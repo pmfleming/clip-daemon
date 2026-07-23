@@ -1,0 +1,184 @@
+{
+  "protocol": "clip-api",
+  "registry": {
+    "methods": [
+      {
+        "name": "clipboard.session.begin",
+        "params_example": {},
+        "response_key": "session",
+        "stream": "clipboard.session"
+      },
+      {
+        "name": "clipboard.session.end",
+        "params_example": {
+          "session_id": "session-opaque"
+        },
+        "response_key": "session",
+        "stream": "clipboard.session"
+      },
+      {
+        "name": "clipboard.session.hidden",
+        "params_example": {
+          "session_id": "session-opaque"
+        },
+        "response_key": "session",
+        "stream": "clipboard.session"
+      },
+      {
+        "name": "clipboard.history.query",
+        "params_example": {
+          "generation": 1,
+          "limit": 100,
+          "query": ""
+        },
+        "response_key": "history",
+        "stream": "clipboard.history.changed"
+      },
+      {
+        "name": "clipboard.entry.details",
+        "params_example": {
+          "entry_id": "entry-opaque",
+          "revision": 1
+        },
+        "response_key": "entry",
+        "stream": null
+      },
+      {
+        "name": "clipboard.entry.thumbnail",
+        "params_example": {
+          "entry_id": "entry-opaque",
+          "revision": 1
+        },
+        "response_key": "thumbnail",
+        "stream": null
+      },
+      {
+        "name": "clipboard.entry.action",
+        "params_example": {
+          "action": "copy",
+          "entry_id": "entry-opaque",
+          "revision": 1,
+          "session_id": null
+        },
+        "response_key": "operation",
+        "stream": "clipboard.operation"
+      },
+      {
+        "name": "clipboard.entry.edit.begin",
+        "params_example": {
+          "entry_id": "entry-opaque",
+          "revision": 1
+        },
+        "response_key": "edit",
+        "stream": "clipboard.operation"
+      },
+      {
+        "name": "clipboard.entry.edit.commit",
+        "params_example": {
+          "edit_id": "edit-opaque",
+          "value": "replacement"
+        },
+        "response_key": "entry",
+        "stream": "clipboard.history.changed"
+      },
+      {
+        "name": "clipboard.entry.edit.cancel",
+        "params_example": {
+          "edit_id": "edit-opaque"
+        },
+        "response_key": "edit",
+        "stream": null
+      },
+      {
+        "name": "clipboard.capture.setPaused",
+        "params_example": {
+          "paused": true
+        },
+        "response_key": "capture",
+        "stream": "clipboard.capture.changed"
+      },
+      {
+        "name": "clipboard.settings.get",
+        "params_example": {},
+        "response_key": "settings",
+        "stream": null
+      },
+      {
+        "name": "clipboard.settings.update",
+        "params_example": {
+          "max_entries": 750,
+          "max_entry_bytes": 16777216
+        },
+        "response_key": "settings",
+        "stream": null
+      },
+      {
+        "name": "clipboard.history.wipe.prepare",
+        "params_example": {},
+        "response_key": "challenge",
+        "stream": null
+      },
+      {
+        "name": "clipboard.history.wipe.commit",
+        "params_example": {
+          "challenge_id": "challenge-opaque",
+          "response": "WIPE"
+        },
+        "response_key": "operation",
+        "stream": "clipboard.operation"
+      }
+    ],
+    "protocol": "clip-api",
+    "streams": [
+      {
+        "events": [
+          "subscribed",
+          "added",
+          "replaced",
+          "removed",
+          "reset",
+          "unavailable"
+        ],
+        "name": "clipboard.history.changed"
+      },
+      {
+        "events": [
+          "subscribed",
+          "changed",
+          "unavailable"
+        ],
+        "name": "clipboard.current.changed"
+      },
+      {
+        "events": [
+          "started",
+          "progress",
+          "completed",
+          "failed",
+          "cancelled"
+        ],
+        "name": "clipboard.operation"
+      },
+      {
+        "events": [
+          "subscribed",
+          "changed",
+          "unavailable"
+        ],
+        "name": "clipboard.capture.changed"
+      },
+      {
+        "events": [
+          "paste-prepared",
+          "completed",
+          "fallback",
+          "target-unavailable",
+          "expired"
+        ],
+        "name": "clipboard.session"
+      }
+    ],
+    "version": 1
+  },
+  "version": 1
+}

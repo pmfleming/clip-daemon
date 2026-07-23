@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.laufan.ClipDaemon
+Exec=@out@/bin/clip-daemon daemon
+SystemdService=clip-daemon.service

@@ -1,0 +1,29 @@
+[package]
+name = "clip-daemon"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Clipboard policy and clip-api daemon for Shelllist"
+repository = "https://github.com/pmfleming/clip-daemon"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+clipboard-history-client-sdk = "=0.16.2"
+# The 0.16 SDK's broad internal `version = "0"` range otherwise resolves the
+# incompatible 0.17 core protocol.
+clipboard-history-core = "=0.16.2"
+futures = "0.3"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+zbus = { version = "5", features = ["tokio"] }
+
+[dev-dependencies]
+tempfile = "3"
