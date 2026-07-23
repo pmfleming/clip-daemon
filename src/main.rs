@@ -40,6 +40,10 @@ enum DebugCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    run(Cli::parse().command).await
+}
+
+async fn run(command: Command) -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal())
@@ -48,37 +52,10 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| EnvFilter::new("clip_daemon=debug")),
         )
         .init();
-    match Cli::parse().command {
+    match command {
         Command::Daemon => daemon::run(Arc::new(RingboardBackend::default())).await,
         Command::Client => client::run().await,
-        Command::ProbeRingboard => {
-            let backend = RingboardBackend::default();
-            let status = backend.status().await;
-            if !status.available {
-                println!("{}", serde_json::to_string_pretty(&status)?);
-                anyhow::bail!("Ringboard is unavailable");
-            }
-            let history = backend
-                .query(HistoryQuery {
-                    query: String::new(),
-                    generation: 0,
-                    limit: 10,
-                })
-                .await?;
-            // Never print clipboard IDs, previews, MIME values, or content from a probe.
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": status,
-                    "query": {
-                        "entries_returned": history.entries.len(),
-                        "has_more": history.has_more,
-                        "revision": history.revision
-                    }
-                }))?
-            );
-            Ok(())
-        }
+        Command::ProbeRingboard => probe_ringboard().await,
         Command::Debug { command } => {
             let value = match command {
                 DebugCommand::ProtocolRegistry => protocol::registry(),
@@ -88,4 +65,31 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn probe_ringboard() -> Result<()> {
+    let backend = RingboardBackend::default();
+    let status = backend.status().await;
+    if !status.available {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+        anyhow::bail!("Ringboard is unavailable");
+    }
+    let history = backend
+        .query(HistoryQuery {
+            query: String::new(),
+            generation: 0,
+            limit: 10,
+        })
+        .await?;
+    // Never print clipboard IDs, previews, MIME values, or content from a probe.
+    let report = serde_json::json!({
+        "status": status,
+        "query": {
+            "entries_returned": history.entries.len(),
+            "has_more": history.has_more,
+            "revision": history.revision
+        }
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }

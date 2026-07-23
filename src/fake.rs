@@ -28,11 +28,24 @@ impl FakeBackend {
             .map_err(|_| BackendError::unavailable("Fake clipboard backend is unavailable"))
     }
 
+    fn mutate_entry<T>(
+        &self,
+        opaque_id: &str,
+        mutate: impl FnOnce(&mut EntryDetails) -> T,
+    ) -> BackendResult<T> {
+        let mut entries = self.entries.write().map_err(fake_unavailable)?;
+        entries
+            .iter_mut()
+            .find(|item| item.entry.id == opaque_id)
+            .map(mutate)
+            .ok_or_else(unknown_entry)
+    }
+
     fn operation(&self, opaque_id: &str, action: &str) -> BackendResult<OperationResult> {
         self.entries()?
             .iter()
             .find(|item| item.entry.id == opaque_id)
-            .ok_or_else(|| BackendError::not_found("Unknown clipboard entry ID"))?;
+            .ok_or_else(unknown_entry)?;
         Ok(OperationResult::completed(
             action,
             "Fake operation completed",
@@ -44,18 +57,13 @@ impl FakeBackend {
         let position = entries
             .iter()
             .position(|item| item.entry.id == opaque_id)
-            .ok_or_else(|| BackendError::not_found("Unknown clipboard entry ID"))?;
+            .ok_or_else(unknown_entry)?;
         entries.remove(position);
         Ok(OperationResult::completed("delete", "Fake entry deleted"))
     }
 
     fn favorite(&self, opaque_id: &str, favorite: bool) -> BackendResult<OperationResult> {
-        let mut entries = self.entries.write().map_err(fake_unavailable)?;
-        let entry = entries
-            .iter_mut()
-            .find(|item| item.entry.id == opaque_id)
-            .ok_or_else(|| BackendError::not_found("Unknown clipboard entry ID"))?;
-        entry.entry.favorite = favorite;
+        self.mutate_entry(opaque_id, |entry| entry.entry.favorite = favorite)?;
         let action = if favorite { "favorite" } else { "unfavorite" };
         Ok(OperationResult::completed(action, "Fake favorite updated"))
     }
@@ -106,7 +114,7 @@ impl ClipboardBackend for FakeBackend {
             .iter()
             .find(|item| item.entry.id == opaque_id)
             .cloned()
-            .ok_or_else(|| BackendError::not_found("Unknown clipboard entry ID"))
+            .ok_or_else(unknown_entry)
     }
 
     async fn thumbnail(&self, opaque_id: &str, _edge: u32) -> BackendResult<EntryThumbnail> {
@@ -144,18 +152,15 @@ impl ClipboardBackend for FakeBackend {
         mime: &str,
         bytes: &[u8],
     ) -> BackendResult<EntryDetails> {
-        let mut entries = self.entries.write().map_err(fake_unavailable)?;
-        let details = entries
-            .iter_mut()
-            .find(|item| item.entry.id == opaque_id)
-            .ok_or_else(|| BackendError::not_found("Unknown clipboard entry ID"))?;
-        details.entry.revision = details.entry.revision.saturating_add(1);
-        details.entry.kind = classify(mime, bytes);
-        details.entry.mime = mime.into();
-        details.entry.byte_size = bytes.len() as u64;
-        details.entry.preview = bounded_preview(bytes, bytes.len());
-        details.text = std::str::from_utf8(bytes).ok().map(str::to_owned);
-        Ok(details.clone())
+        self.mutate_entry(opaque_id, |details| {
+            details.entry.revision = details.entry.revision.saturating_add(1);
+            details.entry.kind = classify(mime, bytes);
+            details.entry.mime = mime.into();
+            details.entry.byte_size = bytes.len() as u64;
+            details.entry.preview = bounded_preview(bytes, bytes.len());
+            details.text = std::str::from_utf8(bytes).ok().map(str::to_owned);
+            details.clone()
+        })
     }
 
     async fn cancel_operation(&self, _operation_id: &str) -> BackendResult<bool> {
@@ -165,6 +170,10 @@ impl ClipboardBackend for FakeBackend {
 
 fn fake_unavailable<T>(_: std::sync::PoisonError<T>) -> BackendError {
     BackendError::unavailable("Fake clipboard backend is unavailable")
+}
+
+fn unknown_entry() -> BackendError {
+    BackendError::not_found("Unknown clipboard entry ID")
 }
 
 #[cfg(test)]

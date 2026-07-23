@@ -2,7 +2,10 @@ use std::{
     env,
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::{
+        fd::{AsFd, OwnedFd},
+        unix::fs::{OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
 };
 
@@ -33,9 +36,7 @@ use super::{MAX_THUMBNAIL_BYTES, RingboardBackend, invalid_entry};
 impl RingboardBackend {
     pub(super) fn restore_entry(&self, opaque_id: &str) -> BackendResult<OperationResult> {
         let (entry, mut reader, _) = self.selected(opaque_id)?;
-        let paste = connect_to_paste_server(&socket_address(paste_socket_file())?)
-            .map_err(operation_error)?;
-        send_paste_buffer(paste, entry, &mut reader, false).map_err(operation_error)?;
+        send_paste_buffer(paste_server()?, entry, &mut reader, false).map_err(operation_error)?;
         Ok(OperationResult::completed(
             "copy",
             "Entry restored to the clipboard",
@@ -49,9 +50,7 @@ impl RingboardBackend {
         }
         let directory = image_directory()?;
         let path = unique_path(&directory, image_extension(&summary.mime));
-        let mut source = entry.to_file(&mut reader).map_err(operation_error)?;
-        let mut output = private_file(&path)?;
-        io::copy(&mut *source, &mut output).map_err(operation_error)?;
+        copy_entry(entry, &mut reader, &path)?;
         let uri = Url::from_file_path(&path)
             .map_err(|_| operation_error("Could not create image file URI"))?;
         add_and_restore(format!("{uri}\r\n").as_bytes(), "text/uri-list")?;
@@ -89,14 +88,8 @@ impl RingboardBackend {
         let directory = runtime_directory("clip-daemon/edits")?;
         let input = unique_path(&directory, image_extension(&summary.mime));
         let output = unique_path(&directory, "png");
-        let mut source = entry.to_file(&mut reader).map_err(operation_error)?;
-        io::copy(&mut *source, &mut private_file(&input)?).map_err(operation_error)?;
-        let ring = if summary.favorite {
-            RingKind::Favorites
-        } else {
-            RingKind::Main
-        };
-        Ok((input, output, entry.id(), ring))
+        copy_entry(entry, &mut reader, &input)?;
+        Ok((input, output, entry.id(), target_ring(summary.favorite)))
     }
 
     pub(super) fn replace_entry(
@@ -111,23 +104,14 @@ impl RingboardBackend {
         private_file(&path)?
             .write_all(bytes)
             .map_err(operation_error)?;
-        let ring = if summary.favorite {
-            RingKind::Favorites
-        } else {
-            RingKind::Main
-        };
-        let result = replace_from_file(entry.id(), ring, &path, mime);
+        let result = replace_from_file(entry.id(), target_ring(summary.favorite), &path, mime);
         let _ = fs::remove_file(path);
         result
     }
 
     pub(super) fn remove_entry(&self, opaque_id: &str) -> BackendResult<OperationResult> {
         let raw_id = self.resolve(opaque_id)?;
-        let server = connect_to_server(&socket_address(socket_file())?).map_err(operation_error)?;
-        let response = RemoveRequest::response(server, raw_id).map_err(operation_error)?;
-        if response.error.is_some() {
-            return Err(operation_error("Ringboard rejected the entry removal"));
-        }
+        remove_raw(server()?, raw_id)?;
         Ok(OperationResult::completed(
             "delete",
             "Clipboard entry deleted",
@@ -140,12 +124,8 @@ impl RingboardBackend {
         favorite: bool,
     ) -> BackendResult<OperationResult> {
         let raw_id = self.resolve(opaque_id)?;
-        let server = connect_to_server(&socket_address(socket_file())?).map_err(operation_error)?;
-        let target = if favorite {
-            RingKind::Favorites
-        } else {
-            RingKind::Main
-        };
+        let server = server()?;
+        let target = target_ring(favorite);
         let response =
             MoveToFrontRequest::response(server, raw_id, Some(target)).map_err(operation_error)?;
         if matches!(response, MoveToFrontResponse::Error(_)) {
@@ -180,12 +160,9 @@ impl RingboardBackend {
             .chain(database.main())
             .map(|entry| entry.id())
             .collect();
-        let server = connect_to_server(&socket_address(socket_file())?).map_err(operation_error)?;
+        let server = server()?;
         for id in ids {
-            let response = RemoveRequest::response(&server, id).map_err(operation_error)?;
-            if response.error.is_some() {
-                return Err(operation_error("Ringboard rejected a history removal"));
-            }
+            remove_raw(&server, id)?;
         }
         self.cleanup_artifacts()?;
         Ok(OperationResult::completed(
@@ -226,21 +203,13 @@ async fn run_annotation(
 }
 
 fn replace_from_file(raw_id: u64, ring: RingKind, path: &Path, mime: &str) -> BackendResult<()> {
-    let file = File::open(path).map_err(operation_error)?;
-    let server = connect_to_server(&socket_address(socket_file())?).map_err(operation_error)?;
-    let mime = MimeType::from(mime).map_err(operation_error)?;
-    let AddResponse::Success { id: replacement } =
-        AddRequest::response_add_unchecked(&server, ring, &mime, file).map_err(operation_error)?;
+    let server = server()?;
+    let replacement = add_file(&server, path, mime, ring)?;
     let swap = SwapRequest::response(&server, raw_id, replacement).map_err(operation_error)?;
     if swap.error1.is_some() || swap.error2.is_some() {
         return Err(operation_error("Ringboard rejected the replacement swap"));
     }
-    let removed = RemoveRequest::response(&server, replacement).map_err(operation_error)?;
-    removed
-        .error
-        .is_none()
-        .then_some(())
-        .ok_or_else(|| operation_error("Ringboard rejected replacement cleanup"))
+    remove_raw(server, replacement)
 }
 
 fn restore_raw(raw_id: u64) -> BackendResult<()> {
@@ -248,9 +217,7 @@ fn restore_raw(raw_id: u64) -> BackendResult<()> {
     let database = DatabaseReader::open(&mut directory).map_err(operation_error)?;
     let mut reader = EntryReader::open(&mut directory).map_err(operation_error)?;
     let entry = database.get_raw(raw_id).map_err(operation_error)?;
-    let paste =
-        connect_to_paste_server(&socket_address(paste_socket_file())?).map_err(operation_error)?;
-    send_paste_buffer(paste, entry, &mut reader, false).map_err(operation_error)
+    send_paste_buffer(paste_server()?, entry, &mut reader, false).map_err(operation_error)
 }
 
 fn add_and_restore(bytes: &[u8], mime: &str) -> BackendResult<()> {
@@ -265,23 +232,55 @@ fn add_and_restore(bytes: &[u8], mime: &str) -> BackendResult<()> {
 }
 
 fn add_file_and_restore(path: &Path, mime: &str) -> BackendResult<()> {
+    let id = add_file(server()?, path, mime, RingKind::Main)?;
+    restore_raw(id)
+}
+
+fn add_file(server: impl AsFd, path: &Path, mime: &str, ring: RingKind) -> BackendResult<u64> {
     let file = File::open(path).map_err(operation_error)?;
-    let server = connect_to_server(&socket_address(socket_file())?).map_err(operation_error)?;
     let mime = MimeType::from(mime).map_err(operation_error)?;
     let AddResponse::Success { id } =
-        AddRequest::response_add_unchecked(server, RingKind::Main, &mime, file)
-            .map_err(operation_error)?;
-    let mut directory = data_dir();
-    let database = DatabaseReader::open(&mut directory).map_err(operation_error)?;
-    let mut reader = EntryReader::open(&mut directory).map_err(operation_error)?;
-    let entry = database.get_raw(id).map_err(operation_error)?;
-    let paste =
-        connect_to_paste_server(&socket_address(paste_socket_file())?).map_err(operation_error)?;
-    send_paste_buffer(paste, entry, &mut reader, false).map_err(operation_error)
+        AddRequest::response_add_unchecked(server, ring, &mime, file).map_err(operation_error)?;
+    Ok(id)
+}
+
+fn remove_raw(server: impl AsFd, id: u64) -> BackendResult<()> {
+    let response = RemoveRequest::response(server, id).map_err(operation_error)?;
+    response
+        .error
+        .is_none()
+        .then_some(())
+        .ok_or_else(|| operation_error("Ringboard rejected removal"))
+}
+
+fn server() -> BackendResult<OwnedFd> {
+    connect_to_server(&socket_address(socket_file())?).map_err(operation_error)
+}
+
+fn paste_server() -> BackendResult<OwnedFd> {
+    connect_to_paste_server(&socket_address(paste_socket_file())?).map_err(operation_error)
 }
 
 fn socket_address(path: PathBuf) -> BackendResult<SocketAddrUnix> {
     SocketAddrUnix::new(path).map_err(operation_error)
+}
+
+fn copy_entry(
+    entry: clipboard_history_client_sdk::Entry,
+    reader: &mut EntryReader,
+    path: &Path,
+) -> BackendResult<()> {
+    let mut source = entry.to_file(reader).map_err(operation_error)?;
+    io::copy(&mut *source, &mut private_file(path)?).map_err(operation_error)?;
+    Ok(())
+}
+
+fn target_ring(favorite: bool) -> RingKind {
+    if favorite {
+        RingKind::Favorites
+    } else {
+        RingKind::Main
+    }
 }
 
 fn valid_edited_image(path: &Path) -> bool {
@@ -315,9 +314,7 @@ fn runtime_directory(child: &str) -> BackendResult<PathBuf> {
 
 fn private_directory(path: PathBuf) -> BackendResult<PathBuf> {
     fs::create_dir_all(&path).map_err(operation_error)?;
-    let mut permissions = fs::metadata(&path).map_err(operation_error)?.permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
-    fs::set_permissions(&path, permissions).map_err(operation_error)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(operation_error)?;
     Ok(path)
 }
 

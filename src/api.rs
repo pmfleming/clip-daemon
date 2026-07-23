@@ -14,18 +14,15 @@ use crate::{
         ActionService, ApiError, MAX_EDIT_BYTES, decode, load_details, validate_entry_id,
         validate_revision,
     },
-    backend::{BackendMutation, ClipboardBackend, HistoryQuery},
+    backend::{BackendMutation, ClipboardBackend, HistoryQuery, MAX_QUERY_LIMIT},
     protocol,
-    session::SessionManager,
     settings::{SettingsManager, SettingsUpdate},
 };
 
 pub const PROTOCOL: &str = protocol::NAME;
 pub const VERSION: u8 = protocol::VERSION;
-const MAX_QUERY_LIMIT: usize = 200;
 pub struct ApiService {
     backend: Arc<dyn ClipboardBackend>,
-    sessions: SessionManager,
     wipe_challenges: Mutex<HashMap<String, Instant>>,
     settings: SettingsManager,
     actions: ActionService,
@@ -36,7 +33,6 @@ impl ApiService {
         let actions = ActionService::new(Arc::clone(&backend));
         Self {
             backend,
-            sessions: SessionManager::default(),
             wipe_challenges: Mutex::new(HashMap::new()),
             settings: SettingsManager::default(),
             actions,
@@ -68,10 +64,10 @@ impl ApiService {
             "clipboard.entry.details" => self.details(decode(params)?).await,
             "clipboard.entry.thumbnail" => self.thumbnail(decode(params)?).await,
             value if value.starts_with("clipboard.entry.") => {
-                self.actions.dispatch(&self.sessions, value, params).await
+                self.actions.dispatch_entry(value, params).await
             }
             value if value.starts_with("clipboard.session.") => {
-                self.dispatch_session(value, params).await
+                self.actions.dispatch_session(value, params).await
             }
             value if value.starts_with("clipboard.history.wipe.") => {
                 self.dispatch_wipe(value, params).await
@@ -80,26 +76,11 @@ impl ApiService {
         }
     }
 
-    async fn dispatch_session(&self, method: &str, params: Value) -> Result<Value, ApiError> {
-        match method {
-            "clipboard.session.begin" => Ok(json!({ "session": self.sessions.begin().await })),
-            "clipboard.session.end" => self.end_session(decode(params)?).await,
-            "clipboard.session.hidden" => self.hide_session(decode(params)?).await,
-            _ => Err(ApiError::new(
-                "unsupported-method",
-                "Unsupported session method",
-            )),
-        }
-    }
-
     async fn dispatch_wipe(&self, method: &str, params: Value) -> Result<Value, ApiError> {
         match method {
             "clipboard.history.wipe.prepare" => self.prepare_wipe().await,
             "clipboard.history.wipe.commit" => self.commit_wipe(decode(params)?).await,
-            _ => Err(ApiError::new(
-                "unsupported-method",
-                "Unsupported wipe method",
-            )),
+            _ => Err(ApiError::unsupported("Unsupported wipe method")),
         }
     }
 
@@ -153,19 +134,6 @@ impl ApiService {
             .await?;
         validate_revision(params.revision, thumbnail.revision)?;
         Ok(json!({ "thumbnail": thumbnail }))
-    }
-
-    async fn end_session(&self, params: SessionParams) -> Result<Value, ApiError> {
-        Ok(json!({ "session": self.sessions.end(&params.session_id).await }))
-    }
-
-    async fn hide_session(&self, params: SessionParams) -> Result<Value, ApiError> {
-        let session = self
-            .sessions
-            .hidden(&params.session_id)
-            .await
-            .map_err(session_error)?;
-        Ok(json!({ "session": session }))
     }
 
     async fn prepare_wipe(&self) -> Result<Value, ApiError> {
@@ -237,11 +205,6 @@ struct EntryParams {
 }
 
 #[derive(Deserialize)]
-struct SessionParams {
-    session_id: String,
-}
-
-#[derive(Deserialize)]
 struct WipeParams {
     challenge_id: String,
     response: String,
@@ -252,10 +215,6 @@ struct PauseParams {
     paused: bool,
     #[serde(default)]
     private_mode: bool,
-}
-
-fn session_error(message: &'static str) -> ApiError {
-    ApiError::new("stale-target", message)
 }
 
 fn settings_error(message: String) -> ApiError {

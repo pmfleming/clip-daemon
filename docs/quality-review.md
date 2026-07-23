@@ -65,4 +65,10 @@ The phase-5 baseline at `21b58f0` was reviewed after the intelligent-action surf
 
 Escape hatches remain at zero and maximum clone score remains low at 15. All 12 unit/integration tests pass.
 
+## Current quality pass
+
+A full Rust Quality Lens pass after the phase-5 refactor reduced the largest function score from 61.82 to 31.58 and the largest module score from 52.82 to 35.64. The Ringboard mutation module fell from 45.07 to 32.31, settings from 42.74 to 31.05, and the executable module from 44.01 to 23.03.
+
+The API now delegates session policy to the action service, raising API locality from 97.0 to 100.0 and leverage from 57.5 to 60.5. Token-clone records fell from 115 to 41, escape hatches remain at zero, and Rust source lines fell from 3,224 to 3,203. All 12 tests pass with no unknown results.
+
 Generated JSON remains under ignored `target/analysis/` and is intentionally not committed.

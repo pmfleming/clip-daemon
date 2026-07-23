@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     backend::{
         BackendError, BackendErrorKind, BackendMutation, BackendResult, ClipboardBackend,
-        HistoryQuery,
+        HistoryQuery, MAX_QUERY_LIMIT,
     },
     classification::{INSPECTION_LIMIT, bounded_preview, classify},
     model::{
@@ -23,7 +23,6 @@ mod mutation;
 use content::{create_thumbnail, detail_facts, invalid_entry, read_bounded};
 
 const DEFAULT_MIME: &str = "text/plain";
-const MAX_QUERY_LIMIT: usize = 200;
 const MAX_DETAILS_BYTES: usize = 256 * 1024;
 const MAX_THUMBNAIL_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_FILES: usize = 100;
@@ -314,11 +313,10 @@ fn entry_revision(raw_id: u64, size: u64, mime: &str) -> u64 {
     hasher.update(raw_id.to_le_bytes());
     hasher.update(size.to_le_bytes());
     hasher.update(mime.as_bytes());
-    u64::from_le_bytes(
-        hasher.finalize()[..8]
-            .try_into()
-            .expect("fixed SHA-256 prefix"),
-    )
+    let digest = hasher.finalize();
+    let mut revision = [0; 8];
+    revision.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(revision)
 }
 
 #[cfg(test)]

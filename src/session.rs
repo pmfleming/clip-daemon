@@ -1,15 +1,13 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 use tokio::{process::Command, sync::Mutex, time::sleep};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct SessionView {
     pub id: String,
     pub target_available: bool,
@@ -18,22 +16,23 @@ pub struct SessionView {
     pub state: &'static str,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Session {
     target: Option<Target>,
     expires: Instant,
     paste_pending: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Deserialize)]
 struct Target {
     address: String,
+    #[serde(default)]
     class: String,
 }
 
 #[derive(Default)]
 pub struct SessionManager {
-    sessions: Arc<Mutex<HashMap<String, Session>>>,
+    sessions: Mutex<HashMap<String, Session>>,
 }
 
 impl SessionManager {
@@ -41,15 +40,16 @@ impl SessionManager {
         self.remove_expired().await;
         let id = format!("session-{}", Uuid::new_v4());
         let target = active_target().await;
+        let target_available = target.is_some();
         self.sessions.lock().await.insert(
             id.clone(),
             Session {
-                target: target.clone(),
+                target,
                 expires: Instant::now() + Duration::from_secs(15),
                 paste_pending: false,
             },
         );
-        view(id, target.is_some(), "active")
+        view(id, target_available, "active")
     }
 
     pub async fn prepare_paste(&self, id: &str) -> Result<bool, &'static str> {
@@ -125,15 +125,9 @@ async fn active_target() -> Option<Target> {
     if !output.status.success() {
         return None;
     }
-    let value: Value = serde_json::from_slice(&output.stdout).ok()?;
-    let address = value["address"].as_str()?.trim().to_owned();
-    if address.is_empty() || address == "0x0" {
-        return None;
-    }
-    Some(Target {
-        address,
-        class: value["class"].as_str().unwrap_or_default().to_owned(),
-    })
+    let mut target: Target = serde_json::from_slice(&output.stdout).ok()?;
+    target.address = target.address.trim().to_owned();
+    (!matches!(target.address.as_str(), "" | "0x0")).then_some(target)
 }
 
 async fn paste_after_hidden(target: Target) {

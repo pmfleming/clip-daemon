@@ -4,6 +4,8 @@ use async_trait::async_trait;
 
 use crate::model::{BackendStatus, EntryDetails, EntryThumbnail, HistoryPage, OperationResult};
 
+pub const MAX_QUERY_LIMIT: usize = 200;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryQuery {
     pub query: String,

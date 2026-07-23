@@ -38,6 +38,10 @@ impl ApiError {
     pub(crate) fn validation(message: impl Into<String>) -> Self {
         Self::new("validation-error", message)
     }
+
+    pub(crate) fn unsupported(message: &'static str) -> Self {
+        Self::new("unsupported-method", message)
+    }
 }
 
 impl From<BackendError> for ApiError {
@@ -53,6 +57,7 @@ impl From<BackendError> for ApiError {
 pub(crate) struct ActionService {
     backend: Arc<dyn ClipboardBackend>,
     edits: Mutex<HashMap<String, EditLease>>,
+    sessions: SessionManager,
 }
 
 impl ActionService {
@@ -60,24 +65,36 @@ impl ActionService {
         Self {
             backend,
             edits: Mutex::new(HashMap::new()),
+            sessions: SessionManager::default(),
         }
     }
 
-    pub async fn dispatch(
-        &self,
-        sessions: &SessionManager,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, ApiError> {
+    pub async fn dispatch_entry(&self, method: &str, params: Value) -> Result<Value, ApiError> {
         match method {
-            "clipboard.entry.action" => self.action(sessions, decode(params)?).await,
+            "clipboard.entry.action" => self.action(decode(params)?).await,
             "clipboard.entry.edit.begin" => self.begin_edit(decode(params)?).await,
             "clipboard.entry.edit.commit" => self.commit_edit(decode(params)?).await,
             "clipboard.entry.edit.cancel" => self.cancel_edit(decode(params)?).await,
-            _ => Err(ApiError::new(
-                "unsupported-method",
-                "Unsupported entry method",
-            )),
+            _ => Err(ApiError::unsupported("Unsupported entry method")),
+        }
+    }
+
+    pub async fn dispatch_session(&self, method: &str, params: Value) -> Result<Value, ApiError> {
+        let params = || decode::<SessionParams>(params);
+        match method {
+            "clipboard.session.begin" => Ok(json!({ "session": self.sessions.begin().await })),
+            "clipboard.session.end" => {
+                Ok(json!({ "session": self.sessions.end(&params()?.session_id).await }))
+            }
+            "clipboard.session.hidden" => {
+                let session = self
+                    .sessions
+                    .hidden(&params()?.session_id)
+                    .await
+                    .map_err(stale_target)?;
+                Ok(json!({ "session": session }))
+            }
+            _ => Err(ApiError::unsupported("Unsupported session method")),
         }
     }
 
@@ -92,11 +109,7 @@ impl ActionService {
         self.edits.lock().await.clear();
     }
 
-    async fn action(
-        &self,
-        sessions: &SessionManager,
-        params: ActionParams,
-    ) -> Result<Value, ApiError> {
+    async fn action(&self, params: ActionParams) -> Result<Value, ApiError> {
         let details = load_details(
             &self.backend,
             &params.entry_id,
@@ -105,44 +118,51 @@ impl ActionService {
         )
         .await?;
         validate_action_kind(details.entry.kind, &params.action)?;
-        self.execute_action(sessions, params, details).await
+        self.execute_action(params, details).await
     }
 
     async fn execute_action(
         &self,
-        sessions: &SessionManager,
         params: ActionParams,
         details: EntryDetails,
     ) -> Result<Value, ApiError> {
-        if is_launch(&params.action) {
+        if matches!(
+            params.action.as_str(),
+            "open-url" | "open-file" | "reveal-file"
+        ) {
             return launch_action(&params, &details).await;
         }
-        let target = if params.action == "paste" {
-            let id = params
-                .session_id
-                .as_deref()
-                .ok_or_else(|| ApiError::validation("session_id is required for paste"))?;
-            Some(sessions.prepare_paste(id).await.map_err(stale_target)?)
-        } else {
-            None
-        };
+        if params.action == "paste" {
+            return self.paste(params).await;
+        }
         let mutation = BackendMutation::for_action(&params.action)
             .ok_or_else(|| ApiError::validation("unsupported entry action"))?;
         let mut operation = self.backend.mutate(&params.entry_id, mutation).await?;
-        if let Some(target) = target {
-            operation.status = if target {
-                "paste-prepared"
-            } else {
-                "completed"
-            }
-            .into();
-            operation.message = if target {
-                "Paste prepared; hide the picker"
-            } else {
-                "Copied; paste manually"
-            }
-            .into();
-        }
+        operation.action = params.action;
+        Ok(json!({ "operation": operation }))
+    }
+
+    async fn paste(&self, params: ActionParams) -> Result<Value, ApiError> {
+        let session_id = params
+            .session_id
+            .as_deref()
+            .ok_or_else(|| ApiError::validation("session_id is required for paste"))?;
+        let has_target = self
+            .sessions
+            .prepare_paste(session_id)
+            .await
+            .map_err(stale_target)?;
+        let mut operation = self
+            .backend
+            .mutate(&params.entry_id, BackendMutation::Restore)
+            .await?;
+        let feedback = if has_target {
+            ("paste-prepared", "Paste prepared; hide the picker")
+        } else {
+            ("completed", "Copied; paste manually")
+        };
+        operation.status = feedback.0.into();
+        operation.message = feedback.1.into();
         operation.action = params.action;
         Ok(json!({ "operation": operation }))
     }
@@ -219,6 +239,11 @@ struct ActionParams {
 }
 
 #[derive(Deserialize)]
+struct SessionParams {
+    session_id: String,
+}
+
+#[derive(Deserialize)]
 struct EntryParams {
     entry_id: String,
     revision: Option<u64>,
@@ -251,7 +276,7 @@ pub(crate) fn decode<T: DeserializeOwned>(params: Value) -> Result<T, ApiError> 
     serde_json::from_value(params).map_err(|error| ApiError::validation(error.to_string()))
 }
 
-fn editable_value(details: &EntryDetails) -> Result<String, ApiError> {
+fn editable_value(details: &EntryDetails) -> Result<&str, ApiError> {
     let editable = matches!(
         details.entry.kind,
         EntryKind::Text | EntryKind::Link | EntryKind::Html | EntryKind::Json | EntryKind::Color
@@ -261,7 +286,7 @@ fn editable_value(details: &EntryDetails) -> Result<String, ApiError> {
     }
     let value = details
         .text
-        .clone()
+        .as_deref()
         .ok_or_else(|| edit_error("Clipboard entry is not valid UTF-8 text"))?;
     (value.len() <= MAX_EDIT_BYTES)
         .then_some(value)
@@ -329,10 +354,6 @@ fn spawn(program: &str, arguments: &[&str]) -> Result<(), ApiError> {
             )
             .into()
         })
-}
-
-fn is_launch(action: &str) -> bool {
-    matches!(action, "open-url" | "open-file" | "reveal-file")
 }
 
 fn validate_action_kind(kind: EntryKind, action: &str) -> Result<(), ApiError> {

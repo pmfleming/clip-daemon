@@ -1,6 +1,11 @@
 use std::{
-    env, fs, fs::OpenOptions, io::Write, num::NonZeroU32, os::unix::fs::OpenOptionsExt,
-    path::PathBuf, sync::Mutex,
+    env, fs,
+    fs::OpenOptions,
+    io::Write,
+    num::NonZeroU32,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::PathBuf,
+    sync::Mutex,
 };
 
 use clipboard_history_client_sdk::{config, core::dirs::data_dir};
@@ -16,7 +21,6 @@ pub struct ClipboardSettings {
     pub max_entries: u32,
     pub max_favorites: u32,
     pub max_entry_bytes: u64,
-    pub max_editable_text_bytes: usize,
     pub capture_paused: bool,
     pub private_mode: bool,
 }
@@ -27,7 +31,6 @@ impl Default for ClipboardSettings {
             max_entries: 750,
             max_favorites: 100,
             max_entry_bytes: 16 * 1024 * 1024,
-            max_editable_text_bytes: 256 * 1024,
             capture_paused: false,
             private_mode: false,
         }
@@ -39,6 +42,22 @@ pub struct SettingsUpdate {
     pub max_entries: Option<u32>,
     pub max_favorites: Option<u32>,
     pub max_entry_bytes: Option<u64>,
+}
+
+impl SettingsUpdate {
+    fn apply(self, value: &ClipboardSettings) -> Result<ClipboardSettings, String> {
+        Ok(ClipboardSettings {
+            max_entries: validated_update(self.max_entries, value.max_entries, 1..=131_070)?,
+            max_favorites: validated_update(self.max_favorites, value.max_favorites, 1..=1_022)?,
+            max_entry_bytes: validated_update(
+                self.max_entry_bytes,
+                value.max_entry_bytes,
+                64 * 1024..=512 * 1024 * 1024,
+            )?,
+            capture_paused: value.capture_paused,
+            private_mode: value.private_mode,
+        })
+    }
 }
 
 pub struct SettingsManager {
@@ -80,27 +99,11 @@ impl SettingsManager {
             .value
             .lock()
             .map_err(|_| "Clipboard settings are unavailable")?;
-        apply_limit(
-            "max_entries",
-            update.max_entries,
-            1..=131_070,
-            &mut value.max_entries,
-        )?;
-        apply_limit(
-            "max_favorites",
-            update.max_favorites,
-            1..=1_022,
-            &mut value.max_favorites,
-        )?;
-        if let Some(max) = update.max_entry_bytes {
-            if !(64 * 1024..=512 * 1024 * 1024).contains(&max) {
-                return Err("max_entry_bytes must be between 64 KiB and 512 MiB".into());
-            }
-            value.max_entry_bytes = max;
-        }
-        persist(self.path.as_ref(), &value)?;
-        write_ringboard_config(&value)?;
-        Ok(value.clone())
+        let updated = update.apply(&value)?;
+        persist(self.path.as_ref(), &updated)?;
+        write_ringboard_config(&updated)?;
+        *value = updated.clone();
+        Ok(updated)
     }
 
     pub async fn set_paused(
@@ -121,20 +124,16 @@ impl SettingsManager {
     }
 }
 
-fn apply_limit(
-    name: &str,
-    update: Option<u32>,
-    range: std::ops::RangeInclusive<u32>,
-    value: &mut u32,
-) -> Result<(), String> {
-    let Some(update) = update else {
-        return Ok(());
-    };
-    if !range.contains(&update) {
-        return Err(format!("{name} is outside Ringboard limits"));
+fn validated_update<T: Copy + PartialOrd>(
+    update: Option<T>,
+    current: T,
+    range: std::ops::RangeInclusive<T>,
+) -> Result<T, String> {
+    match update {
+        Some(value) if range.contains(&value) => Ok(value),
+        Some(_) => Err("Clipboard setting is outside the supported range".into()),
+        None => Ok(current),
     }
-    *value = update;
-    Ok(())
 }
 
 async fn restart_capture() -> Result<(), String> {
@@ -185,11 +184,7 @@ fn persist(path: Option<&PathBuf>, value: &ClipboardSettings) -> Result<(), Stri
     };
     let parent = path.parent().ok_or("Clipboard state path is invalid")?;
     fs::create_dir_all(parent).map_err(|_| "Clipboard state directory is unavailable")?;
-    let mut permissions = fs::metadata(parent)
-        .map_err(|_| "Clipboard state directory is unavailable")?
-        .permissions();
-    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
-    fs::set_permissions(parent, permissions)
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
         .map_err(|_| "Clipboard state permissions could not be set")?;
     let bytes =
         serde_json::to_vec_pretty(value).map_err(|_| "Clipboard settings could not be encoded")?;
