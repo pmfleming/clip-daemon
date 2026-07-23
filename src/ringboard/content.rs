@@ -18,10 +18,25 @@ use super::{INSPECTION_LIMIT, MAX_FILES, MAX_THUMBNAIL_BYTES};
 
 pub(super) fn read_bounded(file: &mut File, limit: usize) -> BackendResult<Vec<u8>> {
     let mut bytes = Vec::with_capacity(limit.min(INSPECTION_LIMIT));
-    file.take(limit as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| invalid_entry("Could not read clipboard entry"))?;
+    let mut buffer = [0_u8; 8192];
+    while bytes.len() < limit {
+        let remaining = limit - bytes.len();
+        let chunk_size = remaining.min(buffer.len());
+        let read = file
+            .read(&mut buffer[..chunk_size])
+            .map_err(|_| invalid_entry("Could not read clipboard entry"))?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
     Ok(bytes)
+}
+
+pub(super) fn detected_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    image::guess_format(bytes)
+        .ok()
+        .map(|format| format.to_mime_type())
 }
 
 pub(super) fn detail_facts(
@@ -152,7 +167,28 @@ pub(super) fn invalid_entry(message: &'static str) -> BackendError {
 
 #[cfg(test)]
 mod tests {
-    use super::{file_preview, parse_files};
+    use std::io::{Seek, SeekFrom, Write};
+
+    use super::{detected_image_mime, file_preview, parse_files, read_bounded};
+
+    #[test]
+    fn bounded_reads_stop_at_the_requested_limit() {
+        let mut file = tempfile::tempfile().expect("temporary file");
+        let content = vec![0x5a; 24_000];
+        file.write_all(&content).expect("write fixture");
+        file.seek(SeekFrom::Start(0)).expect("rewind fixture");
+
+        let bytes = read_bounded(&mut file, 10_000).expect("bounded read");
+
+        assert_eq!(bytes, &content[..10_000]);
+    }
+
+    #[test]
+    fn image_mime_is_detected_without_loading_ringboard_metadata() {
+        let png_header = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        assert_eq!(detected_image_mime(png_header), Some("image/png"));
+        assert_eq!(detected_image_mime(b"ordinary text"), None);
+    }
 
     #[test]
     fn file_metadata_is_parsed_inside_the_daemon() {

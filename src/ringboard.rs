@@ -20,7 +20,7 @@ use crate::{
 mod content;
 mod mutation;
 
-use content::{create_thumbnail, detail_facts, invalid_entry, read_bounded};
+use content::{create_thumbnail, detail_facts, detected_image_mime, invalid_entry, read_bounded};
 
 const DEFAULT_MIME: &str = "text/plain";
 const MAX_DETAILS_BYTES: usize = 256 * 1024;
@@ -106,11 +106,20 @@ impl RingboardBackend {
             .metadata()
             .map_err(|_| invalid_entry("Could not read clipboard entry metadata"))?
             .len();
-        let mime_value = loaded
-            .mime_type()
-            .map_err(|_| invalid_entry("Could not read clipboard MIME metadata"))?;
-        let mime = mime_or_default(mime_value.as_str());
         let bytes = read_bounded(&mut loaded, INSPECTION_LIMIT)?;
+        let detected_mime = detected_image_mime(&bytes);
+        let mime_value = detected_mime
+            .is_none()
+            .then(|| loaded.mime_type())
+            .transpose()
+            .map_err(|_| invalid_entry("Could not read clipboard MIME metadata"))?;
+        let mime = detected_mime
+            .or_else(|| {
+                mime_value
+                    .as_ref()
+                    .map(|value| mime_or_default(value.as_str()))
+            })
+            .unwrap_or(DEFAULT_MIME);
         let id = opaque_id(entry.id());
         self.remember(id.clone(), entry.id())?;
         Ok(EntrySummary {
