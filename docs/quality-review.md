@@ -47,4 +47,22 @@ The mutation/privacy implementation was reviewed again at `242c025`. The follow-
 
 Escape hatches remain at zero, maximum clone score remains low at 15, and all 11 tests pass across two test layers.
 
+## Phase 5 follow-up
+
+The phase-5 baseline at `21b58f0` was reviewed after the intelligent-action surface was complete. Related edit, launch, validation, and API error policy was consolidated behind one action service, while repeated entry load/revision checks were replaced by a shared boundary.
+
+| Signal | Before | After |
+|---|---:|---:|
+| API dispatch function score | 91.67 | 30.02 |
+| entry-action facade score | 74.54 | 8.29 |
+| maximum action execution score | 74.54 | 61.82 |
+| API module score | 79.98 | 32.48 |
+| token-clone records | 117 | 115 |
+| minimum module locality | 91.0 | 97.0 |
+| API leverage | 51.5 | 57.5 |
+| Rust source lines | 3,244 | 3,224 |
+| all Rust lines including integration tests | 3,340 | 3,320 |
+
+Escape hatches remain at zero and maximum clone score remains low at 15. All 12 unit/integration tests pass.
+
 Generated JSON remains under ignored `target/analysis/` and is intentionally not committed.
