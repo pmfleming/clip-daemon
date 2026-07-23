@@ -247,16 +247,30 @@ impl ClipboardBackend for RingboardBackend {
         }
     }
 
+    async fn replace(
+        &self,
+        opaque_id: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> BackendResult<EntryDetails> {
+        self.replace_entry(opaque_id, mime, bytes)?;
+        let details = self.details(opaque_id, MAX_DETAILS_BYTES).await?;
+        self.restore_entry(opaque_id)?;
+        Ok(details)
+    }
+
     async fn cancel_operation(&self, operation_id: &str) -> BackendResult<bool> {
-        Ok(self
+        let task = self
             .operations
             .lock()
             .map_err(|_| lock_error())?
-            .remove(operation_id)
-            .is_some_and(|task| {
-                task.abort();
-                true
-            }))
+            .remove(operation_id);
+        let Some(task) = task.filter(|task| !task.is_finished()) else {
+            return Ok(false);
+        };
+        task.abort();
+        mutation::clear_edit_files();
+        Ok(true)
     }
 }
 

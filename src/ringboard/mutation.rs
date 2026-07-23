@@ -9,8 +9,8 @@ use std::{
 use clipboard_history_client_sdk::{
     DatabaseReader, EntryReader,
     api::{
-        AddRequest, MoveToFrontRequest, RemoveRequest, connect_to_paste_server, connect_to_server,
-        send_paste_buffer,
+        AddRequest, MoveToFrontRequest, RemoveRequest, SwapRequest, connect_to_paste_server,
+        connect_to_server, send_paste_buffer,
     },
     core::{
         dirs::{data_dir, paste_socket_file, socket_file},
@@ -61,10 +61,16 @@ impl RingboardBackend {
     }
 
     pub(super) fn start_annotation(&self, opaque_id: &str) -> BackendResult<OperationResult> {
-        let (input, output) = self.stage_annotation(opaque_id)?;
+        let (input, output, raw_id, ring) = self.stage_annotation(opaque_id)?;
         let mut operation = OperationResult::completed("annotate", "Satty annotation started");
         operation.status = "started".into();
-        let task = tokio::spawn(run_annotation(input, output, operation.id.clone()));
+        let task = tokio::spawn(run_annotation(
+            input,
+            output,
+            raw_id,
+            ring,
+            operation.id.clone(),
+        ));
         self.operations
             .lock()
             .map_err(|_| operation_error("Clipboard operation state is unavailable"))?
@@ -72,7 +78,10 @@ impl RingboardBackend {
         Ok(operation)
     }
 
-    fn stage_annotation(&self, opaque_id: &str) -> BackendResult<(PathBuf, PathBuf)> {
+    fn stage_annotation(
+        &self,
+        opaque_id: &str,
+    ) -> BackendResult<(PathBuf, PathBuf, u64, RingKind)> {
         let (entry, mut reader, summary) = self.selected(opaque_id)?;
         if summary.kind != EntryKind::Image {
             return Err(invalid_entry("Only image entries can be annotated"));
@@ -82,7 +91,34 @@ impl RingboardBackend {
         let output = unique_path(&directory, "png");
         let mut source = entry.to_file(&mut reader).map_err(operation_error)?;
         io::copy(&mut *source, &mut private_file(&input)?).map_err(operation_error)?;
-        Ok((input, output))
+        let ring = if summary.favorite {
+            RingKind::Favorites
+        } else {
+            RingKind::Main
+        };
+        Ok((input, output, entry.id(), ring))
+    }
+
+    pub(super) fn replace_entry(
+        &self,
+        opaque_id: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> BackendResult<()> {
+        let (entry, _, summary) = self.selected(opaque_id)?;
+        let directory = runtime_directory("clip-daemon/transfers")?;
+        let path = unique_path(&directory, "edit");
+        private_file(&path)?
+            .write_all(bytes)
+            .map_err(operation_error)?;
+        let ring = if summary.favorite {
+            RingKind::Favorites
+        } else {
+            RingKind::Main
+        };
+        let result = replace_from_file(entry.id(), ring, &path, mime);
+        let _ = fs::remove_file(path);
+        result
     }
 
     pub(super) fn remove_entry(&self, opaque_id: &str) -> BackendResult<OperationResult> {
@@ -159,7 +195,13 @@ impl RingboardBackend {
     }
 }
 
-async fn run_annotation(input: PathBuf, output: PathBuf, operation_id: String) {
+async fn run_annotation(
+    input: PathBuf,
+    output: PathBuf,
+    raw_id: u64,
+    ring: RingKind,
+    operation_id: String,
+) {
     let status = Command::new("satty")
         .args(["--filename", input.to_string_lossy().as_ref()])
         .args(["--output-filename", output.to_string_lossy().as_ref()])
@@ -174,12 +216,41 @@ async fn run_annotation(input: PathBuf, output: PathBuf, operation_id: String) {
         .await;
     if status.is_ok_and(|value| value.success())
         && valid_edited_image(&output)
-        && let Err(error) = add_file_and_restore(&output, "image/png")
+        && let Err(error) =
+            replace_from_file(raw_id, ring, &output, "image/png").and_then(|()| restore_raw(raw_id))
     {
         tracing::warn!(%operation_id, code = %error.kind.code(), "annotation result could not be restored");
     }
     let _ = fs::remove_file(input);
     let _ = fs::remove_file(output);
+}
+
+fn replace_from_file(raw_id: u64, ring: RingKind, path: &Path, mime: &str) -> BackendResult<()> {
+    let file = File::open(path).map_err(operation_error)?;
+    let server = connect_to_server(&socket_address(socket_file())?).map_err(operation_error)?;
+    let mime = MimeType::from(mime).map_err(operation_error)?;
+    let AddResponse::Success { id: replacement } =
+        AddRequest::response_add_unchecked(&server, ring, &mime, file).map_err(operation_error)?;
+    let swap = SwapRequest::response(&server, raw_id, replacement).map_err(operation_error)?;
+    if swap.error1.is_some() || swap.error2.is_some() {
+        return Err(operation_error("Ringboard rejected the replacement swap"));
+    }
+    let removed = RemoveRequest::response(&server, replacement).map_err(operation_error)?;
+    removed
+        .error
+        .is_none()
+        .then_some(())
+        .ok_or_else(|| operation_error("Ringboard rejected replacement cleanup"))
+}
+
+fn restore_raw(raw_id: u64) -> BackendResult<()> {
+    let mut directory = data_dir();
+    let database = DatabaseReader::open(&mut directory).map_err(operation_error)?;
+    let mut reader = EntryReader::open(&mut directory).map_err(operation_error)?;
+    let entry = database.get_raw(raw_id).map_err(operation_error)?;
+    let paste =
+        connect_to_paste_server(&socket_address(paste_socket_file())?).map_err(operation_error)?;
+    send_paste_buffer(paste, entry, &mut reader, false).map_err(operation_error)
 }
 
 fn add_and_restore(bytes: &[u8], mime: &str) -> BackendResult<()> {
@@ -221,6 +292,13 @@ fn valid_edited_image(path: &Path) -> bool {
             .ok()
             .and_then(|reader| reader.into_dimensions().ok())
             .is_some()
+}
+
+pub(super) fn clear_edit_files() {
+    let root = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir);
+    let _ = fs::remove_dir_all(root.join("clip-daemon/edits"));
 }
 
 fn image_directory() -> BackendResult<PathBuf> {

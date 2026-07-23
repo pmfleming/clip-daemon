@@ -11,7 +11,8 @@ use uuid::Uuid;
 
 use crate::{
     backend::{BackendError, BackendMutation, ClipboardBackend, HistoryQuery},
-    protocol,
+    editing::{EditManager, MAX_EDIT_BYTES},
+    launch, protocol,
     session::SessionManager,
     settings::{SettingsManager, SettingsUpdate},
 };
@@ -19,13 +20,12 @@ use crate::{
 pub const PROTOCOL: &str = protocol::NAME;
 pub const VERSION: u8 = protocol::VERSION;
 const MAX_QUERY_LIMIT: usize = 200;
-const MAX_TEXT_BYTES: usize = 256 * 1024;
-
 pub struct ApiService {
     backend: Arc<dyn ClipboardBackend>,
     sessions: SessionManager,
     wipe_challenges: Mutex<HashMap<String, Instant>>,
     settings: SettingsManager,
+    edits: EditManager,
 }
 
 impl ApiService {
@@ -35,6 +35,7 @@ impl ApiService {
             sessions: SessionManager::default(),
             wipe_challenges: Mutex::new(HashMap::new()),
             settings: SettingsManager::default(),
+            edits: EditManager::default(),
         }
     }
 
@@ -66,6 +67,9 @@ impl ApiService {
             "clipboard.entry.details" => self.details(decode(params)?).await,
             "clipboard.entry.thumbnail" => self.thumbnail(decode(params)?).await,
             "clipboard.entry.action" => self.action(decode(params)?).await,
+            "clipboard.entry.edit.begin" => self.begin_edit(decode(params)?).await,
+            "clipboard.entry.edit.commit" => self.commit_edit(decode(params)?).await,
+            "clipboard.entry.edit.cancel" => self.cancel_edit(decode(params)?).await,
             "clipboard.session.begin" => Ok(json!({ "session": self.sessions.begin().await })),
             "clipboard.session.end" => self.end_session(decode(params)?).await,
             "clipboard.session.hidden" => self.hide_session(decode(params)?).await,
@@ -104,7 +108,7 @@ impl ApiService {
         validate_entry_id(&params.entry_id)?;
         let entry = self
             .backend
-            .details(&params.entry_id, MAX_TEXT_BYTES)
+            .details(&params.entry_id, MAX_EDIT_BYTES)
             .await?;
         validate_revision(params.revision, entry.entry.revision)?;
         Ok(json!({ "entry": entry }))
@@ -122,11 +126,22 @@ impl ApiService {
 
     async fn action(&self, params: ActionParams) -> Result<Value, ApiError> {
         validate_entry_id(&params.entry_id)?;
-        let details = self.backend.details(&params.entry_id, 0).await?;
+        let details = self
+            .backend
+            .details(&params.entry_id, MAX_EDIT_BYTES)
+            .await?;
         validate_revision(Some(params.revision), details.entry.revision)?;
-        let target = match params.action.as_str() {
-            "paste" => Some(self.prepare_paste(&params).await?),
-            _ => None,
+        validate_action_kind(details.entry.kind, &params.action)?;
+        if matches!(
+            params.action.as_str(),
+            "open-url" | "open-file" | "reveal-file"
+        ) {
+            return self.launch_action(&params, &details).await;
+        }
+        let target = if params.action == "paste" {
+            Some(self.prepare_paste(&params).await?)
+        } else {
+            None
         };
         let mutation = BackendMutation::for_action(&params.action)
             .ok_or_else(|| ApiError::validation("unsupported entry action"))?;
@@ -149,6 +164,24 @@ impl ApiService {
         Ok(json!({ "operation": operation }))
     }
 
+    async fn launch_action(
+        &self,
+        params: &ActionParams,
+        details: &crate::model::EntryDetails,
+    ) -> Result<Value, ApiError> {
+        let operation = match params.action.as_str() {
+            "open-url" => launch::open_url(details.text.as_deref().unwrap_or_default()).await?,
+            "open-file" => {
+                launch::open_file(selected_file(details, params.file_index)?, false).await?
+            }
+            "reveal-file" => {
+                launch::open_file(selected_file(details, params.file_index)?, true).await?
+            }
+            _ => return Err(ApiError::validation("unsupported launch action")),
+        };
+        Ok(json!({ "operation": operation }))
+    }
+
     async fn prepare_paste(&self, params: &ActionParams) -> Result<bool, ApiError> {
         let session = params
             .session_id
@@ -158,6 +191,37 @@ impl ApiService {
             .prepare_paste(session)
             .await
             .map_err(session_error)
+    }
+
+    async fn begin_edit(&self, params: EntryParams) -> Result<Value, ApiError> {
+        validate_entry_id(&params.entry_id)?;
+        let details = self
+            .backend
+            .details(&params.entry_id, MAX_EDIT_BYTES)
+            .await?;
+        validate_revision(params.revision, details.entry.revision)?;
+        let edit = self.edits.begin(details).await.map_err(edit_error)?;
+        Ok(json!({ "edit": edit }))
+    }
+
+    async fn commit_edit(&self, params: EditCommitParams) -> Result<Value, ApiError> {
+        let edit = self
+            .edits
+            .commit(&params.edit_id, params.value)
+            .await
+            .map_err(edit_error)?;
+        let current = self.backend.details(&edit.entry_id, 0).await?;
+        validate_revision(Some(edit.revision), current.entry.revision)?;
+        let entry = self
+            .backend
+            .replace(&edit.entry_id, &edit.mime, edit.value.as_bytes())
+            .await?;
+        Ok(json!({ "entry": entry }))
+    }
+
+    async fn cancel_edit(&self, params: EditCancelParams) -> Result<Value, ApiError> {
+        let cancelled = self.edits.cancel(&params.edit_id).await;
+        Ok(json!({ "edit": { "id": params.edit_id, "cancelled": cancelled } }))
     }
 
     async fn end_session(&self, params: SessionParams) -> Result<Value, ApiError> {
@@ -219,6 +283,7 @@ impl ApiService {
         if deadline <= Instant::now() {
             return Err(ApiError::new("stale-action", "wipe challenge expired"));
         }
+        self.edits.clear().await;
         Ok(json!({ "operation": self.backend.mutate("", BackendMutation::Wipe).await? }))
     }
 }
@@ -277,6 +342,18 @@ struct ActionParams {
     revision: u64,
     action: String,
     session_id: Option<String>,
+    file_index: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct EditCommitParams {
+    edit_id: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct EditCancelParams {
+    edit_id: String,
 }
 
 #[derive(Deserialize)]
@@ -316,6 +393,35 @@ fn validate_revision(expected: Option<u64>, actual: u64) -> Result<(), ApiError>
         }),
         _ => Ok(()),
     }
+}
+
+fn validate_action_kind(kind: crate::model::EntryKind, action: &str) -> Result<(), ApiError> {
+    use crate::model::EntryKind;
+    let allowed = match action {
+        "copy" | "delete" | "favorite" | "unfavorite" | "pin-current" | "cleanup" => true,
+        "paste" => kind != EntryKind::Binary,
+        "image-as-file" | "annotate" => kind == EntryKind::Image,
+        "open-url" => kind == EntryKind::Link,
+        "open-file" | "reveal-file" => kind == EntryKind::Files,
+        _ => false,
+    };
+    allowed
+        .then_some(())
+        .ok_or_else(|| ApiError::validation("action is unsafe for this clipboard type"))
+}
+
+fn selected_file(
+    details: &crate::model::EntryDetails,
+    index: Option<usize>,
+) -> Result<&crate::model::FilePreview, ApiError> {
+    details
+        .files
+        .get(index.unwrap_or_default())
+        .ok_or_else(|| ApiError::validation("file_index does not identify a clipboard file"))
+}
+
+fn edit_error(message: &'static str) -> ApiError {
+    ApiError::new("edit-error", message)
 }
 
 fn session_error(message: &'static str) -> ApiError {

@@ -4,6 +4,7 @@ use async_trait::async_trait;
 
 use crate::{
     backend::{BackendError, BackendMutation, BackendResult, ClipboardBackend, HistoryQuery},
+    classification::{bounded_preview, classify},
     model::{
         BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
     },
@@ -135,6 +136,26 @@ impl ClipboardBackend for FakeBackend {
                 Ok(OperationResult::completed("cleanup", "Fake caches cleared"))
             }
         }
+    }
+
+    async fn replace(
+        &self,
+        opaque_id: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> BackendResult<EntryDetails> {
+        let mut entries = self.entries.write().map_err(fake_unavailable)?;
+        let details = entries
+            .iter_mut()
+            .find(|item| item.entry.id == opaque_id)
+            .ok_or_else(|| BackendError::not_found("Unknown clipboard entry ID"))?;
+        details.entry.revision = details.entry.revision.saturating_add(1);
+        details.entry.kind = classify(mime, bytes);
+        details.entry.mime = mime.into();
+        details.entry.byte_size = bytes.len() as u64;
+        details.entry.preview = bounded_preview(bytes, bytes.len());
+        details.text = std::str::from_utf8(bytes).ok().map(str::to_owned);
+        Ok(details.clone())
     }
 
     async fn cancel_operation(&self, _operation_id: &str) -> BackendResult<bool> {

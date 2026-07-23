@@ -105,5 +105,11 @@ pub trait ClipboardBackend: Send + Sync {
         opaque_id: &str,
         mutation: BackendMutation,
     ) -> BackendResult<OperationResult>;
+    async fn replace(
+        &self,
+        opaque_id: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> BackendResult<EntryDetails>;
     async fn cancel_operation(&self, operation_id: &str) -> BackendResult<bool>;
 }
