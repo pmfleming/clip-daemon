@@ -67,6 +67,32 @@ impl Error for BackendError {}
 
 pub type BackendResult<T> = Result<T, BackendError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendMutation {
+    Restore,
+    ImageAsFile,
+    Annotate,
+    Remove,
+    SetFavorite(bool),
+    Wipe,
+    Cleanup,
+}
+
+impl BackendMutation {
+    pub fn for_action(action: &str) -> Option<Self> {
+        match action {
+            "copy" | "paste" => Some(Self::Restore),
+            "image-as-file" => Some(Self::ImageAsFile),
+            "annotate" => Some(Self::Annotate),
+            "delete" => Some(Self::Remove),
+            "favorite" | "pin-current" => Some(Self::SetFavorite(true)),
+            "unfavorite" => Some(Self::SetFavorite(false)),
+            "cleanup" => Some(Self::Cleanup),
+            _ => None,
+        }
+    }
+}
+
 #[async_trait]
 pub trait ClipboardBackend: Send + Sync {
     async fn status(&self) -> BackendStatus;
@@ -74,13 +100,10 @@ pub trait ClipboardBackend: Send + Sync {
     async fn query(&self, query: HistoryQuery) -> BackendResult<HistoryPage>;
     async fn details(&self, opaque_id: &str, max_text_bytes: usize) -> BackendResult<EntryDetails>;
     async fn thumbnail(&self, opaque_id: &str, edge: u32) -> BackendResult<EntryThumbnail>;
-    async fn restore(&self, opaque_id: &str) -> BackendResult<OperationResult>;
-    async fn image_as_file(&self, opaque_id: &str) -> BackendResult<OperationResult>;
-    async fn annotate(&self, opaque_id: &str) -> BackendResult<OperationResult>;
-    async fn wipe(&self) -> BackendResult<OperationResult>;
-    async fn remove(&self, opaque_id: &str) -> BackendResult<OperationResult>;
-    async fn set_favorite(&self, opaque_id: &str, favorite: bool)
-    -> BackendResult<OperationResult>;
+    async fn mutate(
+        &self,
+        opaque_id: &str,
+        mutation: BackendMutation,
+    ) -> BackendResult<OperationResult>;
     async fn cancel_operation(&self, operation_id: &str) -> BackendResult<bool>;
-    async fn cleanup(&self) -> BackendResult<OperationResult>;
 }

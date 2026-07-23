@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 
 use crate::{
-    backend::{BackendError, BackendResult, ClipboardBackend, HistoryQuery},
+    backend::{BackendError, BackendMutation, BackendResult, ClipboardBackend, HistoryQuery},
     model::{
         BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
     },
@@ -36,6 +36,27 @@ impl FakeBackend {
             action,
             "Fake operation completed",
         ))
+    }
+
+    fn remove(&self, opaque_id: &str) -> BackendResult<OperationResult> {
+        let mut entries = self.entries.write().map_err(fake_unavailable)?;
+        let position = entries
+            .iter()
+            .position(|item| item.entry.id == opaque_id)
+            .ok_or_else(|| BackendError::not_found("Unknown clipboard entry ID"))?;
+        entries.remove(position);
+        Ok(OperationResult::completed("delete", "Fake entry deleted"))
+    }
+
+    fn favorite(&self, opaque_id: &str, favorite: bool) -> BackendResult<OperationResult> {
+        let mut entries = self.entries.write().map_err(fake_unavailable)?;
+        let entry = entries
+            .iter_mut()
+            .find(|item| item.entry.id == opaque_id)
+            .ok_or_else(|| BackendError::not_found("Unknown clipboard entry ID"))?;
+        entry.entry.favorite = favorite;
+        let action = if favorite { "favorite" } else { "unfavorite" };
+        Ok(OperationResult::completed(action, "Fake favorite updated"))
     }
 }
 
@@ -95,72 +116,40 @@ impl ClipboardBackend for FakeBackend {
         )))
     }
 
-    async fn restore(&self, opaque_id: &str) -> BackendResult<OperationResult> {
-        self.operation(opaque_id, "copy")
-    }
-
-    async fn image_as_file(&self, opaque_id: &str) -> BackendResult<OperationResult> {
-        self.operation(opaque_id, "image-as-file")
-    }
-
-    async fn annotate(&self, opaque_id: &str) -> BackendResult<OperationResult> {
-        self.operation(opaque_id, "annotate")
-    }
-
-    async fn wipe(&self) -> BackendResult<OperationResult> {
-        self.entries
-            .write()
-            .map_err(|_| BackendError::unavailable("Fake clipboard backend is unavailable"))?
-            .clear();
-        Ok(OperationResult::completed("wipe", "Fake history cleared"))
-    }
-
-    async fn remove(&self, opaque_id: &str) -> BackendResult<OperationResult> {
-        let mut entries = self
-            .entries
-            .write()
-            .map_err(|_| BackendError::unavailable("Fake clipboard backend is unavailable"))?;
-        let position = entries
-            .iter()
-            .position(|item| item.entry.id == opaque_id)
-            .ok_or_else(|| BackendError::not_found("Unknown clipboard entry ID"))?;
-        entries.remove(position);
-        Ok(OperationResult::completed("delete", "Fake entry deleted"))
-    }
-
-    async fn set_favorite(
+    async fn mutate(
         &self,
         opaque_id: &str,
-        favorite: bool,
+        mutation: BackendMutation,
     ) -> BackendResult<OperationResult> {
-        let mut entries = self
-            .entries
-            .write()
-            .map_err(|_| BackendError::unavailable("Fake clipboard backend is unavailable"))?;
-        let entry = entries
-            .iter_mut()
-            .find(|item| item.entry.id == opaque_id)
-            .ok_or_else(|| BackendError::not_found("Unknown clipboard entry ID"))?;
-        entry.entry.favorite = favorite;
-        Ok(OperationResult::completed(
-            if favorite { "favorite" } else { "unfavorite" },
-            "Fake favorite updated",
-        ))
+        match mutation {
+            BackendMutation::Restore => self.operation(opaque_id, "copy"),
+            BackendMutation::ImageAsFile => self.operation(opaque_id, "image-as-file"),
+            BackendMutation::Annotate => self.operation(opaque_id, "annotate"),
+            BackendMutation::Remove => self.remove(opaque_id),
+            BackendMutation::SetFavorite(value) => self.favorite(opaque_id, value),
+            BackendMutation::Wipe => {
+                self.entries.write().map_err(fake_unavailable)?.clear();
+                Ok(OperationResult::completed("wipe", "Fake history cleared"))
+            }
+            BackendMutation::Cleanup => {
+                Ok(OperationResult::completed("cleanup", "Fake caches cleared"))
+            }
+        }
     }
 
     async fn cancel_operation(&self, _operation_id: &str) -> BackendResult<bool> {
         Ok(false)
     }
+}
 
-    async fn cleanup(&self) -> BackendResult<OperationResult> {
-        Ok(OperationResult::completed("cleanup", "Fake caches cleared"))
-    }
+fn fake_unavailable<T>(_: std::sync::PoisonError<T>) -> BackendError {
+    BackendError::unavailable("Fake clipboard backend is unavailable")
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
-        backend::{ClipboardBackend, HistoryQuery},
+        backend::{BackendMutation, ClipboardBackend, HistoryQuery},
         model::{EntryDetails, EntryKind, EntrySummary},
     };
 
@@ -208,9 +197,15 @@ mod tests {
         );
         assert_eq!(backend.change_token().await.unwrap(), 5);
         assert!(backend.details("missing", 10).await.is_err());
-        backend.set_favorite("other", true).await.unwrap();
+        backend
+            .mutate("other", BackendMutation::SetFavorite(true))
+            .await
+            .unwrap();
         assert!(backend.details("other", 10).await.unwrap().entry.favorite);
-        backend.remove("other").await.unwrap();
+        backend
+            .mutate("other", BackendMutation::Remove)
+            .await
+            .unwrap();
         assert!(backend.details("other", 10).await.is_err());
     }
 }

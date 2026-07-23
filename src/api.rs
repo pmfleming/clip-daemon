@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    backend::{BackendError, ClipboardBackend, HistoryQuery},
+    backend::{BackendError, BackendMutation, ClipboardBackend, HistoryQuery},
     protocol,
     session::SessionManager,
     settings::{SettingsManager, SettingsUpdate},
@@ -124,45 +124,40 @@ impl ApiService {
         validate_entry_id(&params.entry_id)?;
         let details = self.backend.details(&params.entry_id, 0).await?;
         validate_revision(Some(params.revision), details.entry.revision)?;
-        let mut operation = match params.action.as_str() {
-            "copy" => self.backend.restore(&params.entry_id).await?,
-            "paste" => {
-                let session_id = params
-                    .session_id
-                    .as_deref()
-                    .ok_or_else(|| ApiError::validation("session_id is required for paste"))?;
-                let target = self
-                    .sessions
-                    .prepare_paste(session_id)
-                    .await
-                    .map_err(session_error)?;
-                let mut operation = self.backend.restore(&params.entry_id).await?;
-                operation.action = "paste".into();
-                operation.status = if target {
-                    "paste-prepared"
-                } else {
-                    "completed"
-                }
-                .into();
-                operation.message = if target {
-                    "Paste prepared; hide the picker"
-                } else {
-                    "Copied; paste manually"
-                }
-                .into();
-                operation
-            }
-            "image-as-file" => self.backend.image_as_file(&params.entry_id).await?,
-            "annotate" => self.backend.annotate(&params.entry_id).await?,
-            "delete" => self.backend.remove(&params.entry_id).await?,
-            "favorite" => self.backend.set_favorite(&params.entry_id, true).await?,
-            "unfavorite" => self.backend.set_favorite(&params.entry_id, false).await?,
-            "pin-current" => self.backend.set_favorite(&params.entry_id, true).await?,
-            "cleanup" => self.backend.cleanup().await?,
-            _ => return Err(ApiError::validation("unsupported entry action")),
+        let target = match params.action.as_str() {
+            "paste" => Some(self.prepare_paste(&params).await?),
+            _ => None,
         };
+        let mutation = BackendMutation::for_action(&params.action)
+            .ok_or_else(|| ApiError::validation("unsupported entry action"))?;
+        let mut operation = self.backend.mutate(&params.entry_id, mutation).await?;
+        if let Some(target) = target {
+            operation.status = if target {
+                "paste-prepared"
+            } else {
+                "completed"
+            }
+            .into();
+            operation.message = if target {
+                "Paste prepared; hide the picker"
+            } else {
+                "Copied; paste manually"
+            }
+            .into();
+        }
         operation.action = params.action;
         Ok(json!({ "operation": operation }))
+    }
+
+    async fn prepare_paste(&self, params: &ActionParams) -> Result<bool, ApiError> {
+        let session = params
+            .session_id
+            .as_deref()
+            .ok_or_else(|| ApiError::validation("session_id is required for paste"))?;
+        self.sessions
+            .prepare_paste(session)
+            .await
+            .map_err(session_error)
     }
 
     async fn end_session(&self, params: SessionParams) -> Result<Value, ApiError> {
@@ -224,7 +219,7 @@ impl ApiService {
         if deadline <= Instant::now() {
             return Err(ApiError::new("stale-action", "wipe challenge expired"));
         }
-        Ok(json!({ "operation": self.backend.wipe().await? }))
+        Ok(json!({ "operation": self.backend.mutate("", BackendMutation::Wipe).await? }))
     }
 }
 
@@ -348,41 +343,4 @@ fn error_response(error: ApiError) -> Value {
 
 pub fn error(code: &str, message: String) -> Value {
     error_response(ApiError::new(code, message))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ApiService;
-    use crate::fake::FakeBackend;
-    use serde_json::json;
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn validation_reserved_methods_and_wipe_challenges_are_stable() {
-        let api = ApiService::new(Arc::new(FakeBackend::default()));
-        assert_eq!(
-            api.dispatch("clipboard.history.query", json!({"limit": 0}))
-                .await["error"]["code"],
-            "validation-error"
-        );
-        assert_eq!(
-            api.dispatch("clipboard.entry.edit.begin", json!({})).await["error"]["code"],
-            "not-implemented"
-        );
-        assert_eq!(
-            api.dispatch("clipboard.nope", json!({})).await["error"]["code"],
-            "unsupported-method"
-        );
-        let challenge = api
-            .dispatch("clipboard.history.wipe.prepare", json!({}))
-            .await;
-        let id = challenge["data"]["challenge"]["id"].as_str().unwrap();
-        let result = api
-            .dispatch(
-                "clipboard.history.wipe.commit",
-                json!({"challenge_id": id, "response": "WIPE"}),
-            )
-            .await;
-        assert_eq!(result["data"]["operation"]["action"], "wipe");
-    }
 }

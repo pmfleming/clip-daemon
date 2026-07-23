@@ -7,7 +7,10 @@ use clipboard_history_client_sdk::{DatabaseReader, Entry, EntryReader};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    backend::{BackendError, BackendErrorKind, BackendResult, ClipboardBackend, HistoryQuery},
+    backend::{
+        BackendError, BackendErrorKind, BackendMutation, BackendResult, ClipboardBackend,
+        HistoryQuery,
+    },
     classification::{INSPECTION_LIMIT, bounded_preview, classify},
     model::{
         BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
@@ -228,32 +231,20 @@ impl ClipboardBackend for RingboardBackend {
         create_thumbnail(&loaded, &summary, edge)
     }
 
-    async fn restore(&self, opaque_id: &str) -> BackendResult<OperationResult> {
-        self.restore_entry(opaque_id)
-    }
-
-    async fn image_as_file(&self, opaque_id: &str) -> BackendResult<OperationResult> {
-        self.save_image_file(opaque_id)
-    }
-
-    async fn annotate(&self, opaque_id: &str) -> BackendResult<OperationResult> {
-        self.start_annotation(opaque_id)
-    }
-
-    async fn wipe(&self) -> BackendResult<OperationResult> {
-        self.wipe_entries()
-    }
-
-    async fn remove(&self, opaque_id: &str) -> BackendResult<OperationResult> {
-        self.remove_entry(opaque_id)
-    }
-
-    async fn set_favorite(
+    async fn mutate(
         &self,
         opaque_id: &str,
-        favorite: bool,
+        mutation: BackendMutation,
     ) -> BackendResult<OperationResult> {
-        self.move_entry(opaque_id, favorite)
+        match mutation {
+            BackendMutation::Restore => self.restore_entry(opaque_id),
+            BackendMutation::ImageAsFile => self.save_image_file(opaque_id),
+            BackendMutation::Annotate => self.start_annotation(opaque_id),
+            BackendMutation::Remove => self.remove_entry(opaque_id),
+            BackendMutation::SetFavorite(value) => self.move_entry(opaque_id, value),
+            BackendMutation::Wipe => self.wipe_entries(),
+            BackendMutation::Cleanup => self.cleanup_artifacts(),
+        }
     }
 
     async fn cancel_operation(&self, operation_id: &str) -> BackendResult<bool> {
@@ -266,10 +257,6 @@ impl ClipboardBackend for RingboardBackend {
                 task.abort();
                 true
             }))
-    }
-
-    async fn cleanup(&self) -> BackendResult<OperationResult> {
-        self.cleanup_artifacts()
     }
 }
 

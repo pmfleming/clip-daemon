@@ -61,6 +61,18 @@ impl RingboardBackend {
     }
 
     pub(super) fn start_annotation(&self, opaque_id: &str) -> BackendResult<OperationResult> {
+        let (input, output) = self.stage_annotation(opaque_id)?;
+        let mut operation = OperationResult::completed("annotate", "Satty annotation started");
+        operation.status = "started".into();
+        let task = tokio::spawn(run_annotation(input, output, operation.id.clone()));
+        self.operations
+            .lock()
+            .map_err(|_| operation_error("Clipboard operation state is unavailable"))?
+            .insert(operation.id.clone(), task);
+        Ok(operation)
+    }
+
+    fn stage_annotation(&self, opaque_id: &str) -> BackendResult<(PathBuf, PathBuf)> {
         let (entry, mut reader, summary) = self.selected(opaque_id)?;
         if summary.kind != EntryKind::Image {
             return Err(invalid_entry("Only image entries can be annotated"));
@@ -70,42 +82,7 @@ impl RingboardBackend {
         let output = unique_path(&directory, "png");
         let mut source = entry.to_file(&mut reader).map_err(operation_error)?;
         io::copy(&mut *source, &mut private_file(&input)?).map_err(operation_error)?;
-        let operation = OperationResult {
-            id: format!("operation-{}", Uuid::new_v4()),
-            action: "annotate".into(),
-            status: "started".into(),
-            message: "Satty annotation started".into(),
-            path: None,
-        };
-        let operation_id = operation.id.clone();
-        let log_id = operation_id.clone();
-        let task = tokio::spawn(async move {
-            let status = Command::new("satty")
-                .args(["--filename", input.to_string_lossy().as_ref()])
-                .args(["--output-filename", output.to_string_lossy().as_ref()])
-                .args([
-                    "--resize",
-                    "smart",
-                    "--early-exit",
-                    "--actions-on-enter",
-                    "save-to-file",
-                ])
-                .status()
-                .await;
-            if status.is_ok_and(|value| value.success())
-                && valid_edited_image(&output)
-                && let Err(error) = add_file_and_restore(&output, "image/png")
-            {
-                tracing::warn!(operation_id = %log_id, code = %error.kind.code(), "annotation result could not be restored");
-            }
-            let _ = fs::remove_file(input);
-            let _ = fs::remove_file(output);
-        });
-        self.operations
-            .lock()
-            .map_err(|_| operation_error("Clipboard operation state is unavailable"))?
-            .insert(operation_id, task);
-        Ok(operation)
+        Ok((input, output))
     }
 
     pub(super) fn remove_entry(&self, opaque_id: &str) -> BackendResult<OperationResult> {
@@ -180,6 +157,29 @@ impl RingboardBackend {
             "Clipboard history cleared",
         ))
     }
+}
+
+async fn run_annotation(input: PathBuf, output: PathBuf, operation_id: String) {
+    let status = Command::new("satty")
+        .args(["--filename", input.to_string_lossy().as_ref()])
+        .args(["--output-filename", output.to_string_lossy().as_ref()])
+        .args([
+            "--resize",
+            "smart",
+            "--early-exit",
+            "--actions-on-enter",
+            "save-to-file",
+        ])
+        .status()
+        .await;
+    if status.is_ok_and(|value| value.success())
+        && valid_edited_image(&output)
+        && let Err(error) = add_file_and_restore(&output, "image/png")
+    {
+        tracing::warn!(%operation_id, code = %error.kind.code(), "annotation result could not be restored");
+    }
+    let _ = fs::remove_file(input);
+    let _ = fs::remove_file(output);
 }
 
 fn add_and_restore(bytes: &[u8], mime: &str) -> BackendResult<()> {

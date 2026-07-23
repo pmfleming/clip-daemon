@@ -30,4 +30,21 @@ Architecture observations:
 - clone findings are only low-risk token windows (maximum score 15); the repeated details/thumbnail selected-entry transaction was removed;
 - all eight discovered tests pass and correctness extraction reports no failed or unknown tests.
 
+## Phases 3 and 4 follow-up
+
+The mutation/privacy implementation was reviewed again at `242c025`. The follow-up replaced the backend's repeated mutation methods with one typed mutation boundary, separated Satty staging from execution, and moved API contract coverage to an integration-test layer.
+
+| Signal | Before | After |
+|---|---:|---:|
+| entry-action function score | 110.10 | 60.93 |
+| annotation function score | 57.96 | 27.10 maximum across staged annotation functions |
+| fake mutation function score | 54.15 | 21.73 |
+| token-clone records | 71 | 53 |
+| minimum module locality | 97.0 | 100.0 |
+| API leverage | 57.5 | 60.5 |
+| Rust source lines | 2,822 | 2,785 |
+| all Rust lines including integration tests | 2,822 | 2,816 |
+
+Escape hatches remain at zero, maximum clone score remains low at 15, and all 11 tests pass across two test layers.
+
 Generated JSON remains under ignored `target/analysis/` and is intentionally not committed.
