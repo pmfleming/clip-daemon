@@ -15,9 +15,9 @@ The phase-1 baseline had these largest non-entrypoint function scores:
 |---|---:|---:|
 | `client::run` / request loop | 81.87 | 29.34 |
 | subscriber history polling | 71.34 | 19.43 |
-| bounded preview normalization | 66.81 | 17.58 maximum in classification module |
+| bounded preview normalization | 66.81 | 0.00 |
 | Ringboard history query | 61.82 | 20.50 |
-| semantic classification | 59.47 | 17.58 maximum in classification module |
+| semantic classification | 59.47 | 0.00 |
 
 The refactor separates JSONL request decoding/dispatch, isolates subscription change emission, uses small classification transformations, centralizes selected-entry loading, and extracts Ringboard content preview/thumbnail policy from database traversal. `ringboard.rs` fell from 400 to 290 physical lines. Despite adding the content module and tracked quality configuration, total Rust source lines fell from 1,778 to 1,776.
 
