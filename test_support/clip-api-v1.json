@@ -46,6 +46,7 @@
       {
         "name": "clipboard.entry.thumbnail",
         "params_example": {
+          "edge": 512,
           "entry_id": "entry-opaque",
           "revision": 1
         },

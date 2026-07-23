@@ -21,6 +21,7 @@ pub struct EntrySummary {
     pub mime: String,
     pub byte_size: u64,
     pub favorite: bool,
+    pub current: bool,
     pub preview: String,
 }
 
@@ -28,15 +29,41 @@ pub struct EntrySummary {
 pub struct HistoryPage {
     pub revision: u64,
     pub generation: u64,
+    pub current: Option<EntrySummary>,
     pub entries: Vec<EntrySummary>,
     pub has_more: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageMetadata {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilePreview {
+    pub display_name: String,
+    pub uri: String,
+    pub exists: bool,
+    pub operation: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntryDetails {
     pub entry: EntrySummary,
     pub text: Option<String>,
+    pub files: Vec<FilePreview>,
+    pub image: Option<ImageMetadata>,
     pub preview_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryThumbnail {
+    pub entry_id: String,
+    pub revision: u64,
+    pub path: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

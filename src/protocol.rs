@@ -44,7 +44,7 @@ pub const METHODS: &[(&str, &str, &str, Option<&str>)] = &[
     ),
     (
         "clipboard.entry.thumbnail",
-        r#"{"entry_id":"entry-opaque","revision":1}"#,
+        r#"{"entry_id":"entry-opaque","revision":1,"edge":512}"#,
         "thumbnail",
         None,
     ),

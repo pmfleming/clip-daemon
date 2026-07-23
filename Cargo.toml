@@ -16,12 +16,14 @@ clipboard-history-client-sdk = "=0.16.2"
 clipboard-history-core = "=0.16.2"
 futures = "0.3"
 hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "tiff", "webp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 zbus = { version = "5", features = ["tokio"] }
 

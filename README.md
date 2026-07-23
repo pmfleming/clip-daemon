@@ -30,6 +30,6 @@ nix run .#qualify
 {"op":"call","id":"q1","method":"clipboard.history.query","params":{"query":"","generation":1,"limit":100}}
 ```
 
-The foundation currently supports bounded read-only history queries/details, exact-MIME-first classification, opaque entry IDs, D-Bus/JSONL transport, and the checked `clip-api` v1 registry. Mutations and universal paste are reserved in the contract but return `not-implemented` until qualification and safety work is complete.
+Phase 1 supports bounded read-only history queries, semantic details, image thumbnails in a private cache, exact-MIME-first classification, daemon-parsed file metadata, opaque entry IDs, structured errors, D-Bus/JSONL transport, and the checked `clip-api` v1 registry. History metadata is polled only while a frontend subscription exists; changes publish monotonic reset/current events. Mutations and universal paste remain reserved in the contract and return `not-implemented` until qualification and safety work is complete.
 
 See [`docs/adr-0001-ringboard-facade.md`](docs/adr-0001-ringboard-facade.md).

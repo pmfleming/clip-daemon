@@ -1,10 +1,19 @@
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
-use zbus::{connection, object_server::SignalEmitter};
+use serde_json::{Map, Value, json};
+use tokio::{sync::Mutex, task::JoinHandle};
+use zbus::{connection, message::Header, object_server::SignalEmitter};
 
-use crate::{api, backend::ClipboardBackend, protocol};
+use crate::{api, backend::ClipboardBackend};
+
+mod subscription;
 
 pub const BUS_NAME: &str = "org.laufan.ClipDaemon";
 pub const OBJECT_PATH: &str = "/org/laufan/ClipDaemon";
@@ -12,6 +21,15 @@ pub const INTERFACE: &str = "org.laufan.ClipDaemon1";
 
 pub struct ClipDaemon {
     backend: Arc<dyn ClipboardBackend>,
+    sequence: AtomicU64,
+    event_revision: Arc<AtomicU64>,
+    subscriptions: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+}
+
+impl ClipDaemon {
+    fn next_id(&self, prefix: &str) -> String {
+        format!("{prefix}-{}", self.sequence.fetch_add(1, Ordering::Relaxed))
+    }
 }
 
 #[zbus::interface(name = "org.laufan.ClipDaemon1")]
@@ -32,33 +50,31 @@ impl ClipDaemon {
     async fn subscribe(
         &self,
         streams: Vec<String>,
+        #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> String {
-        if let Some(stream) = streams.iter().find(|stream| {
-            !protocol::STREAMS
-                .iter()
-                .any(|known| known.0 == stream.as_str())
-        }) {
-            return api::error("validation-error", format!("unknown stream: {stream}")).to_string();
-        }
-        let subscription_id = format!("subscription-{}", uuid::Uuid::new_v4());
-        for stream in &streams {
-            let event = json!({
-                "protocol": api::PROTOCOL, "version": api::VERSION,
-                "stream": stream, "event": "subscribed", "subscription_id": subscription_id
-            });
-            if let Err(error) = Self::event(&emitter, stream, &event.to_string()).await {
-                return api::error("subscription-unavailable", error.to_string()).to_string();
-            }
-        }
-        api::success(json!({
-            "subscription": { "id": subscription_id, "streams": streams }
-        }))
-        .to_string()
+        let Some(owner) = header.sender().map(|sender| sender.to_owned()) else {
+            return api::error(
+                "subscription-unavailable",
+                "D-Bus caller identity is unavailable".into(),
+            )
+            .to_string();
+        };
+        subscription::start(self, streams, owner, emitter).await
     }
 
     async fn cancel(&self, request_id: &str) -> String {
-        api::success(json!({ "cancelled": request_id })).to_string()
+        if let Some(task) = self.subscriptions.lock().await.remove(request_id) {
+            task.abort();
+            tracing::debug!(subscription_id = %request_id, "clipboard subscription cancelled");
+            return api::success(json!({ "cancelled": request_id, "kind": "subscription" }))
+                .to_string();
+        }
+        api::error(
+            "request-not-found",
+            format!("No active subscription named {request_id}"),
+        )
+        .to_string()
     }
 
     #[zbus(signal)]
@@ -66,12 +82,42 @@ impl ClipDaemon {
     -> zbus::Result<()>;
 }
 
+async fn emit_event(
+    emitter: &SignalEmitter<'_>,
+    stream: &str,
+    event: &str,
+    subscription_id: &str,
+    extra: Option<Value>,
+) {
+    let mut envelope = Map::from_iter([
+        ("protocol".into(), json!(api::PROTOCOL)),
+        ("version".into(), json!(api::VERSION)),
+        ("stream".into(), json!(stream)),
+        ("event".into(), json!(event)),
+        ("subscription_id".into(), json!(subscription_id)),
+    ]);
+    if let Some(Value::Object(fields)) = extra {
+        envelope.extend(fields);
+    }
+    if let Err(error) =
+        ClipDaemon::event(emitter, stream, &Value::Object(envelope).to_string()).await
+    {
+        tracing::warn!(%stream, %error, "clipboard subscription event could not be emitted");
+    }
+}
+
 pub async fn run(backend: Arc<dyn ClipboardBackend>) -> Result<()> {
+    let daemon = ClipDaemon {
+        backend,
+        sequence: AtomicU64::new(1),
+        event_revision: Arc::new(AtomicU64::new(0)),
+        subscriptions: Arc::new(Mutex::new(HashMap::new())),
+    };
     let _connection = connection::Builder::session()
         .context("connect to session D-Bus")?
         .name(BUS_NAME)
         .context("claim clip-daemon bus name")?
-        .serve_at(OBJECT_PATH, ClipDaemon { backend })
+        .serve_at(OBJECT_PATH, daemon)
         .context("export clip-daemon interface")?
         .build()
         .await
