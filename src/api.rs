@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -10,7 +11,7 @@ use crate::{
 
 pub const PROTOCOL: &str = protocol::NAME;
 pub const VERSION: u8 = protocol::VERSION;
-const MAX_QUERY_LIMIT: u64 = 200;
+const MAX_QUERY_LIMIT: usize = 200;
 const MAX_TEXT_BYTES: usize = 256 * 1024;
 
 #[derive(Debug)]
@@ -21,20 +22,16 @@ struct ApiError {
 }
 
 impl ApiError {
-    fn validation(message: impl Into<String>) -> Self {
+    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            code: "validation-error".into(),
+            code: code.into(),
             message: message.into(),
             retryable: false,
         }
     }
 
-    fn reserved(method: &str) -> Self {
-        Self {
-            code: "not-implemented".into(),
-            message: format!("{method} is reserved by clip-api v1 but is not implemented yet"),
-            retryable: false,
-        }
+    fn validation(message: impl Into<String>) -> Self {
+        Self::new("validation-error", message)
     }
 }
 
@@ -48,16 +45,29 @@ impl From<BackendError> for ApiError {
     }
 }
 
+#[derive(Deserialize)]
+struct QueryParams {
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    generation: u64,
+    #[serde(default = "default_query_limit")]
+    limit: usize,
+}
+
+#[derive(Deserialize)]
+struct EntryParams {
+    entry_id: String,
+    revision: Option<u64>,
+    edge: Option<u32>,
+}
+
 pub async fn dispatch(backend: Arc<dyn ClipboardBackend>, method: &str, params: Value) -> Value {
     tracing::debug!(%method, "clip-api request started");
-    let result = dispatch_method(backend, method, &params).await;
-    match result {
-        Ok(data) => {
-            tracing::debug!(%method, "clip-api request completed");
-            success(data)
-        }
+    match dispatch_method(backend, method, params).await {
+        Ok(data) => success(data),
         Err(error) => {
-            tracing::warn!(%method, code = error.code, "clip-api request failed");
+            tracing::warn!(%method, code = %error.code, "clip-api request failed");
             error_response(error)
         }
     }
@@ -66,69 +76,87 @@ pub async fn dispatch(backend: Arc<dyn ClipboardBackend>, method: &str, params: 
 async fn dispatch_method(
     backend: Arc<dyn ClipboardBackend>,
     method: &str,
-    params: &Value,
+    params: Value,
 ) -> Result<Value, ApiError> {
     match method {
-        "clipboard.history.query" => query(&backend, params).await,
-        "clipboard.entry.details" => details(&backend, params).await,
-        "clipboard.entry.thumbnail" => thumbnail(&backend, params).await,
+        "clipboard.history.query" => query(&backend, decode(params)?).await,
+        "clipboard.entry.details" => details(&backend, decode(params)?).await,
+        "clipboard.entry.thumbnail" => thumbnail(&backend, decode(params)?).await,
         "clipboard.session.begin" => Ok(session()),
         "clipboard.settings.get" => Ok(settings()),
-        _ if protocol::METHODS.iter().any(|item| item.0 == method) => {
-            Err(ApiError::reserved(method))
-        }
-        _ => Err(ApiError {
-            code: "unsupported-method".into(),
-            message: format!("Unsupported clip-api method: {method}"),
-            retryable: false,
-        }),
+        _ if protocol::METHODS.contains(&method) => Err(ApiError::new(
+            "not-implemented",
+            format!("{method} is reserved by clip-api v1 but is not implemented yet"),
+        )),
+        _ => Err(ApiError::new(
+            "unsupported-method",
+            format!("Unsupported clip-api method: {method}"),
+        )),
     }
 }
 
-async fn query(backend: &Arc<dyn ClipboardBackend>, params: &Value) -> Result<Value, ApiError> {
-    let limit = params.optional_u64("limit")?.unwrap_or(100);
-    if !(1..=MAX_QUERY_LIMIT).contains(&limit) {
+async fn query(
+    backend: &Arc<dyn ClipboardBackend>,
+    params: QueryParams,
+) -> Result<Value, ApiError> {
+    if !(1..=MAX_QUERY_LIMIT).contains(&params.limit) {
         return Err(ApiError::validation("limit must be between 1 and 200"));
     }
     let history = backend
         .query(HistoryQuery {
-            query: params.optional_string("query")?.unwrap_or_default(),
-            generation: params.optional_u64("generation")?.unwrap_or(0),
-            limit: limit as usize,
+            query: params.query,
+            generation: params.generation,
+            limit: params.limit,
         })
         .await?;
     Ok(json!({ "history": history }))
 }
 
-async fn details(backend: &Arc<dyn ClipboardBackend>, params: &Value) -> Result<Value, ApiError> {
-    let entry = backend
-        .details(params.require_string("entry_id")?, MAX_TEXT_BYTES)
-        .await?;
-    validate_revision(params, entry.entry.revision)?;
+async fn details(
+    backend: &Arc<dyn ClipboardBackend>,
+    params: EntryParams,
+) -> Result<Value, ApiError> {
+    validate_entry_id(&params.entry_id)?;
+    let entry = backend.details(&params.entry_id, MAX_TEXT_BYTES).await?;
+    validate_revision(params.revision, entry.entry.revision)?;
     Ok(json!({ "entry": entry }))
 }
 
-async fn thumbnail(backend: &Arc<dyn ClipboardBackend>, params: &Value) -> Result<Value, ApiError> {
-    let edge = params.optional_u64("edge")?.unwrap_or(512);
-    let edge = u32::try_from(edge).map_err(|_| ApiError::validation("edge is too large"))?;
+async fn thumbnail(
+    backend: &Arc<dyn ClipboardBackend>,
+    params: EntryParams,
+) -> Result<Value, ApiError> {
+    validate_entry_id(&params.entry_id)?;
     let thumbnail = backend
-        .thumbnail(params.require_string("entry_id")?, edge)
+        .thumbnail(&params.entry_id, params.edge.unwrap_or(512))
         .await?;
-    validate_revision(params, thumbnail.revision)?;
+    validate_revision(params.revision, thumbnail.revision)?;
     Ok(json!({ "thumbnail": thumbnail }))
 }
 
-fn validate_revision(params: &Value, actual: u64) -> Result<(), ApiError> {
-    if let Some(expected) = params.optional_u64("revision")?
-        && expected != actual
-    {
-        return Err(ApiError {
+fn decode<T: for<'de> Deserialize<'de>>(params: Value) -> Result<T, ApiError> {
+    serde_json::from_value(params).map_err(|error| ApiError::validation(error.to_string()))
+}
+
+fn validate_entry_id(id: &str) -> Result<(), ApiError> {
+    (!id.is_empty())
+        .then_some(())
+        .ok_or_else(|| ApiError::validation("entry_id is required"))
+}
+
+fn validate_revision(expected: Option<u64>, actual: u64) -> Result<(), ApiError> {
+    match expected {
+        Some(revision) if revision != actual => Err(ApiError {
             code: "stale-entry".into(),
             message: "Clipboard entry changed; refresh and try again".into(),
             retryable: true,
-        });
+        }),
+        _ => Ok(()),
     }
-    Ok(())
+}
+
+const fn default_query_limit() -> usize {
+    100
 }
 
 fn session() -> Value {
@@ -150,61 +178,19 @@ fn settings() -> Value {
     }})
 }
 
-trait Params {
-    fn optional_string(&self, name: &str) -> Result<Option<String>, ApiError>;
-    fn optional_u64(&self, name: &str) -> Result<Option<u64>, ApiError>;
-    fn require_string(&self, name: &str) -> Result<&str, ApiError>;
-}
-
-impl Params for Value {
-    fn optional_string(&self, name: &str) -> Result<Option<String>, ApiError> {
-        match self.get(name) {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::String(value)) => Ok(Some(value.clone())),
-            _ => Err(ApiError::validation(format!("'{name}' must be a string"))),
-        }
-    }
-
-    fn optional_u64(&self, name: &str) -> Result<Option<u64>, ApiError> {
-        match self.get(name) {
-            None | Some(Value::Null) => Ok(None),
-            Some(value) => value.as_u64().map(Some).ok_or_else(|| {
-                ApiError::validation(format!("'{name}' must be an unsigned integer"))
-            }),
-        }
-    }
-
-    fn require_string(&self, name: &str) -> Result<&str, ApiError> {
-        self.get(name)
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| ApiError::validation(format!("'{name}' is required")))
-    }
-}
-
 pub fn success(data: Value) -> Value {
     json!({ "protocol": PROTOCOL, "version": VERSION, "ok": true, "data": data })
 }
 
 fn error_response(error: ApiError) -> Value {
     json!({
-        "protocol": PROTOCOL,
-        "version": VERSION,
-        "ok": false,
-        "error": {
-            "code": error.code,
-            "message": error.message,
-            "retryable": error.retryable
-        }
+        "protocol": PROTOCOL, "version": VERSION, "ok": false,
+        "error": { "code": error.code, "message": error.message, "retryable": error.retryable }
     })
 }
 
 pub fn error(code: &str, message: String) -> Value {
-    error_response(ApiError {
-        code: code.into(),
-        message,
-        retryable: false,
-    })
+    error_response(ApiError::new(code, message))
 }
 
 #[cfg(test)]

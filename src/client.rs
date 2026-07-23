@@ -7,7 +7,6 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::Mutex,
-    task::JoinSet,
 };
 
 use crate::{
@@ -46,63 +45,94 @@ pub async fn run() -> Result<()> {
     if let Some(connection) = connection.clone() {
         spawn_events(connection, Arc::clone(&output));
     }
-    let mut tasks = JoinSet::new();
+    request_loop(connection, output).await
+}
+
+async fn request_loop(connection: Option<zbus::Connection>, output: Output) -> Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = lines.next_line().await.context("read client request")? {
-        if line.trim().is_empty() {
+        let Some(request) = decode_request(&line, &output).await? else {
             continue;
-        }
-        let request: Request = match serde_json::from_str(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                emit(
-                    &output,
-                    &json!({"kind":"protocol-error","error":error.to_string()}),
-                )
-                .await?;
-                continue;
-            }
         };
-        match request {
-            Request::Call { id, method, params } => {
-                let connection = connection.clone();
-                let output = Arc::clone(&output);
-                tasks.spawn(async move {
-                    let response = call(&connection, &method, params)
-                        .await
-                        .unwrap_or_else(|_| {
-                            api::error(
-                                "daemon-unavailable",
-                                "clip-daemon session service is unavailable".into(),
-                            )
-                        });
-                    let _ = emit(
-                        &output,
-                        &json!({"kind":"response","id":id,"ok":true,"response":response}),
-                    )
-                    .await;
-                });
-            }
-            Request::Subscribe { id, streams } => {
-                let response = transport_call(&connection, "Subscribe", &(streams,)).await;
-                emit_transport(&output, &id, response).await?;
-            }
-            Request::Cancel { id, request_id } => {
-                let response = transport_call(&connection, "Cancel", &(request_id.as_str(),)).await;
-                emit_transport(&output, &id, response).await?;
-            }
-            Request::Shutdown { id } => {
-                tasks.abort_all();
-                emit(
-                    &output,
-                    &json!({"kind":"response","id":id,"ok":true,"response":{"shutdown":true}}),
-                )
-                .await?;
-                break;
-            }
+        if !handle_request(request, &connection, &output).await? {
+            break;
         }
     }
     Ok(())
+}
+
+async fn decode_request(line: &str, output: &Output) -> Result<Option<Request>> {
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+    match serde_json::from_str(line) {
+        Ok(request) => Ok(Some(request)),
+        Err(error) => {
+            emit(
+                output,
+                &json!({"kind":"protocol-error","error":error.to_string()}),
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
+async fn handle_request(
+    request: Request,
+    connection: &Option<zbus::Connection>,
+    output: &Output,
+) -> Result<bool> {
+    match request {
+        Request::Call { id, method, params } => {
+            tokio::spawn(run_call(
+                connection.clone(),
+                Arc::clone(output),
+                id,
+                method,
+                params,
+            ));
+        }
+        Request::Subscribe { id, streams } => {
+            let response = transport_call(connection, "Subscribe", &(streams,)).await;
+            emit_transport(output, &id, response).await?;
+        }
+        Request::Cancel { id, request_id } => {
+            let response = transport_call(connection, "Cancel", &(request_id.as_str(),)).await;
+            emit_transport(output, &id, response).await?;
+        }
+        Request::Shutdown { id } => {
+            emit(
+                output,
+                &json!({"kind":"response","id":id,"ok":true,"response":{"shutdown":true}}),
+            )
+            .await?;
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn run_call(
+    connection: Option<zbus::Connection>,
+    output: Output,
+    id: String,
+    method: String,
+    params: Value,
+) {
+    let response = call(&connection, &method, params)
+        .await
+        .unwrap_or_else(|_| {
+            api::error(
+                "daemon-unavailable",
+                "clip-daemon session service is unavailable".into(),
+            )
+        });
+    let _ = emit(
+        &output,
+        &json!({"kind":"response","id":id,"ok":true,"response":response}),
+    )
+    .await;
 }
 
 async fn proxy(connection: &Option<zbus::Connection>) -> Result<zbus::Proxy<'_>> {

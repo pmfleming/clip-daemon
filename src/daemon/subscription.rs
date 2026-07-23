@@ -18,11 +18,9 @@ struct RequestedStreams {
 impl RequestedStreams {
     fn parse(streams: &[String]) -> Option<Self> {
         if streams.is_empty()
-            || streams.iter().any(|requested| {
-                !protocol::STREAMS
-                    .iter()
-                    .any(|(supported, _)| requested == supported)
-            })
+            || streams
+                .iter()
+                .any(|requested| !protocol::STREAMS.contains(&requested.as_str()))
         {
             return None;
         }
@@ -31,6 +29,10 @@ impl RequestedStreams {
             history: wants(protocol::stream::HISTORY),
             current: wants(protocol::stream::CURRENT),
         })
+    }
+
+    const fn watches_clipboard(self) -> bool {
+        self.history || self.current
     }
 }
 
@@ -60,9 +62,13 @@ pub(super) async fn start(
         for stream in &task_streams {
             emit_event(&destination, stream, "subscribed", &task_id, None).await;
         }
-        tokio::select! {
-            () = poll_history(destination.clone(), backend, event_revision, task_id.clone(), requested) => {}
-            () = wait_for_owner_loss(connection, owner) => {}
+        if requested.watches_clipboard() {
+            tokio::select! {
+                () = poll_history(destination.clone(), backend, event_revision, task_id.clone(), requested) => {}
+                () = wait_for_owner_loss(connection, owner) => {}
+            }
+        } else {
+            wait_for_owner_loss(connection, owner).await;
         }
         subscriptions.lock().await.remove(&task_id);
         tracing::debug!(subscription_id = %task_id, "clipboard subscription ended");
@@ -79,54 +85,64 @@ async fn poll_history(
     subscription_id: String,
     requested: RequestedStreams,
 ) {
-    if !requested.history && !requested.current {
-        std::future::pending::<()>().await;
-    }
     let mut previous = backend.change_token().await.ok();
     let mut timer = tokio::time::interval(Duration::from_millis(500));
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         timer.tick().await;
-        let token = match backend.change_token().await {
-            Ok(token) => token,
-            Err(error) => {
-                emit_event(
-                    &emitter,
-                    protocol::stream::HISTORY,
-                    "unavailable",
-                    &subscription_id,
-                    Some(json!({ "error": { "code": error.kind.code(), "message": error.to_string() } })),
-                )
-                .await;
-                continue;
+        match backend.change_token().await {
+            Ok(token) if previous.replace(token) != Some(token) => {
+                emit_changes(&emitter, &event_revision, &subscription_id, requested).await;
             }
-        };
-        if previous.replace(token) == Some(token) {
-            continue;
-        }
-        let revision = event_revision.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        let data = Some(json!({ "data": { "revision": revision, "change": "reset" } }));
-        if requested.history {
-            emit_event(
-                &emitter,
-                protocol::stream::HISTORY,
-                "reset",
-                &subscription_id,
-                data.clone(),
-            )
-            .await;
-        }
-        if requested.current {
-            emit_event(
-                &emitter,
-                protocol::stream::CURRENT,
-                "changed",
-                &subscription_id,
-                data,
-            )
-            .await;
+            Ok(_) => {}
+            Err(error) => emit_unavailable(&emitter, &subscription_id, error).await,
         }
     }
+}
+
+async fn emit_changes(
+    emitter: &SignalEmitter<'_>,
+    event_revision: &std::sync::atomic::AtomicU64,
+    subscription_id: &str,
+    requested: RequestedStreams,
+) {
+    let revision = event_revision.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let data = Some(json!({ "data": { "revision": revision, "change": "reset" } }));
+    if requested.history {
+        emit_event(
+            emitter,
+            protocol::stream::HISTORY,
+            "reset",
+            subscription_id,
+            data.clone(),
+        )
+        .await;
+    }
+    if requested.current {
+        emit_event(
+            emitter,
+            protocol::stream::CURRENT,
+            "changed",
+            subscription_id,
+            data,
+        )
+        .await;
+    }
+}
+
+async fn emit_unavailable(
+    emitter: &SignalEmitter<'_>,
+    subscription_id: &str,
+    error: crate::backend::BackendError,
+) {
+    emit_event(
+        emitter,
+        protocol::stream::HISTORY,
+        "unavailable",
+        subscription_id,
+        Some(json!({ "error": { "code": error.kind.code(), "message": error.to_string() } })),
+    )
+    .await;
 }
 
 async fn wait_for_owner_loss(connection: zbus::Connection, owner: UniqueName<'static>) {
