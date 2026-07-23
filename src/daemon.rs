@@ -51,7 +51,10 @@ impl ClipDaemon {
                 return api::error("subscription-unavailable", error.to_string()).to_string();
             }
         }
-        api::success(json!({ "subscription_id": subscription_id, "streams": streams })).to_string()
+        api::success(json!({
+            "subscription": { "id": subscription_id, "streams": streams }
+        }))
+        .to_string()
     }
 
     async fn cancel(&self, request_id: &str) -> String {
