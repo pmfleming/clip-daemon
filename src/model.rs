@@ -72,3 +72,24 @@ pub struct BackendStatus {
     pub engine: String,
     pub detail: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperationResult {
+    pub id: String,
+    pub action: String,
+    pub status: String,
+    pub message: String,
+    pub path: Option<String>,
+}
+
+impl OperationResult {
+    pub fn completed(action: &str, message: &str) -> Self {
+        Self {
+            id: format!("operation-{}", uuid::Uuid::new_v4()),
+            action: action.into(),
+            status: "completed".into(),
+            message: message.into(),
+            path: None,
+        }
+    }
+}

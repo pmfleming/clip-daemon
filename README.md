@@ -30,7 +30,9 @@ nix run .#qualify
 {"op":"call","id":"q1","method":"clipboard.history.query","params":{"query":"","generation":1,"limit":100}}
 ```
 
-Phase 1 supports bounded read-only history queries, semantic details, image thumbnails in a private cache, exact-MIME-first classification, daemon-parsed file metadata, opaque entry IDs, structured errors, D-Bus/JSONL transport, and the checked `clip-api` v1 registry. History metadata is polled only while a frontend subscription exists; changes publish monotonic reset/current events. Mutations and universal paste remain reserved in the contract and return `not-implemented` until qualification and safety work is complete.
+The daemon supports bounded history queries, semantic details, private image thumbnails, exact-MIME restoration through Ringboard, opaque entry IDs, structured errors, D-Bus/JSONL transport, and the checked `clip-api` v1 registry. History metadata is polled only while a frontend subscription exists.
+
+Phase 3 adds copy and compositor-aware paste sessions, terminal/GUI shortcuts after the picker is hidden, image-as-file materialization, Satty annotation with validated PNG return, and two-phase history wipe. Generated files use collision-safe names and private runtime/cache permissions. Ringboard remains the only selection owner, avoiding a second restore/capture pipeline.
 
 Run the local quality review with:
 

@@ -332,6 +332,7 @@ dependencies = [
  "futures",
  "hex",
  "image",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

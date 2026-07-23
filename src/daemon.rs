@@ -11,7 +11,10 @@ use serde_json::{Map, Value, json};
 use tokio::{sync::Mutex, task::JoinHandle};
 use zbus::{connection, message::Header, object_server::SignalEmitter};
 
-use crate::{api, backend::ClipboardBackend};
+use crate::{
+    api::{self, ApiService},
+    backend::ClipboardBackend,
+};
 
 mod subscription;
 
@@ -20,7 +23,7 @@ pub const OBJECT_PATH: &str = "/org/laufan/ClipDaemon";
 pub const INTERFACE: &str = "org.laufan.ClipDaemon1";
 
 pub struct ClipDaemon {
-    backend: Arc<dyn ClipboardBackend>,
+    api: Arc<ApiService>,
     sequence: AtomicU64,
     event_revision: Arc<AtomicU64>,
     subscriptions: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
@@ -42,9 +45,7 @@ impl ClipDaemon {
                     .to_string();
             }
         };
-        api::dispatch(Arc::clone(&self.backend), method, params)
-            .await
-            .to_string()
+        self.api.dispatch(method, params).await.to_string()
     }
 
     async fn subscribe(
@@ -108,7 +109,7 @@ async fn emit_event(
 
 pub async fn run(backend: Arc<dyn ClipboardBackend>) -> Result<()> {
     let daemon = ClipDaemon {
-        backend,
+        api: Arc::new(ApiService::new(backend)),
         sequence: AtomicU64::new(1),
         event_revision: Arc::new(AtomicU64::new(0)),
         subscriptions: Arc::new(Mutex::new(HashMap::new())),

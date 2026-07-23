@@ -7,10 +7,13 @@ use sha2::{Digest, Sha256};
 use crate::{
     backend::{BackendError, BackendErrorKind, BackendResult, ClipboardBackend, HistoryQuery},
     classification::{INSPECTION_LIMIT, bounded_preview, classify},
-    model::{BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage},
+    model::{
+        BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
+    },
 };
 
 mod content;
+mod mutation;
 
 use content::{create_thumbnail, detail_facts, invalid_entry, read_bounded};
 
@@ -219,6 +222,22 @@ impl ClipboardBackend for RingboardBackend {
             .to_file(&mut reader)
             .map_err(|_| invalid_entry("Could not open clipboard image"))?;
         create_thumbnail(&loaded, &summary, edge)
+    }
+
+    async fn restore(&self, opaque_id: &str) -> BackendResult<OperationResult> {
+        self.restore_entry(opaque_id)
+    }
+
+    async fn image_as_file(&self, opaque_id: &str) -> BackendResult<OperationResult> {
+        self.save_image_file(opaque_id)
+    }
+
+    async fn annotate(&self, opaque_id: &str) -> BackendResult<OperationResult> {
+        self.start_annotation(opaque_id)
+    }
+
+    async fn wipe(&self) -> BackendResult<OperationResult> {
+        self.wipe_entries()
     }
 }
 

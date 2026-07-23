@@ -51,7 +51,7 @@ pub(super) async fn start(
     };
     let id = daemon.next_id("subscription");
     let destination = emitter.set_destination(owner.clone().into()).to_owned();
-    let backend = Arc::clone(&daemon.backend);
+    let backend = daemon.api.backend();
     let subscriptions = Arc::clone(&daemon.subscriptions);
     let event_revision = Arc::clone(&daemon.event_revision);
     let task_id = id.clone();

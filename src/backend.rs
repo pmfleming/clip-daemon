@@ -2,7 +2,7 @@ use std::{error::Error, fmt};
 
 use async_trait::async_trait;
 
-use crate::model::{BackendStatus, EntryDetails, EntryThumbnail, HistoryPage};
+use crate::model::{BackendStatus, EntryDetails, EntryThumbnail, HistoryPage, OperationResult};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryQuery {
@@ -74,4 +74,8 @@ pub trait ClipboardBackend: Send + Sync {
     async fn query(&self, query: HistoryQuery) -> BackendResult<HistoryPage>;
     async fn details(&self, opaque_id: &str, max_text_bytes: usize) -> BackendResult<EntryDetails>;
     async fn thumbnail(&self, opaque_id: &str, edge: u32) -> BackendResult<EntryThumbnail>;
+    async fn restore(&self, opaque_id: &str) -> BackendResult<OperationResult>;
+    async fn image_as_file(&self, opaque_id: &str) -> BackendResult<OperationResult>;
+    async fn annotate(&self, opaque_id: &str) -> BackendResult<OperationResult>;
+    async fn wipe(&self) -> BackendResult<OperationResult>;
 }

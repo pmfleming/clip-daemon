@@ -115,6 +115,17 @@ fn image_dimensions(bytes: &[u8]) -> Option<ImageMetadata> {
     Some(ImageMetadata { width, height })
 }
 
+pub(super) fn clear_cache() -> BackendResult<()> {
+    let directory = cache_root()?.join("clip-daemon");
+    match fs::remove_dir_all(directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(BackendError::unavailable(
+            "Clipboard cache could not be cleared",
+        )),
+    }
+}
+
 fn thumbnail_directory() -> BackendResult<PathBuf> {
     let directory = cache_root()?.join("clip-daemon/thumbnails");
     fs::create_dir_all(&directory)

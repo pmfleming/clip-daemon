@@ -16,7 +16,7 @@
             version = "0.1.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
-            nativeBuildInputs = [ pkgs.pkg-config ];
+            nativeBuildInputs = [ pkgs.makeWrapper pkgs.pkg-config ];
             buildInputs = [ pkgs.dbus ];
             strictDeps = true;
             # Ringboard 0.16.2 still declares core_io_borrowed_buf as nightly-only.
@@ -29,6 +29,10 @@
                 $out/share/systemd/user/clip-daemon.service \
                 $out/share/dbus-1/services/org.laufan.ClipDaemon.service \
                 --replace-fail @out@ $out
+            '';
+            postFixup = ''
+              wrapProgram $out/bin/clip-daemon \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.hyprland pkgs.libnotify pkgs.satty pkgs.systemd ]}
             '';
             meta = {
               description = "Ringboard policy and clip-api daemon for Shelllist";

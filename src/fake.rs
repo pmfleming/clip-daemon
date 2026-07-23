@@ -4,7 +4,9 @@ use async_trait::async_trait;
 
 use crate::{
     backend::{BackendError, BackendResult, ClipboardBackend, HistoryQuery},
-    model::{BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage},
+    model::{
+        BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
+    },
 };
 
 #[derive(Clone, Default)]
@@ -23,6 +25,17 @@ impl FakeBackend {
         self.entries
             .read()
             .map_err(|_| BackendError::unavailable("Fake clipboard backend is unavailable"))
+    }
+
+    fn operation(&self, opaque_id: &str, action: &str) -> BackendResult<OperationResult> {
+        self.entries()?
+            .iter()
+            .find(|item| item.entry.id == opaque_id)
+            .ok_or_else(|| BackendError::not_found("Unknown clipboard entry ID"))?;
+        Ok(OperationResult::completed(
+            action,
+            "Fake operation completed",
+        ))
     }
 }
 
@@ -80,6 +93,26 @@ impl ClipboardBackend for FakeBackend {
             "No thumbnail fixture for {}",
             details.entry.id
         )))
+    }
+
+    async fn restore(&self, opaque_id: &str) -> BackendResult<OperationResult> {
+        self.operation(opaque_id, "copy")
+    }
+
+    async fn image_as_file(&self, opaque_id: &str) -> BackendResult<OperationResult> {
+        self.operation(opaque_id, "image-as-file")
+    }
+
+    async fn annotate(&self, opaque_id: &str) -> BackendResult<OperationResult> {
+        self.operation(opaque_id, "annotate")
+    }
+
+    async fn wipe(&self) -> BackendResult<OperationResult> {
+        self.entries
+            .write()
+            .map_err(|_| BackendError::unavailable("Fake clipboard backend is unavailable"))?
+            .clear();
+        Ok(OperationResult::completed("wipe", "Fake history cleared"))
     }
 }
 

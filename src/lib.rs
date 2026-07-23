@@ -9,3 +9,4 @@ pub mod fake;
 pub mod model;
 pub mod protocol;
 pub mod ringboard;
+pub mod session;
