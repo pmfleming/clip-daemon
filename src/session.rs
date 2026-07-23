@@ -185,12 +185,22 @@ fn is_terminal(class: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_terminal;
+    use super::{SessionManager, is_terminal};
 
     #[test]
     fn terminal_targets_use_terminal_paste_shortcut() {
         assert!(is_terminal("com.mitchellh.ghostty"));
         assert!(is_terminal("org.kde.konsole"));
         assert!(!is_terminal("firefox"));
+    }
+
+    #[tokio::test]
+    async fn stale_sessions_never_prepare_a_paste() {
+        assert!(
+            SessionManager::default()
+                .prepare_paste("missing")
+                .await
+                .is_err()
+        );
     }
 }

@@ -71,9 +71,13 @@ impl ClipDaemon {
             return api::success(json!({ "cancelled": request_id, "kind": "subscription" }))
                 .to_string();
         }
+        if self.api.cancel_operation(request_id).await {
+            return api::success(json!({ "cancelled": request_id, "kind": "operation" }))
+                .to_string();
+        }
         api::error(
             "request-not-found",
-            format!("No active subscription named {request_id}"),
+            format!("No active subscription or operation named {request_id}"),
         )
         .to_string()
     }

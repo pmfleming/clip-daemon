@@ -9,11 +9,12 @@ use std::{
 use clipboard_history_client_sdk::{
     DatabaseReader, EntryReader,
     api::{
-        AddRequest, RemoveRequest, connect_to_paste_server, connect_to_server, send_paste_buffer,
+        AddRequest, MoveToFrontRequest, RemoveRequest, connect_to_paste_server, connect_to_server,
+        send_paste_buffer,
     },
     core::{
         dirs::{data_dir, paste_socket_file, socket_file},
-        protocol::{AddResponse, MimeType, RingKind},
+        protocol::{AddResponse, MimeType, MoveToFrontResponse, RingKind},
     },
 };
 use image::ImageReader;
@@ -77,7 +78,8 @@ impl RingboardBackend {
             path: None,
         };
         let operation_id = operation.id.clone();
-        tokio::spawn(async move {
+        let log_id = operation_id.clone();
+        let task = tokio::spawn(async move {
             let status = Command::new("satty")
                 .args(["--filename", input.to_string_lossy().as_ref()])
                 .args(["--output-filename", output.to_string_lossy().as_ref()])
@@ -94,12 +96,68 @@ impl RingboardBackend {
                 && valid_edited_image(&output)
                 && let Err(error) = add_file_and_restore(&output, "image/png")
             {
-                tracing::warn!(%operation_id, code = %error.kind.code(), "annotation result could not be restored");
+                tracing::warn!(operation_id = %log_id, code = %error.kind.code(), "annotation result could not be restored");
             }
             let _ = fs::remove_file(input);
             let _ = fs::remove_file(output);
         });
+        self.operations
+            .lock()
+            .map_err(|_| operation_error("Clipboard operation state is unavailable"))?
+            .insert(operation_id, task);
         Ok(operation)
+    }
+
+    pub(super) fn remove_entry(&self, opaque_id: &str) -> BackendResult<OperationResult> {
+        let raw_id = self.resolve(opaque_id)?;
+        let server = connect_to_server(&socket_address(socket_file())?).map_err(operation_error)?;
+        let response = RemoveRequest::response(server, raw_id).map_err(operation_error)?;
+        if response.error.is_some() {
+            return Err(operation_error("Ringboard rejected the entry removal"));
+        }
+        Ok(OperationResult::completed(
+            "delete",
+            "Clipboard entry deleted",
+        ))
+    }
+
+    pub(super) fn move_entry(
+        &self,
+        opaque_id: &str,
+        favorite: bool,
+    ) -> BackendResult<OperationResult> {
+        let raw_id = self.resolve(opaque_id)?;
+        let server = connect_to_server(&socket_address(socket_file())?).map_err(operation_error)?;
+        let target = if favorite {
+            RingKind::Favorites
+        } else {
+            RingKind::Main
+        };
+        let response =
+            MoveToFrontRequest::response(server, raw_id, Some(target)).map_err(operation_error)?;
+        if matches!(response, MoveToFrontResponse::Error(_)) {
+            return Err(operation_error("Ringboard rejected the favorite change"));
+        }
+        let action = if favorite { "favorite" } else { "unfavorite" };
+        Ok(OperationResult::completed(action, "Favorite state updated"))
+    }
+
+    pub(super) fn cleanup_artifacts(&self) -> BackendResult<OperationResult> {
+        for (_, task) in self
+            .operations
+            .lock()
+            .map_err(|_| operation_error("Clipboard operation state is unavailable"))?
+            .drain()
+        {
+            task.abort();
+        }
+        super::content::clear_cache()?;
+        let runtime = runtime_directory("clip-daemon")?;
+        fs::remove_dir_all(&runtime).map_err(operation_error)?;
+        Ok(OperationResult::completed(
+            "cleanup",
+            "Clipboard caches cleared",
+        ))
     }
 
     pub(super) fn wipe_entries(&self) -> BackendResult<OperationResult> {
@@ -116,7 +174,7 @@ impl RingboardBackend {
                 return Err(operation_error("Ringboard rejected a history removal"));
             }
         }
-        super::content::clear_cache()?;
+        self.cleanup_artifacts()?;
         Ok(OperationResult::completed(
             "wipe",
             "Clipboard history cleared",

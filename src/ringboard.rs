@@ -1,5 +1,7 @@
 use std::{collections::HashMap, sync::Mutex};
 
+use tokio::task::JoinHandle;
+
 use async_trait::async_trait;
 use clipboard_history_client_sdk::{DatabaseReader, Entry, EntryReader};
 use sha2::{Digest, Sha256};
@@ -56,6 +58,7 @@ impl QueryAccumulator<'_> {
 pub struct RingboardBackend {
     ids: Mutex<HashMap<String, u64>>,
     revision: Mutex<RevisionState>,
+    operations: Mutex<HashMap<String, JoinHandle<()>>>,
 }
 
 impl Default for RingboardBackend {
@@ -63,6 +66,7 @@ impl Default for RingboardBackend {
         Self {
             ids: Mutex::new(HashMap::new()),
             revision: Mutex::new(RevisionState::default()),
+            operations: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -238,6 +242,34 @@ impl ClipboardBackend for RingboardBackend {
 
     async fn wipe(&self) -> BackendResult<OperationResult> {
         self.wipe_entries()
+    }
+
+    async fn remove(&self, opaque_id: &str) -> BackendResult<OperationResult> {
+        self.remove_entry(opaque_id)
+    }
+
+    async fn set_favorite(
+        &self,
+        opaque_id: &str,
+        favorite: bool,
+    ) -> BackendResult<OperationResult> {
+        self.move_entry(opaque_id, favorite)
+    }
+
+    async fn cancel_operation(&self, operation_id: &str) -> BackendResult<bool> {
+        Ok(self
+            .operations
+            .lock()
+            .map_err(|_| lock_error())?
+            .remove(operation_id)
+            .is_some_and(|task| {
+                task.abort();
+                true
+            }))
+    }
+
+    async fn cleanup(&self) -> BackendResult<OperationResult> {
+        self.cleanup_artifacts()
     }
 }
 

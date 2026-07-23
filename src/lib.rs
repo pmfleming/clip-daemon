@@ -10,3 +10,4 @@ pub mod model;
 pub mod protocol;
 pub mod ringboard;
 pub mod session;
+pub mod settings;

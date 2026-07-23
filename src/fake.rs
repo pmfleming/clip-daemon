@@ -114,6 +114,47 @@ impl ClipboardBackend for FakeBackend {
             .clear();
         Ok(OperationResult::completed("wipe", "Fake history cleared"))
     }
+
+    async fn remove(&self, opaque_id: &str) -> BackendResult<OperationResult> {
+        let mut entries = self
+            .entries
+            .write()
+            .map_err(|_| BackendError::unavailable("Fake clipboard backend is unavailable"))?;
+        let position = entries
+            .iter()
+            .position(|item| item.entry.id == opaque_id)
+            .ok_or_else(|| BackendError::not_found("Unknown clipboard entry ID"))?;
+        entries.remove(position);
+        Ok(OperationResult::completed("delete", "Fake entry deleted"))
+    }
+
+    async fn set_favorite(
+        &self,
+        opaque_id: &str,
+        favorite: bool,
+    ) -> BackendResult<OperationResult> {
+        let mut entries = self
+            .entries
+            .write()
+            .map_err(|_| BackendError::unavailable("Fake clipboard backend is unavailable"))?;
+        let entry = entries
+            .iter_mut()
+            .find(|item| item.entry.id == opaque_id)
+            .ok_or_else(|| BackendError::not_found("Unknown clipboard entry ID"))?;
+        entry.entry.favorite = favorite;
+        Ok(OperationResult::completed(
+            if favorite { "favorite" } else { "unfavorite" },
+            "Fake favorite updated",
+        ))
+    }
+
+    async fn cancel_operation(&self, _operation_id: &str) -> BackendResult<bool> {
+        Ok(false)
+    }
+
+    async fn cleanup(&self) -> BackendResult<OperationResult> {
+        Ok(OperationResult::completed("cleanup", "Fake caches cleared"))
+    }
 }
 
 #[cfg(test)]
@@ -167,5 +208,9 @@ mod tests {
         );
         assert_eq!(backend.change_token().await.unwrap(), 5);
         assert!(backend.details("missing", 10).await.is_err());
+        backend.set_favorite("other", true).await.unwrap();
+        assert!(backend.details("other", 10).await.unwrap().entry.favorite);
+        backend.remove("other").await.unwrap();
+        assert!(backend.details("other", 10).await.is_err());
     }
 }

@@ -78,4 +78,9 @@ pub trait ClipboardBackend: Send + Sync {
     async fn image_as_file(&self, opaque_id: &str) -> BackendResult<OperationResult>;
     async fn annotate(&self, opaque_id: &str) -> BackendResult<OperationResult>;
     async fn wipe(&self) -> BackendResult<OperationResult>;
+    async fn remove(&self, opaque_id: &str) -> BackendResult<OperationResult>;
+    async fn set_favorite(&self, opaque_id: &str, favorite: bool)
+    -> BackendResult<OperationResult>;
+    async fn cancel_operation(&self, operation_id: &str) -> BackendResult<bool>;
+    async fn cleanup(&self) -> BackendResult<OperationResult>;
 }

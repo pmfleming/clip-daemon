@@ -13,6 +13,7 @@ use crate::{
     backend::{BackendError, ClipboardBackend, HistoryQuery},
     protocol,
     session::SessionManager,
+    settings::{SettingsManager, SettingsUpdate},
 };
 
 pub const PROTOCOL: &str = protocol::NAME;
@@ -24,6 +25,7 @@ pub struct ApiService {
     backend: Arc<dyn ClipboardBackend>,
     sessions: SessionManager,
     wipe_challenges: Mutex<HashMap<String, Instant>>,
+    settings: SettingsManager,
 }
 
 impl ApiService {
@@ -32,11 +34,19 @@ impl ApiService {
             backend,
             sessions: SessionManager::default(),
             wipe_challenges: Mutex::new(HashMap::new()),
+            settings: SettingsManager::default(),
         }
     }
 
     pub(crate) fn backend(&self) -> Arc<dyn ClipboardBackend> {
         Arc::clone(&self.backend)
+    }
+
+    pub async fn cancel_operation(&self, operation_id: &str) -> bool {
+        self.backend
+            .cancel_operation(operation_id)
+            .await
+            .unwrap_or(false)
     }
 
     pub async fn dispatch(&self, method: &str, params: Value) -> Value {
@@ -61,7 +71,9 @@ impl ApiService {
             "clipboard.session.hidden" => self.hide_session(decode(params)?).await,
             "clipboard.history.wipe.prepare" => self.prepare_wipe().await,
             "clipboard.history.wipe.commit" => self.commit_wipe(decode(params)?).await,
-            "clipboard.settings.get" => Ok(settings()),
+            "clipboard.capture.setPaused" => self.set_paused(decode(params)?).await,
+            "clipboard.settings.get" => self.get_settings(),
+            "clipboard.settings.update" => self.update_settings(decode(params)?).await,
             _ if protocol::METHODS.contains(&method) => Err(ApiError::new(
                 "not-implemented",
                 format!("{method} is reserved by clip-api v1 but is not implemented yet"),
@@ -142,6 +154,11 @@ impl ApiService {
             }
             "image-as-file" => self.backend.image_as_file(&params.entry_id).await?,
             "annotate" => self.backend.annotate(&params.entry_id).await?,
+            "delete" => self.backend.remove(&params.entry_id).await?,
+            "favorite" => self.backend.set_favorite(&params.entry_id, true).await?,
+            "unfavorite" => self.backend.set_favorite(&params.entry_id, false).await?,
+            "pin-current" => self.backend.set_favorite(&params.entry_id, true).await?,
+            "cleanup" => self.backend.cleanup().await?,
             _ => return Err(ApiError::validation("unsupported entry action")),
         };
         operation.action = params.action;
@@ -168,6 +185,28 @@ impl ApiService {
         challenges.retain(|_, deadline| *deadline > Instant::now());
         challenges.insert(id.clone(), expires);
         Ok(json!({ "challenge": { "id": id, "confirmation": "WIPE", "expires_in_ms": 30000 } }))
+    }
+
+    fn get_settings(&self) -> Result<Value, ApiError> {
+        let settings = self.settings.get().map_err(settings_error)?;
+        Ok(json!({ "settings": settings }))
+    }
+
+    async fn update_settings(&self, update: SettingsUpdate) -> Result<Value, ApiError> {
+        let settings = self.settings.update(update).await.map_err(settings_error)?;
+        Ok(json!({ "settings": settings }))
+    }
+
+    async fn set_paused(&self, params: PauseParams) -> Result<Value, ApiError> {
+        let settings = self
+            .settings
+            .set_paused(params.paused, params.private_mode)
+            .await
+            .map_err(settings_error)?;
+        Ok(json!({ "capture": {
+            "paused": settings.capture_paused,
+            "private_mode": settings.private_mode
+        }, "settings": settings }))
     }
 
     async fn commit_wipe(&self, params: WipeParams) -> Result<Value, ApiError> {
@@ -256,6 +295,13 @@ struct WipeParams {
     response: String,
 }
 
+#[derive(Deserialize)]
+struct PauseParams {
+    paused: bool,
+    #[serde(default)]
+    private_mode: bool,
+}
+
 fn decode<T: for<'de> Deserialize<'de>>(params: Value) -> Result<T, ApiError> {
     serde_json::from_value(params).map_err(|error| ApiError::validation(error.to_string()))
 }
@@ -281,18 +327,12 @@ fn session_error(message: &'static str) -> ApiError {
     ApiError::new("stale-target", message)
 }
 
-const fn default_query_limit() -> usize {
-    100
+fn settings_error(message: String) -> ApiError {
+    ApiError::new("settings-error", message)
 }
 
-fn settings() -> Value {
-    json!({ "settings": {
-        "max_entries": 750,
-        "max_favorites": 100,
-        "max_entry_bytes": 16777216,
-        "max_editable_text_bytes": MAX_TEXT_BYTES,
-        "capture_paused": false
-    }})
+const fn default_query_limit() -> usize {
+    100
 }
 
 pub fn success(data: Value) -> Value {
