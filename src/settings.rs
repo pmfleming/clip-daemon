@@ -5,7 +5,10 @@ use std::{
 
 use clipboard_history_client_sdk::{config, core::dirs::data_dir};
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
+use tokio::{
+    process::Command,
+    time::{Duration, sleep},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -106,14 +109,7 @@ impl SettingsManager {
         private: bool,
     ) -> Result<ClipboardSettings, String> {
         let action = if paused { "stop" } else { "start" };
-        let status = Command::new("systemctl")
-            .args(["--user", action, "ringboard-wayland.service"])
-            .status()
-            .await
-            .map_err(|_| "Could not control Ringboard capture")?;
-        if !status.success() {
-            return Err("Ringboard capture service rejected the request".into());
-        }
+        control_units(action, &["ringboard-wayland.service"]).await?;
         let mut value = self
             .value
             .lock()
@@ -142,20 +138,22 @@ fn apply_limit(
 }
 
 async fn restart_capture() -> Result<(), String> {
+    control_units("restart", &["ringboard-server.service"]).await?;
+    sleep(Duration::from_millis(200)).await;
+    control_units("restart", &["ringboard-wayland.service"]).await
+}
+
+async fn control_units(action: &str, units: &[&str]) -> Result<(), String> {
     let status = Command::new("systemctl")
-        .args([
-            "--user",
-            "restart",
-            "ringboard-server.service",
-            "ringboard-wayland.service",
-        ])
+        .args(["--user", action])
+        .args(units)
         .status()
         .await
-        .map_err(|_| "Could not restart Ringboard")?;
+        .map_err(|_| "Could not control Ringboard services")?;
     status
         .success()
         .then_some(())
-        .ok_or_else(|| "Ringboard rejected the retention update".into())
+        .ok_or_else(|| "Ringboard service rejected the request".into())
 }
 
 fn write_ringboard_config(value: &ClipboardSettings) -> Result<(), String> {

@@ -42,8 +42,8 @@ The mutation/privacy implementation was reviewed again at `242c025`. The follow-
 | token-clone records | 71 | 53 |
 | minimum module locality | 97.0 | 100.0 |
 | API leverage | 57.5 | 60.5 |
-| Rust source lines | 2,822 | 2,785 |
-| all Rust lines including integration tests | 2,822 | 2,816 |
+| Rust source lines | 2,822 | 2,783 |
+| all Rust lines including integration tests | 2,822 | 2,814 |
 
 Escape hatches remain at zero, maximum clone score remains low at 15, and all 11 tests pass across two test layers.
 
