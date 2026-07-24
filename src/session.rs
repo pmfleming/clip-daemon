@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use tokio::{process::Command, sync::Mutex, time::sleep};
 use uuid::Uuid;
 
+const SESSION_TTL: Duration = Duration::from_secs(300);
+const SESSION_TTL_MS: u64 = 300_000;
+
 #[derive(Debug, Serialize)]
 pub struct SessionView {
     pub id: String,
@@ -45,7 +48,7 @@ impl SessionManager {
             id.clone(),
             Session {
                 target,
-                expires: Instant::now() + Duration::from_secs(15),
+                expires: Instant::now() + SESSION_TTL,
                 paste_pending: false,
             },
         );
@@ -111,7 +114,7 @@ fn view(id: String, target_available: bool, state: &'static str) -> SessionView 
         } else {
             "copy-only"
         },
-        expires_in_ms: 15_000,
+        expires_in_ms: SESSION_TTL_MS,
         state,
     }
 }
@@ -127,26 +130,53 @@ async fn active_target() -> Option<Target> {
     }
     let mut target: Target = serde_json::from_slice(&output.stdout).ok()?;
     target.address = target.address.trim().to_owned();
-    (!matches!(target.address.as_str(), "" | "0x0")).then_some(target)
+    valid_window_address(&target.address).then_some(target)
+}
+
+fn valid_window_address(address: &str) -> bool {
+    address.strip_prefix("0x").is_some_and(|value| {
+        !value.is_empty() && value.chars().all(|character| character.is_ascii_hexdigit())
+    }) && address != "0x0"
+}
+
+async fn hyprland_dispatch(lua: &str, legacy_dispatcher: &str, legacy_argument: &str) -> bool {
+    if dispatch_succeeded(
+        Command::new("hyprctl")
+            .args(["dispatch", lua])
+            .output()
+            .await,
+    ) {
+        return true;
+    }
+    dispatch_succeeded(
+        Command::new("hyprctl")
+            .args(["dispatch", legacy_dispatcher, legacy_argument])
+            .output()
+            .await,
+    )
+}
+
+fn dispatch_succeeded(output: std::io::Result<std::process::Output>) -> bool {
+    output.is_ok_and(|value| {
+        value.status.success() && String::from_utf8_lossy(&value.stdout).trim() == "ok"
+    })
 }
 
 async fn paste_after_hidden(target: Target) {
-    sleep(Duration::from_millis(220)).await;
+    sleep(Duration::from_millis(600)).await;
     let selector = format!("address:{}", target.address);
-    let _ = Command::new("hyprctl")
-        .args(["dispatch", "focuswindow", &selector])
-        .status()
-        .await;
-    let shortcut = if is_terminal(&target.class) {
-        "CTRL SHIFT,V"
+    let lua_focus = format!("hl.dsp.focus({{ window = '{selector}' }})");
+    let _ = hyprland_dispatch(&lua_focus, "focuswindow", &selector).await;
+    let modifiers = if is_terminal(&target.class) {
+        "CTRL SHIFT"
     } else {
-        "CTRL,V"
+        "CTRL"
     };
-    let status = Command::new("hyprctl")
-        .args(["dispatch", "sendshortcut", shortcut, &selector])
-        .status()
-        .await;
-    if !status.is_ok_and(|value| value.success()) {
+    let legacy_shortcut = format!("{modifiers},V,{selector}");
+    let lua_shortcut = format!(
+        "hl.dsp.send_shortcut({{ mods = '{modifiers}', key = 'V', window = '{selector}' }})"
+    );
+    if !hyprland_dispatch(&lua_shortcut, "sendshortcut", &legacy_shortcut).await {
         let _ = Command::new("notify-send")
             .args([
                 "-a",
@@ -179,13 +209,21 @@ fn is_terminal(class: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionManager, is_terminal};
+    use super::{SessionManager, is_terminal, valid_window_address};
 
     #[test]
     fn terminal_targets_use_terminal_paste_shortcut() {
         assert!(is_terminal("com.mitchellh.ghostty"));
         assert!(is_terminal("org.kde.konsole"));
         assert!(!is_terminal("firefox"));
+    }
+
+    #[test]
+    fn paste_targets_require_hyprland_window_addresses() {
+        assert!(valid_window_address("0x123abc"));
+        assert!(!valid_window_address("0x0"));
+        assert!(!valid_window_address("123abc"));
+        assert!(!valid_window_address("0x123'; os.execute('false')"));
     }
 
     #[tokio::test]
