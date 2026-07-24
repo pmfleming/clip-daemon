@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env,
     fs::{self, File, Permissions},
     io::{BufReader, Read},
@@ -6,7 +7,7 @@ use std::{
     path::PathBuf,
 };
 
-use image::{DynamicImage, ImageReader};
+use image::{DynamicImage, ImageReader, Limits};
 use url::Url;
 
 use crate::{
@@ -15,6 +16,9 @@ use crate::{
 };
 
 use super::{INSPECTION_LIMIT, MAX_FILES, MAX_THUMBNAIL_BYTES};
+
+const MAX_IMAGE_DIMENSION: u32 = 16_384;
+const MAX_DECODED_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
 pub(super) fn read_bounded(file: &mut File, limit: usize) -> BackendResult<Vec<u8>> {
     let mut bytes = Vec::with_capacity(limit.min(INSPECTION_LIMIT));
@@ -94,11 +98,21 @@ fn cached_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
 }
 
 fn decode_image(file: &File) -> BackendResult<DynamicImage> {
-    ImageReader::new(BufReader::new(file))
+    let mut reader = ImageReader::new(BufReader::new(file))
         .with_guessed_format()
-        .map_err(|_| invalid_entry("Clipboard image format is invalid"))?
+        .map_err(|_| invalid_entry("Clipboard image format is invalid"))?;
+    reader.limits(image_decode_limits());
+    reader
         .decode()
         .map_err(|_| invalid_entry("Clipboard image could not be decoded"))
+}
+
+pub(super) fn image_decode_limits() -> Limits {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_DECODED_IMAGE_BYTES);
+    limits
 }
 
 fn parse_files(mime: &str, bytes: &[u8]) -> Vec<FilePreview> {
@@ -142,11 +156,37 @@ fn file_preview(uri: &str, operation: &str) -> Option<FilePreview> {
 }
 
 fn image_dimensions(bytes: &[u8]) -> Option<ImageMetadata> {
-    let reader = ImageReader::new(std::io::Cursor::new(bytes))
+    let mut reader = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
+    reader.limits(image_decode_limits());
     let (width, height) = reader.into_dimensions().ok()?;
     Some(ImageMetadata { width, height })
+}
+
+pub(super) fn prune_thumbnails(valid: &[(String, u64)]) {
+    let Ok(root) = cache_root() else {
+        return;
+    };
+    let directory = root.join("clip-daemon/thumbnails");
+    prune_thumbnail_directory(&directory, valid);
+}
+
+fn prune_thumbnail_directory(directory: &std::path::Path, valid: &[(String, u64)]) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let prefixes: HashSet<String> = valid
+        .iter()
+        .map(|(id, revision)| format!("{id}-{revision}-"))
+        .collect();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 pub(super) fn clear_cache() -> BackendResult<()> {
@@ -186,9 +226,15 @@ pub(super) fn invalid_entry(message: &'static str) -> BackendError {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Seek, SeekFrom, Write};
+    use std::{
+        fs::File,
+        io::{Seek, SeekFrom, Write},
+    };
 
-    use super::{detected_image_mime, file_preview, parse_files, read_bounded};
+    use super::{
+        MAX_DECODED_IMAGE_BYTES, MAX_IMAGE_DIMENSION, detected_image_mime, file_preview,
+        image_decode_limits, parse_files, prune_thumbnail_directory, read_bounded,
+    };
 
     #[test]
     fn bounded_reads_stop_at_the_requested_limit() {
@@ -219,5 +265,30 @@ mod tests {
         assert_eq!(files[0].display_name, "one.txt");
         assert_eq!(files[0].operation, "cut");
         assert_eq!(file_preview("not a uri", "copy"), None);
+    }
+
+    #[test]
+    fn thumbnail_pruning_keeps_only_current_entry_revisions() {
+        let directory = tempfile::tempdir().expect("thumbnail directory");
+        let current = directory.path().join("entry-current-7-256.png");
+        let stale_revision = directory.path().join("entry-current-6-256.png");
+        let removed_entry = directory.path().join("entry-removed-1-256.png");
+        for path in [&current, &stale_revision, &removed_entry] {
+            File::create(path).expect("thumbnail fixture");
+        }
+
+        prune_thumbnail_directory(directory.path(), &[("entry-current".into(), 7)]);
+
+        assert!(current.exists());
+        assert!(!stale_revision.exists());
+        assert!(!removed_entry.exists());
+    }
+
+    #[test]
+    fn thumbnail_decode_limits_dimensions_and_allocations() {
+        let limits = image_decode_limits();
+        assert!(limits.check_dimensions(MAX_IMAGE_DIMENSION + 1, 1).is_err());
+        let mut limits = image_decode_limits();
+        assert!(limits.reserve(MAX_DECODED_IMAGE_BYTES + 1).is_err());
     }
 }

@@ -55,6 +55,19 @@ impl FakeBackend {
         ))
     }
 
+    fn validate_revision(&self, opaque_id: &str, expected: Option<u64>) -> BackendResult<()> {
+        let actual = self
+            .entries()?
+            .iter()
+            .find(|item| item.entry.id == opaque_id)
+            .map(|item| item.entry.revision)
+            .ok_or_else(unknown_entry)?;
+        if expected.is_some_and(|revision| revision != actual) {
+            return Err(BackendError::stale("Clipboard entry revision is stale"));
+        }
+        Ok(())
+    }
+
     fn remove(&self, opaque_id: &str) -> BackendResult<OperationResult> {
         let mut entries = self.entries.write().map_err(fake_unavailable)?;
         let position = entries
@@ -120,11 +133,24 @@ impl ClipboardBackend for FakeBackend {
             .ok_or_else(unknown_entry)
     }
 
-    async fn thumbnail(&self, opaque_id: &str, _edge: u32) -> BackendResult<EntryThumbnail> {
-        let details = self.details(opaque_id, 0).await?;
+    async fn revision(&self, opaque_id: &str) -> BackendResult<u64> {
+        self.entries()?
+            .iter()
+            .find(|item| item.entry.id == opaque_id)
+            .map(|item| item.entry.revision)
+            .ok_or_else(unknown_entry)
+    }
+
+    async fn thumbnail(
+        &self,
+        opaque_id: &str,
+        expected_revision: u64,
+        _edge: u32,
+    ) -> BackendResult<EntryThumbnail> {
+        self.validate_revision(opaque_id, Some(expected_revision))?;
         Err(BackendError::not_found(format!(
             "No thumbnail fixture for {}",
-            details.entry.id
+            opaque_id
         )))
     }
 
@@ -141,8 +167,17 @@ impl ClipboardBackend for FakeBackend {
     async fn mutate(
         &self,
         opaque_id: &str,
+        expected_revision: Option<u64>,
         mutation: BackendMutation,
     ) -> BackendResult<OperationResult> {
+        if !matches!(mutation, BackendMutation::Wipe | BackendMutation::Cleanup) {
+            if expected_revision.is_none() {
+                return Err(BackendError::stale(
+                    "An expected clipboard entry revision is required",
+                ));
+            }
+            self.validate_revision(opaque_id, expected_revision)?;
+        }
         match mutation {
             BackendMutation::Restore => self.operation(opaque_id, "copy"),
             BackendMutation::ImageAsFile => self.operation(opaque_id, "image-as-file"),
@@ -162,9 +197,11 @@ impl ClipboardBackend for FakeBackend {
     async fn replace(
         &self,
         opaque_id: &str,
+        expected_revision: u64,
         mime: &str,
         bytes: &[u8],
     ) -> BackendResult<EntryDetails> {
+        self.validate_revision(opaque_id, Some(expected_revision))?;
         self.mutate_entry(opaque_id, |details| {
             details.entry.revision = details.entry.revision.saturating_add(1);
             details.entry.kind = classify(mime, bytes);
@@ -239,14 +276,22 @@ mod tests {
             Some("beta")
         );
         assert_eq!(backend.change_token().await.unwrap(), 5);
+        assert_eq!(backend.revision("other").await.unwrap(), 3);
         assert!(backend.details("missing", 10).await.is_err());
+        let stale_thumbnail = backend.thumbnail("other", 2, 512).await.unwrap_err();
+        assert_eq!(stale_thumbnail.kind.code(), "stale-action");
+        let stale = backend
+            .mutate("other", Some(2), BackendMutation::Remove)
+            .await
+            .unwrap_err();
+        assert_eq!(stale.kind.code(), "stale-action");
         backend
-            .mutate("other", BackendMutation::SetFavorite(true))
+            .mutate("other", Some(3), BackendMutation::SetFavorite(true))
             .await
             .unwrap();
         assert!(backend.details("other", 10).await.unwrap().entry.favorite);
         backend
-            .mutate("other", BackendMutation::Remove)
+            .mutate("other", Some(3), BackendMutation::Remove)
             .await
             .unwrap();
         assert!(backend.details("other", 10).await.is_err());

@@ -25,6 +25,7 @@ pub struct ScreenshotRegion {
 pub enum BackendErrorKind {
     Unavailable,
     NotFound,
+    Stale,
     InvalidData,
     OperationFailed,
 }
@@ -34,6 +35,7 @@ impl BackendErrorKind {
         match self {
             Self::Unavailable => "backend-unavailable",
             Self::NotFound => "entry-not-found",
+            Self::Stale => "stale-action",
             Self::InvalidData => "invalid-entry",
             Self::OperationFailed => "operation-failed",
         }
@@ -64,6 +66,10 @@ impl BackendError {
 
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(BackendErrorKind::NotFound, message)
+    }
+
+    pub fn stale(message: impl Into<String>) -> Self {
+        Self::new(BackendErrorKind::Stale, message)
     }
 }
 
@@ -108,17 +114,25 @@ pub trait ClipboardBackend: Send + Sync {
     async fn status(&self) -> BackendStatus;
     async fn change_token(&self) -> BackendResult<u64>;
     async fn query(&self, query: HistoryQuery) -> BackendResult<HistoryPage>;
+    async fn revision(&self, opaque_id: &str) -> BackendResult<u64>;
     async fn details(&self, opaque_id: &str, max_text_bytes: usize) -> BackendResult<EntryDetails>;
-    async fn thumbnail(&self, opaque_id: &str, edge: u32) -> BackendResult<EntryThumbnail>;
+    async fn thumbnail(
+        &self,
+        opaque_id: &str,
+        expected_revision: u64,
+        edge: u32,
+    ) -> BackendResult<EntryThumbnail>;
     async fn capture_screenshot(&self, region: ScreenshotRegion) -> BackendResult<OperationResult>;
     async fn mutate(
         &self,
         opaque_id: &str,
+        expected_revision: Option<u64>,
         mutation: BackendMutation,
     ) -> BackendResult<OperationResult>;
     async fn replace(
         &self,
         opaque_id: &str,
+        expected_revision: u64,
         mime: &str,
         bytes: &[u8],
     ) -> BackendResult<EntryDetails>;

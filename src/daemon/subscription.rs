@@ -57,8 +57,12 @@ pub(super) async fn start(
     let task_id = id.clone();
     let task_streams = streams.clone();
     let connection = destination.connection().clone();
+    let (start_task, task_ready) = tokio::sync::oneshot::channel();
 
     let task = tokio::spawn(async move {
+        if task_ready.await.is_err() {
+            return;
+        }
         for stream in &task_streams {
             emit_event(&destination, stream, "subscribed", &task_id, None).await;
         }
@@ -74,6 +78,16 @@ pub(super) async fn start(
         tracing::debug!(subscription_id = %task_id, "clipboard subscription ended");
     });
     daemon.subscriptions.lock().await.insert(id.clone(), task);
+    if start_task.send(()).is_err() {
+        if let Some(task) = daemon.subscriptions.lock().await.remove(&id) {
+            task.abort();
+        }
+        return api::error(
+            "subscription-unavailable",
+            "Subscription task could not be started".into(),
+        )
+        .to_string();
+    }
     tracing::debug!(subscription_id = %id, "clipboard subscription started");
     api::success(json!({ "subscription": { "id": id, "streams": streams } })).to_string()
 }

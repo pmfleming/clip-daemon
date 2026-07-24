@@ -129,11 +129,16 @@ impl ApiService {
 
     async fn thumbnail(&self, params: EntryParams) -> Result<Value, ApiError> {
         validate_entry_id(&params.entry_id)?;
+        let current_revision = self.backend.revision(&params.entry_id).await?;
+        validate_revision(params.revision, current_revision)?;
         let thumbnail = self
             .backend
-            .thumbnail(&params.entry_id, params.edge.unwrap_or(512))
+            .thumbnail(
+                &params.entry_id,
+                params.revision.unwrap_or(current_revision),
+                params.edge.unwrap_or(512),
+            )
             .await?;
-        validate_revision(params.revision, thumbnail.revision)?;
         Ok(json!({ "thumbnail": thumbnail }))
     }
 
@@ -204,7 +209,12 @@ impl ApiService {
             return Err(ApiError::new("stale-action", "wipe challenge expired"));
         }
         self.actions.clear().await;
-        Ok(json!({ "operation": self.backend.mutate("", BackendMutation::Wipe).await? }))
+        Ok(json!({
+            "operation": self
+                .backend
+                .mutate("", None, BackendMutation::Wipe)
+                .await?
+        }))
     }
 }
 

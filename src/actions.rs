@@ -70,6 +70,10 @@ impl ActionService {
     }
 
     pub async fn dispatch_entry(&self, method: &str, params: Value) -> Result<Value, ApiError> {
+        self.edits
+            .lock()
+            .await
+            .retain(|_, lease| lease.expires > Instant::now());
         match method {
             "clipboard.entry.action" => self.action(decode(params)?).await,
             "clipboard.entry.edit.begin" => self.begin_edit(decode(params)?).await,
@@ -137,7 +141,10 @@ impl ActionService {
         }
         let mutation = BackendMutation::for_action(&params.action)
             .ok_or_else(|| ApiError::validation("unsupported entry action"))?;
-        let mut operation = self.backend.mutate(&params.entry_id, mutation).await?;
+        let mut operation = self
+            .backend
+            .mutate(&params.entry_id, Some(params.revision), mutation)
+            .await?;
         operation.action = params.action;
         Ok(json!({ "operation": operation }))
     }
@@ -154,7 +161,11 @@ impl ActionService {
             .map_err(stale_target)?;
         let mut operation = self
             .backend
-            .mutate(&params.entry_id, BackendMutation::Restore)
+            .mutate(
+                &params.entry_id,
+                Some(params.revision),
+                BackendMutation::Restore,
+            )
             .await?;
         let feedback = if has_target {
             ("paste-prepared", "Paste prepared; hide the picker")
@@ -207,11 +218,16 @@ impl ActionService {
         if params.value.len() > MAX_EDIT_BYTES {
             return Err(edit_error("Edited text exceeds the configured limit"));
         }
-        let current = self.backend.details(&lease.entry_id, 0).await?;
-        validate_revision(Some(lease.revision), current.entry.revision)?;
+        let current_revision = self.backend.revision(&lease.entry_id).await?;
+        validate_revision(Some(lease.revision), current_revision)?;
         let entry = self
             .backend
-            .replace(&lease.entry_id, &lease.mime, params.value.as_bytes())
+            .replace(
+                &lease.entry_id,
+                lease.revision,
+                &lease.mime,
+                params.value.as_bytes(),
+            )
             .await?;
         Ok(json!({ "entry": entry }))
     }
@@ -296,8 +312,8 @@ fn editable_value(details: &EntryDetails) -> Result<&str, ApiError> {
 async fn launch_action(params: &ActionParams, details: &EntryDetails) -> Result<Value, ApiError> {
     let operation = match params.action.as_str() {
         "open-url" => open_url(details.text.as_deref().unwrap_or_default())?,
-        "open-file" => open_file(selected_file(details, params.file_index)?, false)?,
-        "reveal-file" => open_file(selected_file(details, params.file_index)?, true)?,
+        "open-file" => open_file(selected_file(details, params.file_index)?)?,
+        "reveal-file" => reveal_file(selected_file(details, params.file_index)?).await?,
         _ => return Err(ApiError::validation("unsupported launch action")),
     };
     Ok(json!({ "operation": operation }))
@@ -315,24 +331,46 @@ fn open_url(value: &str) -> Result<crate::model::OperationResult, ApiError> {
     ))
 }
 
-fn open_file(file: &FilePreview, reveal: bool) -> Result<crate::model::OperationResult, ApiError> {
+fn open_file(file: &FilePreview) -> Result<crate::model::OperationResult, ApiError> {
     let path = local_path(file)?;
     if !path.exists() {
         return Err(BackendError::not_found("Clipboard file no longer exists").into());
     }
     let path = path.to_string_lossy();
-    let (program, arguments, action, message) = if reveal {
-        (
-            "dolphin",
-            vec!["--select", path.as_ref()],
-            "reveal-file",
-            "File revealed",
-        )
-    } else {
-        ("xdg-open", vec![path.as_ref()], "open-file", "File opened")
-    };
-    spawn(program, &arguments)?;
-    Ok(crate::model::OperationResult::completed(action, message))
+    spawn("xdg-open", &[path.as_ref()])?;
+    Ok(crate::model::OperationResult::completed(
+        "open-file",
+        "File opened",
+    ))
+}
+
+async fn reveal_file(file: &FilePreview) -> Result<crate::model::OperationResult, ApiError> {
+    let path = local_path(file)?;
+    if !path.exists() {
+        return Err(BackendError::not_found("Clipboard file no longer exists").into());
+    }
+    let uri = Url::from_file_path(&path)
+        .map_err(|_| invalid("Clipboard entry is not a local file"))?
+        .to_string();
+    let connection = zbus::Connection::session()
+        .await
+        .map_err(|_| launch_error("Could not connect to the desktop file manager"))?;
+    let proxy = zbus::Proxy::new(
+        &connection,
+        "org.freedesktop.FileManager1",
+        "/org/freedesktop/FileManager1",
+        "org.freedesktop.FileManager1",
+    )
+    .await
+    .map_err(|_| launch_error("Desktop file manager is unavailable"))?;
+    proxy
+        .call_method("ShowItems", &(vec![uri], ""))
+        .await
+        .map_err(|_| launch_error("Desktop file manager could not reveal the file"))?;
+    Ok(crate::model::OperationResult::completed(
+        "reveal-file",
+        "File revealed",
+    ))
 }
 
 fn local_path(file: &FilePreview) -> Result<PathBuf, ApiError> {
@@ -347,13 +385,11 @@ fn spawn(program: &str, arguments: &[&str]) -> Result<(), ApiError> {
         .args(arguments)
         .spawn()
         .map(|_| ())
-        .map_err(|_| {
-            BackendError::new(
-                BackendErrorKind::OperationFailed,
-                "Application launch failed",
-            )
-            .into()
-        })
+        .map_err(|_| launch_error("Application launch failed"))
+}
+
+fn launch_error(message: &'static str) -> ApiError {
+    BackendError::new(BackendErrorKind::OperationFailed, message).into()
 }
 
 fn validate_action_kind(kind: EntryKind, action: &str) -> Result<(), ApiError> {

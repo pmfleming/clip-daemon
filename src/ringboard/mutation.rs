@@ -37,8 +37,8 @@ use super::{MAX_THUMBNAIL_BYTES, OperationTask, RingboardBackend, invalid_entry,
 pub(super) struct AnnotationStage {
     input: PathBuf,
     output: PathBuf,
-    raw_id: u64,
-    ring: RingKind,
+    opaque_id: String,
+    revision: u64,
 }
 
 impl RingboardBackend {
@@ -51,20 +51,32 @@ impl RingboardBackend {
         drop(private_file(&path)?);
         let result = capture_and_restore(region, &path);
         let _ = fs::remove_file(path);
+        if result.is_ok() {
+            self.clear_identity_state()?;
+        }
         result
     }
 
-    pub(super) fn restore_entry(&self, opaque_id: &str) -> BackendResult<OperationResult> {
-        let (entry, mut reader, _) = self.selected(opaque_id)?;
-        send_paste_buffer(paste_server()?, entry, &mut reader, false).map_err(operation_error)?;
+    pub(super) fn restore_entry(
+        &self,
+        opaque_id: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<OperationResult> {
+        let paste_server = paste_server()?;
+        let (entry, mut reader, _) = self.selected(opaque_id, expected_revision)?;
+        send_paste_buffer(paste_server, entry, &mut reader, false).map_err(operation_error)?;
         Ok(OperationResult::completed(
             "copy",
             "Entry restored to the clipboard",
         ))
     }
 
-    pub(super) fn save_image_file(&self, opaque_id: &str) -> BackendResult<OperationResult> {
-        let (entry, mut reader, summary) = self.selected(opaque_id)?;
+    pub(super) fn save_image_file(
+        &self,
+        opaque_id: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<OperationResult> {
+        let (entry, mut reader, summary) = self.selected(opaque_id, expected_revision)?;
         if summary.kind != EntryKind::Image {
             return Err(invalid_entry("Only image entries can be saved as files"));
         }
@@ -74,6 +86,7 @@ impl RingboardBackend {
         let uri = Url::from_file_path(&path)
             .map_err(|_| operation_error("Could not create image file URI"))?;
         add_and_restore(format!("{uri}\r\n").as_bytes(), "text/uri-list")?;
+        self.clear_identity_state()?;
         let mut result = OperationResult::completed("image-as-file", "Image file copied");
         result.path = Some(path.to_string_lossy().into_owned());
         Ok(result)
@@ -89,11 +102,12 @@ impl RingboardBackend {
         let files = [staged.input.clone(), staged.output.clone()];
         let cleanup_files = files.clone();
         let operations = self.operations.clone();
+        let backend = self.clone();
         let task_id = operation_id.clone();
         let (start, ready) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             if ready.await.is_ok() {
-                run_annotation(staged, task_id.clone()).await;
+                run_annotation(backend, staged, task_id.clone()).await;
             }
             if let Ok(mut active) = operations.lock() {
                 active.remove(&task_id);
@@ -116,8 +130,12 @@ impl RingboardBackend {
         Ok(operation)
     }
 
-    pub(super) fn stage_annotation(&self, opaque_id: &str) -> BackendResult<AnnotationStage> {
-        let (entry, mut reader, summary) = self.selected(opaque_id)?;
+    pub(super) fn stage_annotation(
+        &self,
+        opaque_id: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<AnnotationStage> {
+        let (entry, mut reader, summary) = self.selected(opaque_id, expected_revision)?;
         if summary.kind != EntryKind::Image {
             return Err(invalid_entry("Only image entries can be annotated"));
         }
@@ -128,31 +146,44 @@ impl RingboardBackend {
         Ok(AnnotationStage {
             input,
             output,
-            raw_id: entry.id(),
-            ring: target_ring(summary.favorite),
+            opaque_id: opaque_id.to_owned(),
+            revision: summary.revision,
         })
     }
 
     pub(super) fn replace_entry(
         &self,
         opaque_id: &str,
+        expected_revision: Option<u64>,
         mime: &str,
         bytes: &[u8],
-    ) -> BackendResult<()> {
-        let (entry, _, summary) = self.selected(opaque_id)?;
+    ) -> BackendResult<u64> {
         let directory = runtime_directory("clip-daemon/transfers")?;
         let path = unique_path(&directory, "edit");
         private_file(&path)?
             .write_all(bytes)
             .map_err(operation_error)?;
-        let result = replace_from_file(entry.id(), target_ring(summary.favorite), &path, mime);
+        let result = self
+            .selected(opaque_id, expected_revision)
+            .and_then(|(entry, _, summary)| {
+                replace_from_file(entry.id(), target_ring(summary.favorite), &path, mime)?;
+                Ok(entry.id())
+            });
         let _ = fs::remove_file(path);
-        result
+        let raw_id = result?;
+        self.clear_identity_state()?;
+        Ok(raw_id)
     }
 
-    pub(super) fn remove_entry(&self, opaque_id: &str) -> BackendResult<OperationResult> {
-        let raw_id = self.resolve(opaque_id)?;
-        remove_raw(server()?, raw_id)?;
+    pub(super) fn remove_entry(
+        &self,
+        opaque_id: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<OperationResult> {
+        let server = server()?;
+        let (entry, _, _) = self.selected(opaque_id, expected_revision)?;
+        remove_raw(server, entry.id())?;
+        self.clear_identity_state()?;
         Ok(OperationResult::completed(
             "delete",
             "Clipboard entry deleted",
@@ -162,16 +193,18 @@ impl RingboardBackend {
     pub(super) fn move_entry(
         &self,
         opaque_id: &str,
+        expected_revision: Option<u64>,
         favorite: bool,
     ) -> BackendResult<OperationResult> {
-        let raw_id = self.resolve(opaque_id)?;
         let server = server()?;
+        let (entry, _, _) = self.selected(opaque_id, expected_revision)?;
         let target = target_ring(favorite);
-        let response =
-            MoveToFrontRequest::response(server, raw_id, Some(target)).map_err(operation_error)?;
+        let response = MoveToFrontRequest::response(server, entry.id(), Some(target))
+            .map_err(operation_error)?;
         if matches!(response, MoveToFrontResponse::Error(_)) {
             return Err(operation_error("Ringboard rejected the favorite change"));
         }
+        self.clear_identity_state()?;
         let action = if favorite { "favorite" } else { "unfavorite" };
         Ok(OperationResult::completed(action, "Favorite state updated"))
     }
@@ -206,6 +239,7 @@ impl RingboardBackend {
             remove_raw(&server, id)?;
         }
         self.cleanup_artifacts()?;
+        self.clear_identity_state()?;
         Ok(OperationResult::completed(
             "wipe",
             "Clipboard history cleared",
@@ -238,7 +272,7 @@ fn capture_and_restore(region: ScreenshotRegion, path: &Path) -> BackendResult<O
     ))
 }
 
-async fn run_annotation(staged: AnnotationStage, operation_id: String) {
+async fn run_annotation(backend: RingboardBackend, staged: AnnotationStage, operation_id: String) {
     let mut command = Command::new("satty");
     command.kill_on_drop(true);
     let status = command
@@ -258,14 +292,21 @@ async fn run_annotation(staged: AnnotationStage, operation_id: String) {
         .await;
     if status.is_ok_and(|value| value.success()) {
         let output = staged.output.clone();
-        let raw_id = staged.raw_id;
-        let ring = staged.ring;
+        let opaque_id = staged.opaque_id.clone();
+        let revision = staged.revision;
         if let Err(error) = run_blocking(move || {
             if !valid_edited_image(&output) {
                 return Err(operation_error("Annotation returned an invalid image"));
             }
-            replace_from_file(raw_id, ring, &output, "image/png")?;
-            restore_raw(raw_id)
+            let (entry, _, summary) = backend.selected(&opaque_id, Some(revision))?;
+            replace_from_file(
+                entry.id(),
+                target_ring(summary.favorite),
+                &output,
+                "image/png",
+            )?;
+            backend.clear_identity_state()?;
+            restore_raw(entry.id())
         })
         .await
         {
@@ -362,13 +403,20 @@ fn target_ring(favorite: bool) -> RingKind {
 }
 
 fn valid_edited_image(path: &Path) -> bool {
-    path.metadata()
+    if !path
+        .metadata()
         .is_ok_and(|metadata| metadata.len() <= MAX_THUMBNAIL_BYTES)
-        && ImageReader::open(path)
-            .and_then(ImageReader::with_guessed_format)
-            .ok()
-            .and_then(|reader| reader.into_dimensions().ok())
-            .is_some()
+    {
+        return false;
+    }
+    let Some(mut reader) = ImageReader::open(path)
+        .and_then(ImageReader::with_guessed_format)
+        .ok()
+    else {
+        return false;
+    };
+    reader.limits(super::content::image_decode_limits());
+    reader.decode().is_ok()
 }
 
 pub(super) fn remove_files(paths: &[PathBuf]) {
@@ -428,7 +476,7 @@ fn operation_error(error: impl std::fmt::Display) -> BackendError {
 mod tests {
     use std::fs;
 
-    use super::remove_files;
+    use super::{remove_files, valid_edited_image};
 
     #[test]
     fn operation_cleanup_only_removes_its_own_files() {
@@ -445,5 +493,19 @@ mod tests {
         assert!(!first.exists());
         assert!(!second.exists());
         assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn edited_images_must_fully_decode() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let valid = directory.path().join("valid.png");
+        let malformed = directory.path().join("malformed.png");
+        image::RgbaImage::new(2, 2)
+            .save(&valid)
+            .expect("write valid image");
+        fs::write(&malformed, b"\x89PNG\r\n\x1a\n").expect("write malformed image");
+
+        assert!(valid_edited_image(&valid));
+        assert!(!valid_edited_image(&malformed));
     }
 }

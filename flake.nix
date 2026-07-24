@@ -32,7 +32,7 @@
             '';
             postFixup = ''
               wrapProgram $out/bin/clip-daemon \
-                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.grim pkgs.hyprland pkgs.kdePackages.dolphin pkgs.libnotify pkgs.satty pkgs.systemd pkgs.xdg-utils ]}
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.grim pkgs.hyprland pkgs.libnotify pkgs.satty pkgs.systemd pkgs.xdg-utils ]}
             '';
             meta = {
               description = "Ringboard policy and clip-api daemon for Shelllist";

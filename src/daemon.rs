@@ -8,7 +8,14 @@ use std::{
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    signal::{
+        ctrl_c,
+        unix::{SignalKind, signal},
+    },
+    sync::Mutex,
+    task::JoinHandle,
+};
 use zbus::{connection, message::Header, object_server::SignalEmitter};
 
 use crate::{
@@ -132,7 +139,14 @@ pub async fn run(backend: Arc<dyn ClipboardBackend>) -> Result<()> {
         object_path = OBJECT_PATH,
         "clip-daemon started"
     );
-    tokio::signal::ctrl_c()
-        .await
-        .context("wait for shutdown signal")
+    wait_for_shutdown().await
+}
+
+async fn wait_for_shutdown() -> Result<()> {
+    let mut terminate =
+        signal(SignalKind::terminate()).context("listen for SIGTERM shutdown signal")?;
+    tokio::select! {
+        result = ctrl_c() => result.context("wait for Ctrl-C shutdown signal"),
+        _ = terminate.recv() => Ok(()),
+    }
 }

@@ -11,6 +11,7 @@
 | Unknown binary | copy only |
 
 Browsing history never opens a URL or file and performs no preview fetch. URL opening occurs only after an explicit action, parses the complete value in Rust, and allows only HTTP and HTTPS. File actions require a local `file:` URI and recheck existence immediately before launch. Missing files return `entry-not-found`.
+File reveal uses the desktop-neutral `org.freedesktop.FileManager1.ShowItems` D-Bus interface.
 
 Edit leases are one-use, expire after 60 seconds, and are limited to 256 KiB of valid UTF-8. Commit revalidates the entry revision. Ringboard replacement uses add/swap/remove so the original ring and favorite position are retained before the replacement becomes the current selection. Wipe clears all pending edit leases.
 

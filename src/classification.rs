@@ -15,13 +15,28 @@ pub fn bounded_preview(bytes: &[u8], max_bytes: usize) -> String {
         .split_whitespace()
         .map(|word| {
             word.chars()
-                .filter(|character| !character.is_control())
+                .filter(|character| preview_character_is_visible(*character))
                 .collect::<String>()
         })
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
     truncate_utf8(normalized, PREVIEW_LIMIT)
+}
+
+fn preview_character_is_visible(character: char) -> bool {
+    !character.is_control()
+        && !matches!(
+            character,
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+        )
 }
 
 fn authoritative_kind(mime: &str) -> Option<EntryKind> {
@@ -112,5 +127,14 @@ mod tests {
     fn previews_are_single_line_and_bounded() {
         assert_eq!(bounded_preview(b" first\n\tsecond ", 1024), "first second");
         assert!(bounded_preview(&vec![b'a'; 1024], 1024).len() <= 256);
+    }
+
+    #[test]
+    fn previews_remove_bidi_and_zero_width_spoofing_characters() {
+        let preview = bounded_preview(
+            "safe\u{202e}gpj.exe zero\u{200b}width عربي".as_bytes(),
+            1024,
+        );
+        assert_eq!(preview, "safegpj.exe zerowidth عربي");
     }
 }

@@ -1,21 +1,25 @@
 use std::{
     env, fs,
-    fs::OpenOptions,
+    fs::{File, OpenOptions},
+    io,
     io::Write,
     num::NonZeroU32,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::PathBuf,
-    sync::Mutex,
+    path::{Path, PathBuf},
+    sync::Mutex as StdMutex,
 };
 
 use clipboard_history_client_sdk::{config, core::dirs::data_dir};
 use serde::{Deserialize, Serialize};
 use tokio::{
     process::Command,
+    sync::Mutex as AsyncMutex,
+    task::spawn_blocking,
     time::{Duration, sleep},
 };
+use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClipboardSettings {
     pub max_entries: u32,
@@ -61,49 +65,71 @@ impl SettingsUpdate {
 }
 
 pub struct SettingsManager {
-    value: Mutex<ClipboardSettings>,
+    state: StdMutex<SettingsState>,
     path: Option<PathBuf>,
+    transaction: AsyncMutex<()>,
+}
+
+struct SettingsState {
+    value: ClipboardSettings,
+    load_error: Option<String>,
 }
 
 impl Default for SettingsManager {
     fn default() -> Self {
         let path = settings_path();
-        let value = path
-            .as_ref()
-            .and_then(|path| fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
+        let (value, load_error) = match load_settings(path.as_deref()) {
+            Ok(value) => (value, None),
+            Err(error) => (ClipboardSettings::default(), Some(error)),
+        };
         Self {
-            value: Mutex::new(value),
+            state: StdMutex::new(SettingsState { value, load_error }),
             path,
+            transaction: AsyncMutex::new(()),
         }
     }
 }
 
 impl SettingsManager {
     pub fn get(&self) -> Result<ClipboardSettings, String> {
-        self.value
+        let state = self
+            .state
             .lock()
-            .map(|value| value.clone())
-            .map_err(|_| "Clipboard settings are unavailable".into())
+            .map_err(|_| "Clipboard settings are unavailable")?;
+        match &state.load_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(state.value.clone()),
+        }
     }
 
     pub async fn update(&self, update: SettingsUpdate) -> Result<ClipboardSettings, String> {
-        let updated = self.apply_update(update)?;
-        restart_capture().await?;
+        let _transaction = self.transaction.lock().await;
+        let current = self.get()?;
+        let updated = update.apply(&current)?;
+        if updated == current {
+            return Ok(current);
+        }
+        let path = self.path.clone();
+        let persisted = updated.clone();
+        spawn_blocking(move || persist_config_pair(path.as_deref(), &persisted))
+            .await
+            .map_err(|_| "Clipboard settings transaction failed")??;
+        self.commit(updated.clone())
+            .map_err(|error| format!("Clipboard settings were saved, but {error}"))?;
+        if let Err(error) = restart_capture(&updated).await {
+            return Err(format!("Clipboard settings were saved, but {error}"));
+        }
         Ok(updated)
     }
 
-    fn apply_update(&self, update: SettingsUpdate) -> Result<ClipboardSettings, String> {
-        let mut value = self
-            .value
+    fn commit(&self, value: ClipboardSettings) -> Result<(), String> {
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| "Clipboard settings are unavailable")?;
-        let updated = update.apply(&value)?;
-        persist(self.path.as_ref(), &updated)?;
-        write_ringboard_config(&updated)?;
-        *value = updated.clone();
-        Ok(updated)
+        state.value = value;
+        state.load_error = None;
+        Ok(())
     }
 
     pub async fn set_paused(
@@ -111,16 +137,26 @@ impl SettingsManager {
         paused: bool,
         private: bool,
     ) -> Result<ClipboardSettings, String> {
+        let _transaction = self.transaction.lock().await;
+        let current = self.get()?;
+        let mut updated = current.clone();
+        updated.capture_paused = paused;
+        updated.private_mode = paused && private;
+        if updated == current {
+            return Ok(current);
+        }
+        let path = self.path.clone();
+        let persisted = updated.clone();
+        spawn_blocking(move || persist(path.as_deref(), &persisted))
+            .await
+            .map_err(|_| "Clipboard settings transaction failed")??;
+        self.commit(updated.clone())
+            .map_err(|error| format!("Capture preference was saved, but {error}"))?;
         let action = if paused { "stop" } else { "start" };
-        control_units(action, &["ringboard-wayland.service"]).await?;
-        let mut value = self
-            .value
-            .lock()
-            .map_err(|_| "Clipboard settings are unavailable")?;
-        value.capture_paused = paused;
-        value.private_mode = paused && private;
-        persist(self.path.as_ref(), &value)?;
-        Ok(value.clone())
+        if let Err(error) = control_units(action, &["ringboard-wayland.service"]).await {
+            return Err(format!("Capture preference was saved, but {error}"));
+        }
+        Ok(updated)
     }
 }
 
@@ -136,10 +172,15 @@ fn validated_update<T: Copy + PartialOrd>(
     }
 }
 
-async fn restart_capture() -> Result<(), String> {
+async fn restart_capture(settings: &ClipboardSettings) -> Result<(), String> {
     control_units("restart", &["ringboard-server.service"]).await?;
     sleep(Duration::from_millis(200)).await;
-    control_units("restart", &["ringboard-wayland.service"]).await
+    let capture_action = if settings.capture_paused {
+        "stop"
+    } else {
+        "restart"
+    };
+    control_units(capture_action, &["ringboard-wayland.service"]).await
 }
 
 async fn control_units(action: &str, units: &[&str]) -> Result<(), String> {
@@ -155,7 +196,7 @@ async fn control_units(action: &str, units: &[&str]) -> Result<(), String> {
         .ok_or_else(|| "Ringboard service rejected the request".into())
 }
 
-fn write_ringboard_config(value: &ClipboardSettings) -> Result<(), String> {
+fn encoded_ringboard_config(value: &ClipboardSettings) -> Result<(PathBuf, Vec<u8>), String> {
     let config = config::server::Config {
         max_entries: config::server::MaxEntries {
             main: NonZeroU32::new(value.max_entries).ok_or("max_entries cannot be zero")?,
@@ -166,9 +207,7 @@ fn write_ringboard_config(value: &ClipboardSettings) -> Result<(), String> {
     let encoded = toml::to_string_pretty(&config::server::Stable::from(config))
         .map_err(|_| "Ringboard settings could not be encoded")?;
     let path = data_dir().join(config::server::file_name());
-    fs::create_dir_all(path.parent().ok_or("Ringboard data path is invalid")?)
-        .map_err(|_| "Ringboard data directory is unavailable")?;
-    fs::write(path, encoded).map_err(|_| "Ringboard settings could not be written".into())
+    Ok((path, encoded.into_bytes()))
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -178,37 +217,200 @@ fn settings_path() -> Option<PathBuf> {
     Some(root.join("clip-daemon/settings.json"))
 }
 
-fn persist(path: Option<&PathBuf>, value: &ClipboardSettings) -> Result<(), String> {
+fn load_settings(path: Option<&Path>) -> Result<ClipboardSettings, String> {
+    let Some(path) = path else {
+        return Ok(ClipboardSettings::default());
+    };
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ClipboardSettings::default());
+        }
+        Err(_) => return Err("Clipboard settings could not be read".into()),
+    };
+    serde_json::from_slice(&bytes)
+        .map_err(|_| "Clipboard settings file is invalid; refusing to use defaults".into())
+}
+
+fn persist_config_pair(path: Option<&Path>, value: &ClipboardSettings) -> Result<(), String> {
+    let state_bytes = path
+        .map(|_| {
+            serde_json::to_vec_pretty(value)
+                .map_err(|_| "Clipboard settings could not be encoded".to_owned())
+        })
+        .transpose()?;
+    let (ringboard_path, ringboard_bytes) = encoded_ringboard_config(value)?;
+    let previous_ringboard = read_existing(&ringboard_path)?;
+    let previous_state = path.map(read_existing).transpose()?.flatten();
+    let ringboard_temp = stage_write(
+        &ringboard_path,
+        &ringboard_bytes,
+        false,
+        "Ringboard settings",
+    )?;
+    let state_temp = match path.zip(state_bytes.as_deref()) {
+        Some((path, bytes)) => match stage_write(path, bytes, true, "Clipboard settings") {
+            Ok(temp) => Some((path, temp)),
+            Err(error) => {
+                let _ = fs::remove_file(ringboard_temp);
+                return Err(error);
+            }
+        },
+        None => None,
+    };
+    if let Err(error) = commit_staged(&ringboard_path, &ringboard_temp, "Ringboard settings") {
+        if let Some((_, temp)) = state_temp {
+            let _ = fs::remove_file(temp);
+        }
+        return rollback_error(
+            error,
+            [restore_previous(
+                &ringboard_path,
+                previous_ringboard.as_deref(),
+            )],
+        );
+    }
+    if let Some((state_path, temp)) = state_temp
+        && let Err(error) = commit_staged(state_path, &temp, "Clipboard settings")
+    {
+        return rollback_error(
+            error,
+            [
+                restore_previous(state_path, previous_state.as_deref()),
+                restore_previous(&ringboard_path, previous_ringboard.as_deref()),
+            ],
+        );
+    }
+    Ok(())
+}
+
+fn persist(path: Option<&Path>, value: &ClipboardSettings) -> Result<(), String> {
     let Some(path) = path else {
         return Ok(());
     };
-    let parent = path.parent().ok_or("Clipboard state path is invalid")?;
-    fs::create_dir_all(parent).map_err(|_| "Clipboard state directory is unavailable")?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-        .map_err(|_| "Clipboard state permissions could not be set")?;
     let bytes =
         serde_json::to_vec_pretty(value).map_err(|_| "Clipboard settings could not be encoded")?;
+    let previous = read_existing(path)?;
+    let temp = stage_write(path, &bytes, true, "Clipboard settings")?;
+    match commit_staged(path, &temp, "Clipboard settings") {
+        Ok(()) => Ok(()),
+        Err(error) => rollback_error(error, [restore_previous(path, previous.as_deref())]),
+    }
+}
+
+fn atomic_write(
+    path: &Path,
+    bytes: &[u8],
+    private_parent: bool,
+    label: &str,
+) -> Result<(), String> {
+    let temp = stage_write(path, bytes, private_parent, label)?;
+    commit_staged(path, &temp, label)
+}
+
+fn stage_write(
+    path: &Path,
+    bytes: &[u8],
+    private_parent: bool,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{label} path is invalid"))?;
+    fs::create_dir_all(parent).map_err(|_| format!("{label} directory is unavailable"))?;
+    if private_parent {
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .map_err(|_| format!("{label} directory permissions could not be set"))?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("{label} path is invalid"))?;
+    let temp = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
     let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
         .mode(0o600)
-        .open(path)
-        .map_err(|_| "Clipboard settings could not be written")?;
-    file.write_all(&bytes)
-        .map_err(|_| "Clipboard settings could not be written".into())
+        .open(&temp)
+        .map_err(|_| format!("{label} temporary file could not be created"))?;
+    if file.write_all(bytes).is_err() || file.sync_all().is_err() {
+        let _ = fs::remove_file(&temp);
+        return Err(format!("{label} could not be written"));
+    }
+    Ok(temp)
+}
+
+fn commit_staged(path: &Path, temp: &Path, label: &str) -> Result<(), String> {
+    if fs::rename(temp, path).is_err() {
+        let _ = fs::remove_file(temp);
+        return Err(format!("{label} could not be committed"));
+    }
+    sync_parent(path).map_err(|_| format!("{label} directory could not be synced"))
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    File::open(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?.sync_all()
+}
+
+fn read_existing(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err("Existing settings could not be read".into()),
+    }
+}
+
+fn restore_previous(path: &Path, bytes: Option<&[u8]>) -> Result<(), String> {
+    match bytes {
+        Some(bytes) => atomic_write(path, bytes, false, "Ringboard settings rollback"),
+        None => {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(_) => return Err("New settings file could not be removed".to_owned()),
+            }
+            sync_parent(path).map_err(|_| "Settings directory could not be synced".to_owned())
+        }
+    }
+}
+
+fn rollback_error<const N: usize>(
+    error: String,
+    rollbacks: [Result<(), String>; N],
+) -> Result<(), String> {
+    let failures: Vec<_> = rollbacks.into_iter().filter_map(Result::err).collect();
+    if failures.is_empty() {
+        Err(error)
+    } else {
+        Err(format!("{error}; rollback failed: {}", failures.join("; ")))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SettingsManager, SettingsUpdate};
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{
+        ClipboardSettings, SettingsManager, SettingsState, SettingsUpdate, atomic_write,
+        load_settings,
+    };
+
+    fn manager(path: Option<std::path::PathBuf>) -> SettingsManager {
+        SettingsManager {
+            state: std::sync::Mutex::new(SettingsState {
+                value: ClipboardSettings::default(),
+                load_error: None,
+            }),
+            path,
+            transaction: Default::default(),
+        }
+    }
 
     #[tokio::test]
     async fn invalid_limits_are_rejected() {
-        let manager = SettingsManager {
-            value: Default::default(),
-            path: None,
-        };
+        let manager = manager(None);
         assert!(
             manager
                 .update(SettingsUpdate {
@@ -218,5 +420,36 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn no_op_update_does_not_write_or_restart() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        let manager = manager(Some(path.clone()));
+        assert_eq!(
+            manager.update(SettingsUpdate::default()).await.unwrap(),
+            ClipboardSettings::default()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn malformed_settings_are_reported_instead_of_defaulted() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        fs::write(&path, b"{broken").unwrap();
+        let error = load_settings(Some(&path)).unwrap_err();
+        assert!(error.contains("refusing to use defaults"));
+    }
+
+    #[test]
+    fn atomic_write_replaces_the_complete_file() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state/settings.json");
+        atomic_write(&path, b"old", true, "test settings").unwrap();
+        atomic_write(&path, b"new-value", true, "test settings").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new-value");
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
     }
 }
