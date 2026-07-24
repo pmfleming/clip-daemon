@@ -50,7 +50,6 @@ struct SummaryCache {
 #[derive(Clone, Copy)]
 struct IdentityBinding {
     raw_id: u64,
-    generation: u64,
     revision: u64,
 }
 
@@ -142,12 +141,7 @@ impl RingboardBackend {
     }
 
     fn change_token_sync(&self) -> BackendResult<u64> {
-        let token = history_token(&Self::open_database()?);
-        self.ids
-            .lock()
-            .map_err(|_| lock_error())?
-            .retain(|_, binding| binding.generation == token);
-        Ok(token)
+        Ok(history_token(&Self::open_database()?))
     }
 
     fn selected(
@@ -157,17 +151,10 @@ impl RingboardBackend {
     ) -> BackendResult<(Entry, EntryReader, EntrySummary)> {
         let binding = self.resolve(opaque_id)?;
         let (database, mut reader) = Self::open()?;
-        let generation = history_token(&database);
-        if generation != binding.generation {
-            self.ids.lock().map_err(|_| lock_error())?.clear();
-            return Err(BackendError::stale(
-                "Clipboard history changed after this entry was loaded",
-            ));
-        }
         let entry = database
             .get_raw(binding.raw_id)
             .map_err(|_| BackendError::stale("Clipboard entry is stale or missing"))?;
-        let summary = self.summarize(entry, &mut reader, false, generation)?;
+        let summary = self.summarize(entry, &mut reader, false)?;
         if summary.id != opaque_id {
             self.ids.lock().map_err(|_| lock_error())?.remove(opaque_id);
             return Err(BackendError::stale(
@@ -190,7 +177,6 @@ impl RingboardBackend {
         entry: Entry,
         reader: &mut EntryReader,
         current: bool,
-        generation: u64,
     ) -> BackendResult<EntrySummary> {
         let mut loaded = entry
             .to_file(reader)
@@ -213,7 +199,7 @@ impl RingboardBackend {
                     .map(|value| mime_or_default(value.as_str()))
             })
             .unwrap_or(DEFAULT_MIME);
-        let fingerprint = entry_fingerprint(generation, entry.id(), byte_size, mime, &bytes);
+        let fingerprint = entry_fingerprint(entry.id(), byte_size, mime, &bytes);
         let id = opaque_id(&fingerprint);
         Ok(EntrySummary {
             revision: entry_revision(&fingerprint),
@@ -234,13 +220,12 @@ impl RingboardBackend {
         entry: Entry,
         reader: &mut EntryReader,
         current: bool,
-        generation: u64,
     ) -> BackendResult<Option<EntrySummary>> {
         if let Some(summary) = cache.entries.get(&entry.id()) {
             return Ok(summary.clone());
         }
         let summary = match catch_unwind(AssertUnwindSafe(|| {
-            self.summarize(entry, reader, current, generation)
+            self.summarize(entry, reader, current)
         })) {
             Ok(Ok(summary)) => Some(summary),
             Ok(Err(error))
@@ -283,18 +268,13 @@ impl RingboardBackend {
         cache.select_token(token);
         for entry in database.favorites().rev().chain(main) {
             let raw_id = entry.id();
-            if let Some(summary) = self.cached_summary(
-                &mut cache,
-                entry,
-                &mut reader,
-                current_id == Some(raw_id),
-                token,
-            )? {
+            if let Some(summary) =
+                self.cached_summary(&mut cache, entry, &mut reader, current_id == Some(raw_id))?
+            {
                 current_ids.insert(
                     summary.id.clone(),
                     IdentityBinding {
                         raw_id,
-                        generation: token,
                         revision: summary.revision,
                     },
                 );
@@ -326,16 +306,14 @@ impl RingboardBackend {
 
     fn details_raw_sync(&self, raw_id: u64, max_text_bytes: usize) -> BackendResult<EntryDetails> {
         let (database, mut reader) = Self::open()?;
-        let token = history_token(&database);
         let entry = database
             .get_raw(raw_id)
             .map_err(|_| BackendError::not_found("Clipboard entry is stale or missing"))?;
-        let summary = self.summarize(entry, &mut reader, false, token)?;
+        let summary = self.summarize(entry, &mut reader, false)?;
         self.ids.lock().map_err(|_| lock_error())?.insert(
             summary.id.clone(),
             IdentityBinding {
                 raw_id,
-                generation: token,
                 revision: summary.revision,
             },
         );
@@ -622,16 +600,9 @@ fn lock_error() -> BackendError {
     )
 }
 
-fn entry_fingerprint(
-    generation: u64,
-    raw_id: u64,
-    size: u64,
-    mime: &str,
-    bytes: &[u8],
-) -> [u8; 32] {
+fn entry_fingerprint(raw_id: u64, size: u64, mime: &str, bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"clip-daemon:entry-fingerprint:v2:");
-    hasher.update(generation.to_le_bytes());
+    hasher.update(b"clip-daemon:entry-fingerprint:v3:");
     hasher.update(raw_id.to_le_bytes());
     hasher.update(size.to_le_bytes());
     hasher.update(mime.as_bytes());
@@ -654,7 +625,8 @@ fn entry_revision(fingerprint: &[u8; 32]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SAFE_JSON_INTEGER, SummaryCache, entry_revision, history_token_from_parts, opaque_id,
+        MAX_SAFE_JSON_INTEGER, SummaryCache, entry_fingerprint, entry_revision,
+        history_token_from_parts, opaque_id,
     };
 
     #[test]
@@ -685,6 +657,11 @@ mod tests {
 
     #[test]
     fn engine_ids_are_not_exposed_and_revisions_are_stable() {
+        let stable = entry_fingerprint(42, 3, "text/plain", b"abc");
+        assert_eq!(stable, entry_fingerprint(42, 3, "text/plain", b"abc"));
+        assert_ne!(stable, entry_fingerprint(43, 3, "text/plain", b"abc"));
+        assert_ne!(stable, entry_fingerprint(42, 3, "text/plain", b"xyz"));
+
         let first = [0x2a; 32];
         let second = [0x2b; 32];
         assert!(opaque_id(&first).starts_with("entry-"));
