@@ -36,10 +36,23 @@ async fn validation_unknown_methods_and_wipe_challenges_are_stable() {
             "validation-error",
         ),
         ("clipboard.entry.edit.begin", json!({}), "validation-error"),
+        (
+            "clipboard.capture.screenshot",
+            json!({"x":0,"y":0,"width":0,"height":720}),
+            "validation-error",
+        ),
         ("clipboard.nope", json!({}), "unsupported-method"),
     ] {
         assert_eq!(api.dispatch(method, params).await["error"]["code"], code);
     }
+    let screenshot = api
+        .dispatch(
+            "clipboard.capture.screenshot",
+            json!({"x":-1280,"y":0,"width":1280,"height":720}),
+        )
+        .await;
+    assert_eq!(screenshot["data"]["operation"]["action"], "screenshot");
+
     let challenge = api
         .dispatch("clipboard.history.wipe.prepare", json!({}))
         .await;

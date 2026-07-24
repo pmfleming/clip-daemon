@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     backend::{
         BackendError, BackendErrorKind, BackendMutation, BackendResult, ClipboardBackend,
-        HistoryQuery, MAX_QUERY_LIMIT,
+        HistoryQuery, MAX_QUERY_LIMIT, ScreenshotRegion,
     },
     classification::{INSPECTION_LIMIT, bounded_preview, classify},
     model::{
@@ -237,6 +237,10 @@ impl ClipboardBackend for RingboardBackend {
             .to_file(&mut reader)
             .map_err(|_| invalid_entry("Could not open clipboard image"))?;
         create_thumbnail(&loaded, &summary, edge)
+    }
+
+    async fn capture_screenshot(&self, region: ScreenshotRegion) -> BackendResult<OperationResult> {
+        self.capture_region(region).await
     }
 
     async fn mutate(

@@ -27,13 +27,25 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    backend::{BackendError, BackendErrorKind, BackendResult},
+    backend::{BackendError, BackendErrorKind, BackendResult, ScreenshotRegion},
     model::{EntryKind, OperationResult},
 };
 
 use super::{MAX_THUMBNAIL_BYTES, RingboardBackend, invalid_entry};
 
 impl RingboardBackend {
+    pub(super) async fn capture_region(
+        &self,
+        region: ScreenshotRegion,
+    ) -> BackendResult<OperationResult> {
+        let directory = runtime_directory("clip-daemon/screenshots")?;
+        let path = unique_path(&directory, "png");
+        drop(private_file(&path)?);
+        let result = capture_and_restore(region, &path).await;
+        let _ = fs::remove_file(path);
+        result
+    }
+
     pub(super) fn restore_entry(&self, opaque_id: &str) -> BackendResult<OperationResult> {
         let (entry, mut reader, _) = self.selected(opaque_id)?;
         send_paste_buffer(paste_server()?, entry, &mut reader, false).map_err(operation_error)?;
@@ -170,6 +182,35 @@ impl RingboardBackend {
             "Clipboard history cleared",
         ))
     }
+}
+
+async fn capture_and_restore(
+    region: ScreenshotRegion,
+    path: &Path,
+) -> BackendResult<OperationResult> {
+    let geometry = format!(
+        "{},{} {}x{}",
+        region.x, region.y, region.width, region.height
+    );
+    let status = Command::new("grim")
+        .args(["-g", &geometry])
+        .arg(path)
+        .status()
+        .await
+        .map_err(|_| operation_error("Could not start screenshot capture"))?;
+    if !status.success() {
+        return Err(operation_error("Screenshot capture failed"));
+    }
+    if !valid_edited_image(path) {
+        return Err(operation_error(
+            "Screenshot capture returned an invalid image",
+        ));
+    }
+    add_file_and_restore(path, "image/png")?;
+    Ok(OperationResult::completed(
+        "screenshot",
+        "Clipboard screenshot copied",
+    ))
 }
 
 async fn run_annotation(

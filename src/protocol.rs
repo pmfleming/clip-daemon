@@ -23,6 +23,7 @@ pub const METHODS: &[&str] = &[
     "clipboard.entry.edit.commit",
     "clipboard.entry.edit.cancel",
     "clipboard.capture.setPaused",
+    "clipboard.capture.screenshot",
     "clipboard.settings.get",
     "clipboard.settings.update",
     "clipboard.history.wipe.prepare",

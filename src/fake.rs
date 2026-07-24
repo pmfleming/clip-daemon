@@ -3,7 +3,10 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 
 use crate::{
-    backend::{BackendError, BackendMutation, BackendResult, ClipboardBackend, HistoryQuery},
+    backend::{
+        BackendError, BackendMutation, BackendResult, ClipboardBackend, HistoryQuery,
+        ScreenshotRegion,
+    },
     classification::{bounded_preview, classify},
     model::{
         BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
@@ -123,6 +126,16 @@ impl ClipboardBackend for FakeBackend {
             "No thumbnail fixture for {}",
             details.entry.id
         )))
+    }
+
+    async fn capture_screenshot(
+        &self,
+        _region: ScreenshotRegion,
+    ) -> BackendResult<OperationResult> {
+        Ok(OperationResult::completed(
+            "screenshot",
+            "Fake screenshot copied",
+        ))
     }
 
     async fn mutate(

@@ -99,6 +99,17 @@
         "stream": "clipboard.capture.changed"
       },
       {
+        "name": "clipboard.capture.screenshot",
+        "params_example": {
+          "height": 720,
+          "width": 1280,
+          "x": 0,
+          "y": 0
+        },
+        "response_key": "operation",
+        "stream": "clipboard.operation"
+      },
+      {
         "name": "clipboard.settings.get",
         "params_example": {},
         "response_key": "settings",

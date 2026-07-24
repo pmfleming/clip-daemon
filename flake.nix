@@ -32,7 +32,7 @@
             '';
             postFixup = ''
               wrapProgram $out/bin/clip-daemon \
-                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.hyprland pkgs.kdePackages.dolphin pkgs.libnotify pkgs.satty pkgs.systemd pkgs.xdg-utils ]}
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.grim pkgs.hyprland pkgs.kdePackages.dolphin pkgs.libnotify pkgs.satty pkgs.systemd pkgs.xdg-utils ]}
             '';
             meta = {
               description = "Ringboard policy and clip-api daemon for Shelllist";
@@ -60,7 +60,7 @@
 
       devShells = forAllSystems (system: pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo clippy dbus jq just pkg-config ringboard-wayland rust-analyzer rustc rustfmt wayland-utils ];
+          packages = with pkgs; [ cargo clippy dbus grim jq just pkg-config ringboard-wayland rust-analyzer rustc rustfmt wayland-utils ];
           RUST_BACKTRACE = "1";
           RUST_LOG = "clip_daemon=debug";
           RUSTC_BOOTSTRAP = "1";

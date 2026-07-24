@@ -14,6 +14,14 @@ pub struct HistoryQuery {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenshotRegion {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendErrorKind {
     Unavailable,
     NotFound,
@@ -102,6 +110,7 @@ pub trait ClipboardBackend: Send + Sync {
     async fn query(&self, query: HistoryQuery) -> BackendResult<HistoryPage>;
     async fn details(&self, opaque_id: &str, max_text_bytes: usize) -> BackendResult<EntryDetails>;
     async fn thumbnail(&self, opaque_id: &str, edge: u32) -> BackendResult<EntryThumbnail>;
+    async fn capture_screenshot(&self, region: ScreenshotRegion) -> BackendResult<OperationResult>;
     async fn mutate(
         &self,
         opaque_id: &str,

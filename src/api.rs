@@ -14,7 +14,7 @@ use crate::{
         ActionService, ApiError, MAX_EDIT_BYTES, decode, load_details, validate_entry_id,
         validate_revision,
     },
-    backend::{BackendMutation, ClipboardBackend, HistoryQuery, MAX_QUERY_LIMIT},
+    backend::{BackendMutation, ClipboardBackend, HistoryQuery, MAX_QUERY_LIMIT, ScreenshotRegion},
     protocol,
     settings::{SettingsManager, SettingsUpdate},
 };
@@ -87,6 +87,7 @@ impl ApiService {
     async fn dispatch_policy(&self, method: &str, params: Value) -> Result<Value, ApiError> {
         match method {
             "clipboard.capture.setPaused" => self.set_paused(decode(params)?).await,
+            "clipboard.capture.screenshot" => self.capture_screenshot(decode(params)?).await,
             "clipboard.settings.get" => self.get_settings(),
             "clipboard.settings.update" => self.update_settings(decode(params)?).await,
             _ if protocol::METHODS.contains(&method) => Err(ApiError::new(
@@ -167,6 +168,26 @@ impl ApiService {
         }, "settings": settings }))
     }
 
+    async fn capture_screenshot(&self, params: ScreenshotParams) -> Result<Value, ApiError> {
+        if !(1..=MAX_SCREENSHOT_EDGE).contains(&params.width)
+            || !(1..=MAX_SCREENSHOT_EDGE).contains(&params.height)
+        {
+            return Err(ApiError::validation(
+                "screenshot width and height must be between 1 and 32768",
+            ));
+        }
+        let operation = self
+            .backend
+            .capture_screenshot(ScreenshotRegion {
+                x: params.x,
+                y: params.y,
+                width: params.width,
+                height: params.height,
+            })
+            .await?;
+        Ok(json!({ "operation": operation }))
+    }
+
     async fn commit_wipe(&self, params: WipeParams) -> Result<Value, ApiError> {
         if params.response != "WIPE" {
             return Err(ApiError::validation("wipe confirmation must be WIPE"));
@@ -217,9 +238,19 @@ struct PauseParams {
     private_mode: bool,
 }
 
+#[derive(Deserialize)]
+struct ScreenshotParams {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
 fn settings_error(message: String) -> ApiError {
     ApiError::new("settings-error", message)
 }
+
+const MAX_SCREENSHOT_EDGE: u32 = 32_768;
 
 const fn default_query_limit() -> usize {
     100
