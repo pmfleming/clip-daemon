@@ -7,6 +7,7 @@ use std::{
         unix::fs::{OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
+    process::Command as StdCommand,
 };
 
 use clipboard_history_client_sdk::{
@@ -31,17 +32,24 @@ use crate::{
     model::{EntryKind, OperationResult},
 };
 
-use super::{MAX_THUMBNAIL_BYTES, RingboardBackend, invalid_entry};
+use super::{MAX_THUMBNAIL_BYTES, OperationTask, RingboardBackend, invalid_entry, run_blocking};
+
+pub(super) struct AnnotationStage {
+    input: PathBuf,
+    output: PathBuf,
+    raw_id: u64,
+    ring: RingKind,
+}
 
 impl RingboardBackend {
-    pub(super) async fn capture_region(
+    pub(super) fn capture_region(
         &self,
         region: ScreenshotRegion,
     ) -> BackendResult<OperationResult> {
         let directory = runtime_directory("clip-daemon/screenshots")?;
         let path = unique_path(&directory, "png");
         drop(private_file(&path)?);
-        let result = capture_and_restore(region, &path).await;
+        let result = capture_and_restore(region, &path);
         let _ = fs::remove_file(path);
         result
     }
@@ -71,28 +79,44 @@ impl RingboardBackend {
         Ok(result)
     }
 
-    pub(super) fn start_annotation(&self, opaque_id: &str) -> BackendResult<OperationResult> {
-        let (input, output, raw_id, ring) = self.stage_annotation(opaque_id)?;
+    pub(super) fn launch_annotation(
+        &self,
+        staged: AnnotationStage,
+    ) -> BackendResult<OperationResult> {
         let mut operation = OperationResult::completed("annotate", "Satty annotation started");
         operation.status = "started".into();
-        let task = tokio::spawn(run_annotation(
-            input,
-            output,
-            raw_id,
-            ring,
-            operation.id.clone(),
-        ));
-        self.operations
-            .lock()
-            .map_err(|_| operation_error("Clipboard operation state is unavailable"))?
-            .insert(operation.id.clone(), task);
+        let operation_id = operation.id.clone();
+        let files = [staged.input.clone(), staged.output.clone()];
+        let cleanup_files = files.clone();
+        let operations = self.operations.clone();
+        let task_id = operation_id.clone();
+        let (start, ready) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            if ready.await.is_ok() {
+                run_annotation(staged, task_id.clone()).await;
+            }
+            if let Ok(mut active) = operations.lock() {
+                active.remove(&task_id);
+            }
+        });
+        let mut active = match self.operations.lock() {
+            Ok(active) => active,
+            Err(_) => {
+                handle.abort();
+                remove_files(&cleanup_files);
+                return Err(operation_error("Clipboard operation state is unavailable"));
+            }
+        };
+        active.insert(operation_id, OperationTask { handle, files });
+        drop(active);
+        if start.send(()).is_err() {
+            remove_files(&cleanup_files);
+            return Err(operation_error("Annotation task could not be started"));
+        }
         Ok(operation)
     }
 
-    fn stage_annotation(
-        &self,
-        opaque_id: &str,
-    ) -> BackendResult<(PathBuf, PathBuf, u64, RingKind)> {
+    pub(super) fn stage_annotation(&self, opaque_id: &str) -> BackendResult<AnnotationStage> {
         let (entry, mut reader, summary) = self.selected(opaque_id)?;
         if summary.kind != EntryKind::Image {
             return Err(invalid_entry("Only image entries can be annotated"));
@@ -101,7 +125,12 @@ impl RingboardBackend {
         let input = unique_path(&directory, image_extension(&summary.mime));
         let output = unique_path(&directory, "png");
         copy_entry(entry, &mut reader, &input)?;
-        Ok((input, output, entry.id(), target_ring(summary.favorite)))
+        Ok(AnnotationStage {
+            input,
+            output,
+            raw_id: entry.id(),
+            ring: target_ring(summary.favorite),
+        })
     }
 
     pub(super) fn replace_entry(
@@ -148,13 +177,13 @@ impl RingboardBackend {
     }
 
     pub(super) fn cleanup_artifacts(&self) -> BackendResult<OperationResult> {
-        for (_, task) in self
+        for (_, operation) in self
             .operations
             .lock()
             .map_err(|_| operation_error("Clipboard operation state is unavailable"))?
             .drain()
         {
-            task.abort();
+            operation.handle.abort();
         }
         super::content::clear_cache()?;
         let runtime = runtime_directory("clip-daemon")?;
@@ -184,19 +213,15 @@ impl RingboardBackend {
     }
 }
 
-async fn capture_and_restore(
-    region: ScreenshotRegion,
-    path: &Path,
-) -> BackendResult<OperationResult> {
+fn capture_and_restore(region: ScreenshotRegion, path: &Path) -> BackendResult<OperationResult> {
     let geometry = format!(
         "{},{} {}x{}",
         region.x, region.y, region.width, region.height
     );
-    let status = Command::new("grim")
+    let status = StdCommand::new("grim")
         .args(["-g", &geometry])
         .arg(path)
         .status()
-        .await
         .map_err(|_| operation_error("Could not start screenshot capture"))?;
     if !status.success() {
         return Err(operation_error("Screenshot capture failed"));
@@ -213,16 +238,15 @@ async fn capture_and_restore(
     ))
 }
 
-async fn run_annotation(
-    input: PathBuf,
-    output: PathBuf,
-    raw_id: u64,
-    ring: RingKind,
-    operation_id: String,
-) {
-    let status = Command::new("satty")
-        .args(["--filename", input.to_string_lossy().as_ref()])
-        .args(["--output-filename", output.to_string_lossy().as_ref()])
+async fn run_annotation(staged: AnnotationStage, operation_id: String) {
+    let mut command = Command::new("satty");
+    command.kill_on_drop(true);
+    let status = command
+        .args(["--filename", staged.input.to_string_lossy().as_ref()])
+        .args([
+            "--output-filename",
+            staged.output.to_string_lossy().as_ref(),
+        ])
         .args([
             "--resize",
             "smart",
@@ -232,15 +256,28 @@ async fn run_annotation(
         ])
         .status()
         .await;
-    if status.is_ok_and(|value| value.success())
-        && valid_edited_image(&output)
-        && let Err(error) =
-            replace_from_file(raw_id, ring, &output, "image/png").and_then(|()| restore_raw(raw_id))
-    {
-        tracing::warn!(%operation_id, code = %error.kind.code(), "annotation result could not be restored");
+    if status.is_ok_and(|value| value.success()) {
+        let output = staged.output.clone();
+        let raw_id = staged.raw_id;
+        let ring = staged.ring;
+        if let Err(error) = run_blocking(move || {
+            if !valid_edited_image(&output) {
+                return Err(operation_error("Annotation returned an invalid image"));
+            }
+            replace_from_file(raw_id, ring, &output, "image/png")?;
+            restore_raw(raw_id)
+        })
+        .await
+        {
+            tracing::warn!(%operation_id, code = %error.kind.code(), "annotation result could not be restored");
+        }
     }
-    let _ = fs::remove_file(input);
-    let _ = fs::remove_file(output);
+    let files = [staged.input, staged.output];
+    let _ = run_blocking(move || {
+        remove_files(&files);
+        Ok(())
+    })
+    .await;
 }
 
 fn replace_from_file(raw_id: u64, ring: RingKind, path: &Path, mime: &str) -> BackendResult<()> {
@@ -334,11 +371,10 @@ fn valid_edited_image(path: &Path) -> bool {
             .is_some()
 }
 
-pub(super) fn clear_edit_files() {
-    let root = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir);
-    let _ = fs::remove_dir_all(root.join("clip-daemon/edits"));
+pub(super) fn remove_files(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn image_directory() -> BackendResult<PathBuf> {
@@ -386,4 +422,28 @@ fn image_extension(mime: &str) -> &'static str {
 
 fn operation_error(error: impl std::fmt::Display) -> BackendError {
     BackendError::new(BackendErrorKind::OperationFailed, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::remove_files;
+
+    #[test]
+    fn operation_cleanup_only_removes_its_own_files() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let unrelated = directory.path().join("unrelated");
+        for path in [&first, &second, &unrelated] {
+            fs::write(path, b"fixture").expect("write fixture");
+        }
+
+        remove_files(&[first.clone(), second.clone()]);
+
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert!(unrelated.exists());
+    }
 }

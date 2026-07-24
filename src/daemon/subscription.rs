@@ -85,17 +85,25 @@ async fn poll_history(
     subscription_id: String,
     requested: RequestedStreams,
 ) {
-    let mut previous = backend.change_token().await.ok();
+    let mut previous = None;
+    let mut unavailable = false;
     let mut timer = tokio::time::interval(Duration::from_millis(500));
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         timer.tick().await;
         match backend.change_token().await {
-            Ok(token) if previous.replace(token) != Some(token) => {
-                emit_changes(&emitter, &event_revision, &subscription_id, requested).await;
+            Ok(token) => {
+                let recovered = std::mem::replace(&mut unavailable, false);
+                let changed = previous.replace(token).is_some_and(|value| value != token);
+                if recovered || changed {
+                    emit_changes(&emitter, &event_revision, &subscription_id, requested).await;
+                }
             }
-            Ok(_) => {}
-            Err(error) => emit_unavailable(&emitter, &subscription_id, error).await,
+            Err(error) if !unavailable => {
+                unavailable = true;
+                emit_unavailable(&emitter, &subscription_id, requested, error).await;
+            }
+            Err(_) => {}
         }
     }
 }
@@ -133,16 +141,32 @@ async fn emit_changes(
 async fn emit_unavailable(
     emitter: &SignalEmitter<'_>,
     subscription_id: &str,
+    requested: RequestedStreams,
     error: crate::backend::BackendError,
 ) {
-    emit_event(
-        emitter,
-        protocol::stream::HISTORY,
-        "unavailable",
-        subscription_id,
-        Some(json!({ "error": { "code": error.kind.code(), "message": error.to_string() } })),
-    )
-    .await;
+    let data = Some(json!({
+        "error": { "code": error.kind.code(), "message": error.to_string() }
+    }));
+    if requested.history {
+        emit_event(
+            emitter,
+            protocol::stream::HISTORY,
+            "unavailable",
+            subscription_id,
+            data.clone(),
+        )
+        .await;
+    }
+    if requested.current {
+        emit_event(
+            emitter,
+            protocol::stream::CURRENT,
+            "unavailable",
+            subscription_id,
+            data,
+        )
+        .await;
+    }
 }
 
 async fn wait_for_owner_loss(connection: zbus::Connection, owner: UniqueName<'static>) {

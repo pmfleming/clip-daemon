@@ -1,6 +1,11 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle, spawn_blocking};
 
 use async_trait::async_trait;
 use clipboard_history_client_sdk::{DatabaseReader, Entry, EntryReader};
@@ -33,6 +38,26 @@ struct RevisionState {
     revision: u64,
 }
 
+#[derive(Default)]
+struct SummaryCache {
+    token: Option<u64>,
+    entries: HashMap<u64, Option<EntrySummary>>,
+}
+
+impl SummaryCache {
+    fn select_token(&mut self, token: u64) {
+        if self.token != Some(token) {
+            self.token = Some(token);
+            self.entries.clear();
+        }
+    }
+}
+
+struct OperationTask {
+    handle: JoinHandle<()>,
+    files: [PathBuf; 2],
+}
+
 struct QueryAccumulator<'a> {
     needle: &'a str,
     current_id: Option<u64>,
@@ -57,30 +82,57 @@ impl QueryAccumulator<'_> {
     }
 }
 
+#[derive(Clone)]
 pub struct RingboardBackend {
-    ids: Mutex<HashMap<String, u64>>,
-    revision: Mutex<RevisionState>,
-    operations: Mutex<HashMap<String, JoinHandle<()>>>,
+    ids: Arc<Mutex<HashMap<String, u64>>>,
+    revision: Arc<Mutex<RevisionState>>,
+    summaries: Arc<Mutex<SummaryCache>>,
+    operations: Arc<Mutex<HashMap<String, OperationTask>>>,
 }
 
 impl Default for RingboardBackend {
     fn default() -> Self {
         Self {
-            ids: Mutex::new(HashMap::new()),
-            revision: Mutex::new(RevisionState::default()),
-            operations: Mutex::new(HashMap::new()),
+            ids: Arc::new(Mutex::new(HashMap::new())),
+            revision: Arc::new(Mutex::new(RevisionState::default())),
+            summaries: Arc::new(Mutex::new(SummaryCache::default())),
+            operations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
 impl RingboardBackend {
-    fn open() -> BackendResult<(DatabaseReader, EntryReader)> {
+    fn open_database() -> BackendResult<DatabaseReader> {
         let mut directory = clipboard_history_client_sdk::core::dirs::data_dir();
-        let database = DatabaseReader::open(&mut directory)
-            .map_err(|_| BackendError::unavailable("Ringboard history is unavailable"))?;
+        DatabaseReader::open(&mut directory)
+            .map_err(|_| BackendError::unavailable("Ringboard history is unavailable"))
+    }
+
+    fn open() -> BackendResult<(DatabaseReader, EntryReader)> {
+        let database = Self::open_database()?;
+        let mut directory = clipboard_history_client_sdk::core::dirs::data_dir();
         let reader = EntryReader::open(&mut directory)
             .map_err(|_| BackendError::unavailable("Ringboard entries are unavailable"))?;
         Ok((database, reader))
+    }
+
+    fn status_sync(&self) -> BackendStatus {
+        match Self::open_database() {
+            Ok(_) => BackendStatus {
+                available: true,
+                engine: "ringboard".into(),
+                detail: "database-readable".into(),
+            },
+            Err(error) => BackendStatus {
+                available: false,
+                engine: "ringboard".into(),
+                detail: error.to_string(),
+            },
+        }
+    }
+
+    fn change_token_sync(&self) -> BackendResult<u64> {
+        Ok(history_token(&Self::open_database()?))
     }
 
     fn selected(&self, opaque_id: &str) -> BackendResult<(Entry, EntryReader, EntrySummary)> {
@@ -135,6 +187,132 @@ impl RingboardBackend {
         })
     }
 
+    fn cached_summary(
+        &self,
+        cache: &mut SummaryCache,
+        entry: Entry,
+        reader: &mut EntryReader,
+        current: bool,
+    ) -> BackendResult<Option<EntrySummary>> {
+        if let Some(summary) = cache.entries.get(&entry.id()) {
+            return Ok(summary.clone());
+        }
+        let summary = match catch_unwind(AssertUnwindSafe(|| {
+            self.summarize(entry, reader, current)
+        })) {
+            Ok(Ok(summary)) => Some(summary),
+            Ok(Err(error))
+                if matches!(
+                    error.kind,
+                    BackendErrorKind::InvalidData | BackendErrorKind::NotFound
+                ) =>
+            {
+                tracing::warn!(code = %error.kind.code(), "Skipping unreadable clipboard entry");
+                None
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                tracing::warn!("Skipping clipboard entry that panicked while being read");
+                None
+            }
+        };
+        cache.entries.insert(entry.id(), summary.clone());
+        Ok(summary)
+    }
+
+    fn query_sync(&self, query: HistoryQuery) -> BackendResult<HistoryPage> {
+        let (database, mut reader) = Self::open()?;
+        let token = history_token(&database);
+        let main: Vec<_> = database.main().rev().collect();
+        let current_id = main.first().map(Entry::id);
+        let needle = query.query.trim().to_lowercase();
+        let limit = query.limit.clamp(1, MAX_QUERY_LIMIT);
+        let mut results = QueryAccumulator {
+            needle: &needle,
+            current_id,
+            limit,
+            matched: 0,
+            current: None,
+            entries: Vec::with_capacity(limit),
+        };
+        let mut cache = self.summaries.lock().map_err(|_| lock_error())?;
+        cache.select_token(token);
+        for entry in database.favorites().rev().chain(main) {
+            let raw_id = entry.id();
+            if let Some(summary) =
+                self.cached_summary(&mut cache, entry, &mut reader, current_id == Some(raw_id))?
+            {
+                results.add(raw_id, summary);
+            }
+        }
+        Ok(HistoryPage {
+            revision: self.revision_for(token)?,
+            generation: query.generation,
+            current: results.current,
+            has_more: results.matched > results.entries.len(),
+            entries: results.entries,
+        })
+    }
+
+    fn details_sync(&self, opaque_id: &str, max_text_bytes: usize) -> BackendResult<EntryDetails> {
+        let (entry, mut reader, summary) = self.selected(opaque_id)?;
+        let mut loaded = entry
+            .to_file(&mut reader)
+            .map_err(|_| invalid_entry("Could not open clipboard details"))?;
+        let limit = max_text_bytes.min(MAX_DETAILS_BYTES);
+        let mut bytes = read_bounded(&mut loaded, limit.saturating_add(1))?;
+        let truncated = bytes.len() > limit;
+        bytes.truncate(limit);
+        let text = std::str::from_utf8(&bytes).ok().map(str::to_owned);
+        let (files, image) = detail_facts(&summary, &bytes);
+        Ok(EntryDetails {
+            entry: summary,
+            text,
+            files,
+            image,
+            preview_truncated: truncated,
+        })
+    }
+
+    fn thumbnail_sync(&self, opaque_id: &str, edge: u32) -> BackendResult<EntryThumbnail> {
+        let (entry, mut reader, summary) = self.selected(opaque_id)?;
+        let loaded = entry
+            .to_file(&mut reader)
+            .map_err(|_| invalid_entry("Could not open clipboard image"))?;
+        create_thumbnail(&loaded, &summary, edge)
+    }
+
+    fn mutate_sync(
+        &self,
+        opaque_id: &str,
+        mutation: BackendMutation,
+    ) -> BackendResult<OperationResult> {
+        match mutation {
+            BackendMutation::Restore => self.restore_entry(opaque_id),
+            BackendMutation::ImageAsFile => self.save_image_file(opaque_id),
+            BackendMutation::Remove => self.remove_entry(opaque_id),
+            BackendMutation::SetFavorite(value) => self.move_entry(opaque_id, value),
+            BackendMutation::Wipe => self.wipe_entries(),
+            BackendMutation::Cleanup => self.cleanup_artifacts(),
+            BackendMutation::Annotate => Err(BackendError::new(
+                BackendErrorKind::OperationFailed,
+                "Annotation must be started asynchronously",
+            )),
+        }
+    }
+
+    fn replace_sync(
+        &self,
+        opaque_id: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> BackendResult<EntryDetails> {
+        self.replace_entry(opaque_id, mime, bytes)?;
+        let details = self.details_sync(opaque_id, MAX_DETAILS_BYTES)?;
+        self.restore_entry(opaque_id)?;
+        Ok(details)
+    }
+
     fn remember(&self, opaque: String, raw: u64) -> BackendResult<()> {
         self.ids
             .lock()
@@ -165,82 +343,41 @@ impl RingboardBackend {
 #[async_trait]
 impl ClipboardBackend for RingboardBackend {
     async fn status(&self) -> BackendStatus {
-        match Self::open() {
-            Ok(_) => BackendStatus {
-                available: true,
-                engine: "ringboard".into(),
-                detail: "database-readable".into(),
-            },
-            Err(error) => BackendStatus {
+        let backend = self.clone();
+        spawn_blocking(move || backend.status_sync())
+            .await
+            .unwrap_or_else(|_| BackendStatus {
                 available: false,
                 engine: "ringboard".into(),
-                detail: error.to_string(),
-            },
-        }
+                detail: "Ringboard status task failed".into(),
+            })
     }
 
     async fn change_token(&self) -> BackendResult<u64> {
-        let (database, _) = Self::open()?;
-        Ok(history_token(&database))
+        let backend = self.clone();
+        run_blocking(move || backend.change_token_sync()).await
     }
 
     async fn query(&self, query: HistoryQuery) -> BackendResult<HistoryPage> {
-        let (database, mut reader) = Self::open()?;
-        let main: Vec<_> = database.main().rev().collect();
-        let current_id = main.first().map(Entry::id);
-        let needle = query.query.trim().to_lowercase();
-        let limit = query.limit.clamp(1, MAX_QUERY_LIMIT);
-        let mut results = QueryAccumulator {
-            needle: &needle,
-            current_id,
-            limit,
-            matched: 0,
-            current: None,
-            entries: Vec::with_capacity(limit),
-        };
-        for entry in database.favorites().rev().chain(main) {
-            let summary = self.summarize(entry, &mut reader, current_id == Some(entry.id()))?;
-            results.add(entry.id(), summary);
-        }
-        Ok(HistoryPage {
-            revision: self.revision_for(history_token(&database))?,
-            generation: query.generation,
-            current: results.current,
-            has_more: results.matched > results.entries.len(),
-            entries: results.entries,
-        })
+        let backend = self.clone();
+        run_blocking(move || backend.query_sync(query)).await
     }
 
     async fn details(&self, opaque_id: &str, max_text_bytes: usize) -> BackendResult<EntryDetails> {
-        let (entry, mut reader, summary) = self.selected(opaque_id)?;
-        let mut loaded = entry
-            .to_file(&mut reader)
-            .map_err(|_| invalid_entry("Could not open clipboard details"))?;
-        let limit = max_text_bytes.min(MAX_DETAILS_BYTES);
-        let mut bytes = read_bounded(&mut loaded, limit.saturating_add(1))?;
-        let truncated = bytes.len() > limit;
-        bytes.truncate(limit);
-        let text = std::str::from_utf8(&bytes).ok().map(str::to_owned);
-        let (files, image) = detail_facts(&summary, &bytes);
-        Ok(EntryDetails {
-            entry: summary,
-            text,
-            files,
-            image,
-            preview_truncated: truncated,
-        })
+        let backend = self.clone();
+        let opaque_id = opaque_id.to_owned();
+        run_blocking(move || backend.details_sync(&opaque_id, max_text_bytes)).await
     }
 
     async fn thumbnail(&self, opaque_id: &str, edge: u32) -> BackendResult<EntryThumbnail> {
-        let (entry, mut reader, summary) = self.selected(opaque_id)?;
-        let loaded = entry
-            .to_file(&mut reader)
-            .map_err(|_| invalid_entry("Could not open clipboard image"))?;
-        create_thumbnail(&loaded, &summary, edge)
+        let backend = self.clone();
+        let opaque_id = opaque_id.to_owned();
+        run_blocking(move || backend.thumbnail_sync(&opaque_id, edge)).await
     }
 
     async fn capture_screenshot(&self, region: ScreenshotRegion) -> BackendResult<OperationResult> {
-        self.capture_region(region).await
+        let backend = self.clone();
+        run_blocking(move || backend.capture_region(region)).await
     }
 
     async fn mutate(
@@ -248,15 +385,15 @@ impl ClipboardBackend for RingboardBackend {
         opaque_id: &str,
         mutation: BackendMutation,
     ) -> BackendResult<OperationResult> {
-        match mutation {
-            BackendMutation::Restore => self.restore_entry(opaque_id),
-            BackendMutation::ImageAsFile => self.save_image_file(opaque_id),
-            BackendMutation::Annotate => self.start_annotation(opaque_id),
-            BackendMutation::Remove => self.remove_entry(opaque_id),
-            BackendMutation::SetFavorite(value) => self.move_entry(opaque_id, value),
-            BackendMutation::Wipe => self.wipe_entries(),
-            BackendMutation::Cleanup => self.cleanup_artifacts(),
+        if mutation == BackendMutation::Annotate {
+            let backend = self.clone();
+            let opaque_id = opaque_id.to_owned();
+            let staged = run_blocking(move || backend.stage_annotation(&opaque_id)).await?;
+            return self.launch_annotation(staged);
         }
+        let backend = self.clone();
+        let opaque_id = opaque_id.to_owned();
+        run_blocking(move || backend.mutate_sync(&opaque_id, mutation)).await
     }
 
     async fn replace(
@@ -265,25 +402,48 @@ impl ClipboardBackend for RingboardBackend {
         mime: &str,
         bytes: &[u8],
     ) -> BackendResult<EntryDetails> {
-        self.replace_entry(opaque_id, mime, bytes)?;
-        let details = self.details(opaque_id, MAX_DETAILS_BYTES).await?;
-        self.restore_entry(opaque_id)?;
-        Ok(details)
+        let backend = self.clone();
+        let opaque_id = opaque_id.to_owned();
+        let mime = mime.to_owned();
+        let bytes = bytes.to_vec();
+        run_blocking(move || backend.replace_sync(&opaque_id, &mime, &bytes)).await
     }
 
     async fn cancel_operation(&self, operation_id: &str) -> BackendResult<bool> {
-        let task = self
+        let operation = self
             .operations
             .lock()
             .map_err(|_| lock_error())?
             .remove(operation_id);
-        let Some(task) = task.filter(|task| !task.is_finished()) else {
+        let Some(operation) = operation else {
             return Ok(false);
         };
-        task.abort();
-        mutation::clear_edit_files();
-        Ok(true)
+        let was_running = !operation.handle.is_finished();
+        operation.handle.abort();
+        let _ = operation.handle.await;
+        run_blocking(move || {
+            mutation::remove_files(&operation.files);
+            Ok(())
+        })
+        .await?;
+        Ok(was_running)
     }
+}
+
+async fn run_blocking<T>(
+    work: impl FnOnce() -> BackendResult<T> + Send + 'static,
+) -> BackendResult<T>
+where
+    T: Send + 'static,
+{
+    spawn_blocking(work).await.map_err(blocking_task_error)?
+}
+
+fn blocking_task_error(_: JoinError) -> BackendError {
+    BackendError::new(
+        BackendErrorKind::OperationFailed,
+        "Clipboard backend task failed",
+    )
 }
 
 fn mime_or_default(mime: &str) -> &str {
@@ -334,7 +494,19 @@ fn entry_revision(raw_id: u64, size: u64, mime: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{entry_revision, opaque_id};
+    use super::{SummaryCache, entry_revision, opaque_id};
+
+    #[test]
+    fn summary_cache_is_retained_until_the_history_token_changes() {
+        let mut cache = SummaryCache::default();
+        cache.select_token(1);
+        cache.entries.insert(42, None);
+        cache.select_token(1);
+        assert!(cache.entries.contains_key(&42));
+
+        cache.select_token(2);
+        assert!(cache.entries.is_empty());
+    }
 
     #[test]
     fn engine_ids_are_not_exposed_and_revisions_are_stable() {

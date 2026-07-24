@@ -58,9 +58,20 @@ pub(super) fn create_thumbnail(
     if summary.kind != EntryKind::Image || summary.byte_size > MAX_THUMBNAIL_BYTES {
         return Err(invalid_entry("Clipboard entry cannot be thumbnailed"));
     }
+    let edge = edge.clamp(32, 1024);
+    let path =
+        thumbnail_directory()?.join(format!("{}-{}-{edge}.png", summary.id, summary.revision));
+    if let Some((width, height)) = cached_dimensions(&path) {
+        return Ok(EntryThumbnail {
+            entry_id: summary.id.clone(),
+            revision: summary.revision,
+            path: path.to_string_lossy().into_owned(),
+            width,
+            height,
+        });
+    }
     let image = decode_image(file)?;
-    let thumbnail = image.thumbnail(edge.clamp(32, 1024), edge.clamp(32, 1024));
-    let path = thumbnail_directory()?.join(format!("{}-{}.png", summary.id, summary.revision));
+    let thumbnail = image.thumbnail(edge, edge);
     thumbnail
         .save_with_format(&path, image::ImageFormat::Png)
         .map_err(|_| invalid_entry("Clipboard thumbnail could not be written"))?;
@@ -72,6 +83,14 @@ pub(super) fn create_thumbnail(
         width: thumbnail.width(),
         height: thumbnail.height(),
     })
+}
+
+fn cached_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+    ImageReader::open(path)
+        .and_then(ImageReader::with_guessed_format)
+        .ok()?
+        .into_dimensions()
+        .ok()
 }
 
 fn decode_image(file: &File) -> BackendResult<DynamicImage> {
