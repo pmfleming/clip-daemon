@@ -12,12 +12,16 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    backend::{BackendError, BackendErrorKind, BackendMutation, ClipboardBackend},
-    model::{EntryDetails, EntryKind, FilePreview},
+    backend::{
+        BackendError, BackendErrorKind, BackendMutation, ClipboardBackend, HistoryQuery,
+        MAX_QUERY_LIMIT, ScreenshotRegion,
+    },
+    model::{EntryDetails, EntryKind, FilePreview, OperationResult},
     session::SessionManager,
 };
 
-pub(crate) const MAX_EDIT_BYTES: usize = 256 * 1024;
+const MAX_EDIT_BYTES: usize = 256 * 1024;
+pub type Backend = Arc<dyn ClipboardBackend>;
 
 #[derive(Debug)]
 pub(crate) struct ApiError {
@@ -54,14 +58,14 @@ impl From<BackendError> for ApiError {
     }
 }
 
-pub(crate) struct ActionService {
-    backend: Arc<dyn ClipboardBackend>,
+pub(crate) struct ClipboardService {
+    backend: Backend,
     edits: Mutex<HashMap<String, EditLease>>,
     sessions: SessionManager,
 }
 
-impl ActionService {
-    pub fn new(backend: Arc<dyn ClipboardBackend>) -> Self {
+impl ClipboardService {
+    pub fn new(backend: Backend) -> Self {
         Self {
             backend,
             edits: Mutex::new(HashMap::new()),
@@ -102,6 +106,85 @@ impl ActionService {
         }
     }
 
+    pub(crate) async fn query(&self, params: QueryParams) -> Result<Value, ApiError> {
+        if !(1..=MAX_QUERY_LIMIT).contains(&params.limit) {
+            return Err(ApiError::validation("limit must be between 1 and 200"));
+        }
+        let history = self
+            .backend
+            .query(HistoryQuery {
+                query: params.query,
+                generation: params.generation,
+                limit: params.limit,
+            })
+            .await?;
+        Ok(json!({ "history": history }))
+    }
+
+    pub(crate) async fn details(&self, params: EntryParams) -> Result<Value, ApiError> {
+        let entry = self.load_details(&params.entry_id, params.revision).await?;
+        Ok(json!({ "entry": entry }))
+    }
+
+    async fn load_details(
+        &self,
+        entry_id: &str,
+        revision: Option<u64>,
+    ) -> Result<EntryDetails, ApiError> {
+        validate_entry_id(entry_id)?;
+        let details = self.backend.details(entry_id, MAX_EDIT_BYTES).await?;
+        validate_revision(revision, details.entry.revision)?;
+        Ok(details)
+    }
+
+    pub(crate) async fn thumbnail(&self, params: EntryParams) -> Result<Value, ApiError> {
+        validate_entry_id(&params.entry_id)?;
+        let revision = self.backend.revision(&params.entry_id).await?;
+        validate_revision(params.revision, revision)?;
+        let thumbnail = self
+            .backend
+            .thumbnail(
+                &params.entry_id,
+                params.revision.unwrap_or(revision),
+                params.edge.unwrap_or(512),
+            )
+            .await?;
+        Ok(json!({ "thumbnail": thumbnail }))
+    }
+
+    pub(crate) async fn capture_screenshot(
+        &self,
+        params: ScreenshotParams,
+    ) -> Result<Value, ApiError> {
+        if !(1..=MAX_SCREENSHOT_EDGE).contains(&params.width)
+            || !(1..=MAX_SCREENSHOT_EDGE).contains(&params.height)
+        {
+            return Err(ApiError::validation(
+                "screenshot width and height must be between 1 and 32768",
+            ));
+        }
+        let operation = self
+            .backend
+            .capture_screenshot(ScreenshotRegion {
+                x: params.x,
+                y: params.y,
+                width: params.width,
+                height: params.height,
+            })
+            .await?;
+        Ok(json!({ "operation": operation }))
+    }
+
+    pub(crate) async fn change_token(&self) -> Result<u64, ApiError> {
+        Ok(self.backend.change_token().await?)
+    }
+
+    pub(crate) async fn wipe(&self) -> Result<Value, ApiError> {
+        Ok(json!({
+            "operation": self.backend.mutate("", None, BackendMutation::Wipe).await?
+        }))
+    }
+
     pub async fn cancel(&self, operation_id: &str) -> bool {
         self.backend
             .cancel_operation(operation_id)
@@ -114,13 +197,9 @@ impl ActionService {
     }
 
     async fn action(&self, params: ActionParams) -> Result<Value, ApiError> {
-        let details = load_details(
-            &self.backend,
-            &params.entry_id,
-            Some(params.revision),
-            MAX_EDIT_BYTES,
-        )
-        .await?;
+        let details = self
+            .load_details(&params.entry_id, Some(params.revision))
+            .await?;
         validate_action_kind(details.entry.kind, &params.action)?;
         self.execute_action(params, details).await
     }
@@ -179,13 +258,7 @@ impl ActionService {
     }
 
     async fn begin_edit(&self, params: EntryParams) -> Result<Value, ApiError> {
-        let details = load_details(
-            &self.backend,
-            &params.entry_id,
-            params.revision,
-            MAX_EDIT_BYTES,
-        )
-        .await?;
+        let details = self.load_details(&params.entry_id, params.revision).await?;
         let value = editable_value(&details)?;
         let id = format!("edit-{}", Uuid::new_v4());
         let view = json!({
@@ -260,9 +333,28 @@ struct SessionParams {
 }
 
 #[derive(Deserialize)]
-struct EntryParams {
+pub(crate) struct EntryParams {
     entry_id: String,
     revision: Option<u64>,
+    edge: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct QueryParams {
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    generation: u64,
+    #[serde(default = "default_query_limit")]
+    limit: usize,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ScreenshotParams {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Deserialize)]
@@ -274,18 +366,6 @@ struct EditCommitParams {
 #[derive(Deserialize)]
 struct EditCancelParams {
     edit_id: String,
-}
-
-pub(crate) async fn load_details(
-    backend: &Arc<dyn ClipboardBackend>,
-    entry_id: &str,
-    revision: Option<u64>,
-    max_bytes: usize,
-) -> Result<EntryDetails, ApiError> {
-    validate_entry_id(entry_id)?;
-    let details = backend.details(entry_id, max_bytes).await?;
-    validate_revision(revision, details.entry.revision)?;
-    Ok(details)
 }
 
 pub(crate) fn decode<T: DeserializeOwned>(params: Value) -> Result<T, ApiError> {
@@ -319,32 +399,26 @@ async fn launch_action(params: &ActionParams, details: &EntryDetails) -> Result<
     Ok(json!({ "operation": operation }))
 }
 
-fn open_url(value: &str) -> Result<crate::model::OperationResult, ApiError> {
+fn open_url(value: &str) -> Result<OperationResult, ApiError> {
     let url = Url::parse(value.trim()).map_err(|_| invalid("URL is malformed"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(invalid("Only HTTP and HTTPS URLs can be opened directly").into());
     }
     spawn("xdg-open", &[url.as_str()])?;
-    Ok(crate::model::OperationResult::completed(
-        "open-url",
-        "URL opened",
-    ))
+    Ok(OperationResult::completed("open-url", "URL opened"))
 }
 
-fn open_file(file: &FilePreview) -> Result<crate::model::OperationResult, ApiError> {
+fn open_file(file: &FilePreview) -> Result<OperationResult, ApiError> {
     let path = local_path(file)?;
     if !path.exists() {
         return Err(BackendError::not_found("Clipboard file no longer exists").into());
     }
     let path = path.to_string_lossy();
     spawn("xdg-open", &[path.as_ref()])?;
-    Ok(crate::model::OperationResult::completed(
-        "open-file",
-        "File opened",
-    ))
+    Ok(OperationResult::completed("open-file", "File opened"))
 }
 
-async fn reveal_file(file: &FilePreview) -> Result<crate::model::OperationResult, ApiError> {
+async fn reveal_file(file: &FilePreview) -> Result<OperationResult, ApiError> {
     let path = local_path(file)?;
     if !path.exists() {
         return Err(BackendError::not_found("Clipboard file no longer exists").into());
@@ -367,10 +441,7 @@ async fn reveal_file(file: &FilePreview) -> Result<crate::model::OperationResult
         .call_method("ShowItems", &(vec![uri], ""))
         .await
         .map_err(|_| launch_error("Desktop file manager could not reveal the file"))?;
-    Ok(crate::model::OperationResult::completed(
-        "reveal-file",
-        "File revealed",
-    ))
+    Ok(OperationResult::completed("reveal-file", "File revealed"))
 }
 
 fn local_path(file: &FilePreview) -> Result<PathBuf, ApiError> {
@@ -440,4 +511,10 @@ fn stale_target(message: &'static str) -> ApiError {
 
 fn invalid(message: &'static str) -> BackendError {
     BackendError::new(BackendErrorKind::InvalidData, message)
+}
+
+const MAX_SCREENSHOT_EDGE: u32 = 32_768;
+
+const fn default_query_limit() -> usize {
+    100
 }

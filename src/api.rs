@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -10,11 +9,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    actions::{
-        ActionService, ApiError, MAX_EDIT_BYTES, decode, load_details, validate_entry_id,
-        validate_revision,
-    },
-    backend::{BackendMutation, ClipboardBackend, HistoryQuery, MAX_QUERY_LIMIT, ScreenshotRegion},
+    actions::{self, ApiError, ClipboardService, decode},
     protocol,
     settings::{SettingsManager, SettingsUpdate},
 };
@@ -22,25 +17,25 @@ use crate::{
 pub const PROTOCOL: &str = protocol::NAME;
 pub const VERSION: u8 = protocol::VERSION;
 pub struct ApiService {
-    backend: Arc<dyn ClipboardBackend>,
     wipe_challenges: Mutex<HashMap<String, Instant>>,
     settings: SettingsManager,
-    actions: ActionService,
+    actions: ClipboardService,
 }
 
 impl ApiService {
-    pub fn new(backend: Arc<dyn ClipboardBackend>) -> Self {
-        let actions = ActionService::new(Arc::clone(&backend));
+    pub fn new(backend: actions::Backend) -> Self {
         Self {
-            backend,
             wipe_challenges: Mutex::new(HashMap::new()),
             settings: SettingsManager::default(),
-            actions,
+            actions: ClipboardService::new(backend),
         }
     }
 
-    pub(crate) fn backend(&self) -> Arc<dyn ClipboardBackend> {
-        Arc::clone(&self.backend)
+    pub(crate) async fn change_token(&self) -> Result<u64, Value> {
+        self.actions
+            .change_token()
+            .await
+            .map_err(|error| json!({ "error": { "code": error.code, "message": error.message } }))
     }
 
     pub async fn cancel_operation(&self, operation_id: &str) -> bool {
@@ -60,9 +55,9 @@ impl ApiService {
 
     async fn dispatch_method(&self, method: &str, params: Value) -> Result<Value, ApiError> {
         match method {
-            "clipboard.history.query" => self.query(decode(params)?).await,
-            "clipboard.entry.details" => self.details(decode(params)?).await,
-            "clipboard.entry.thumbnail" => self.thumbnail(decode(params)?).await,
+            "clipboard.history.query" => self.actions.query(decode(params)?).await,
+            "clipboard.entry.details" => self.actions.details(decode(params)?).await,
+            "clipboard.entry.thumbnail" => self.actions.thumbnail(decode(params)?).await,
             value if value.starts_with("clipboard.entry.") => {
                 self.actions.dispatch_entry(value, params).await
             }
@@ -87,7 +82,9 @@ impl ApiService {
     async fn dispatch_policy(&self, method: &str, params: Value) -> Result<Value, ApiError> {
         match method {
             "clipboard.capture.setPaused" => self.set_paused(decode(params)?).await,
-            "clipboard.capture.screenshot" => self.capture_screenshot(decode(params)?).await,
+            "clipboard.capture.screenshot" => {
+                self.actions.capture_screenshot(decode(params)?).await
+            }
             "clipboard.settings.get" => self.get_settings(),
             "clipboard.settings.update" => self.update_settings(decode(params)?).await,
             _ if protocol::METHODS.contains(&method) => Err(ApiError::new(
@@ -99,47 +96,6 @@ impl ApiService {
                 format!("Unsupported clip-api method: {method}"),
             )),
         }
-    }
-
-    async fn query(&self, params: QueryParams) -> Result<Value, ApiError> {
-        if !(1..=MAX_QUERY_LIMIT).contains(&params.limit) {
-            return Err(ApiError::validation("limit must be between 1 and 200"));
-        }
-        let history = self
-            .backend
-            .query(HistoryQuery {
-                query: params.query,
-                generation: params.generation,
-                limit: params.limit,
-            })
-            .await?;
-        Ok(json!({ "history": history }))
-    }
-
-    async fn details(&self, params: EntryParams) -> Result<Value, ApiError> {
-        let entry = load_details(
-            &self.backend,
-            &params.entry_id,
-            params.revision,
-            MAX_EDIT_BYTES,
-        )
-        .await?;
-        Ok(json!({ "entry": entry }))
-    }
-
-    async fn thumbnail(&self, params: EntryParams) -> Result<Value, ApiError> {
-        validate_entry_id(&params.entry_id)?;
-        let current_revision = self.backend.revision(&params.entry_id).await?;
-        validate_revision(params.revision, current_revision)?;
-        let thumbnail = self
-            .backend
-            .thumbnail(
-                &params.entry_id,
-                params.revision.unwrap_or(current_revision),
-                params.edge.unwrap_or(512),
-            )
-            .await?;
-        Ok(json!({ "thumbnail": thumbnail }))
     }
 
     async fn prepare_wipe(&self) -> Result<Value, ApiError> {
@@ -173,26 +129,6 @@ impl ApiService {
         }, "settings": settings }))
     }
 
-    async fn capture_screenshot(&self, params: ScreenshotParams) -> Result<Value, ApiError> {
-        if !(1..=MAX_SCREENSHOT_EDGE).contains(&params.width)
-            || !(1..=MAX_SCREENSHOT_EDGE).contains(&params.height)
-        {
-            return Err(ApiError::validation(
-                "screenshot width and height must be between 1 and 32768",
-            ));
-        }
-        let operation = self
-            .backend
-            .capture_screenshot(ScreenshotRegion {
-                x: params.x,
-                y: params.y,
-                width: params.width,
-                height: params.height,
-            })
-            .await?;
-        Ok(json!({ "operation": operation }))
-    }
-
     async fn commit_wipe(&self, params: WipeParams) -> Result<Value, ApiError> {
         if params.response != "WIPE" {
             return Err(ApiError::validation("wipe confirmation must be WIPE"));
@@ -209,30 +145,8 @@ impl ApiService {
             return Err(ApiError::new("stale-action", "wipe challenge expired"));
         }
         self.actions.clear().await;
-        Ok(json!({
-            "operation": self
-                .backend
-                .mutate("", None, BackendMutation::Wipe)
-                .await?
-        }))
+        self.actions.wipe().await
     }
-}
-
-#[derive(Deserialize)]
-struct QueryParams {
-    #[serde(default)]
-    query: String,
-    #[serde(default)]
-    generation: u64,
-    #[serde(default = "default_query_limit")]
-    limit: usize,
-}
-
-#[derive(Deserialize)]
-struct EntryParams {
-    entry_id: String,
-    revision: Option<u64>,
-    edge: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -248,22 +162,8 @@ struct PauseParams {
     private_mode: bool,
 }
 
-#[derive(Deserialize)]
-struct ScreenshotParams {
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-}
-
 fn settings_error(message: String) -> ApiError {
     ApiError::new("settings-error", message)
-}
-
-const MAX_SCREENSHOT_EDGE: u32 = 32_768;
-
-const fn default_query_limit() -> usize {
-    100
 }
 
 pub fn success(data: Value) -> Value {

@@ -39,7 +39,7 @@ pub const STREAMS: &[&str] = &[
 ];
 
 pub fn registry() -> Value {
-    contract_fixture()["registry"].clone()
+    contract_fixture()["registry"].take()
 }
 
 pub fn contract_fixture() -> Value {

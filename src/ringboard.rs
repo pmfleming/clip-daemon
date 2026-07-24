@@ -35,6 +35,13 @@ const MAX_DETAILS_BYTES: usize = 256 * 1024;
 const MAX_THUMBNAIL_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_FILES: usize = 100;
 
+macro_rules! run_backend {
+    ($source:expr, $method:ident($($argument:expr),* $(,)?)) => {{
+        let backend = $source.clone();
+        run_blocking(move || backend.$method($($argument),*)).await
+    }};
+}
+
 #[derive(Default)]
 struct RevisionState {
     token: Option<u64>,
@@ -155,21 +162,31 @@ impl RingboardBackend {
             .get_raw(binding.raw_id)
             .map_err(|_| BackendError::stale("Clipboard entry is stale or missing"))?;
         let summary = self.summarize(entry, &mut reader, false)?;
-        if summary.id != opaque_id {
-            self.ids.lock().map_err(|_| lock_error())?.remove(opaque_id);
-            return Err(BackendError::stale(
-                "Clipboard entry ID is stale or has been reused",
-            ));
-        }
-        if summary.revision != binding.revision
+        self.verify_selection(opaque_id, expected_revision, binding, &summary)?;
+        Ok((entry, reader, summary))
+    }
+
+    fn verify_selection(
+        &self,
+        opaque_id: &str,
+        expected_revision: Option<u64>,
+        binding: IdentityBinding,
+        summary: &EntrySummary,
+    ) -> BackendResult<()> {
+        let error = if summary.id != opaque_id {
+            Some("Clipboard entry ID is stale or has been reused")
+        } else if summary.revision != binding.revision
             || expected_revision.is_some_and(|revision| revision != summary.revision)
         {
-            self.ids.lock().map_err(|_| lock_error())?.remove(opaque_id);
-            return Err(BackendError::stale(
-                "Clipboard entry revision changed before the operation",
-            ));
-        }
-        Ok((entry, reader, summary))
+            Some("Clipboard entry revision changed before the operation")
+        } else {
+            None
+        };
+        let Some(message) = error else {
+            return Ok(());
+        };
+        self.ids.lock().map_err(|_| lock_error())?.remove(opaque_id);
+        Err(BackendError::stale(message))
     }
 
     fn summarize(
@@ -339,13 +356,7 @@ impl RingboardBackend {
         expected_revision: Option<u64>,
         mutation: BackendMutation,
     ) -> BackendResult<OperationResult> {
-        if !matches!(mutation, BackendMutation::Wipe | BackendMutation::Cleanup)
-            && expected_revision.is_none()
-        {
-            return Err(BackendError::stale(
-                "An expected clipboard entry revision is required",
-            ));
-        }
+        mutation.require_revision(expected_revision)?;
         match mutation {
             BackendMutation::Restore => self.restore_entry(opaque_id, expected_revision),
             BackendMutation::ImageAsFile => self.save_image_file(opaque_id, expected_revision),
@@ -416,25 +427,21 @@ impl ClipboardBackend for RingboardBackend {
     }
 
     async fn change_token(&self) -> BackendResult<u64> {
-        let backend = self.clone();
-        run_blocking(move || backend.change_token_sync()).await
+        run_backend!(self, change_token_sync())
     }
 
     async fn query(&self, query: HistoryQuery) -> BackendResult<HistoryPage> {
-        let backend = self.clone();
-        run_blocking(move || backend.query_sync(query)).await
+        run_backend!(self, query_sync(query))
     }
 
     async fn details(&self, opaque_id: &str, max_text_bytes: usize) -> BackendResult<EntryDetails> {
-        let backend = self.clone();
         let opaque_id = opaque_id.to_owned();
-        run_blocking(move || backend.details_sync(&opaque_id, max_text_bytes)).await
+        run_backend!(self, details_sync(&opaque_id, max_text_bytes))
     }
 
     async fn revision(&self, opaque_id: &str) -> BackendResult<u64> {
-        let backend = self.clone();
         let opaque_id = opaque_id.to_owned();
-        run_blocking(move || backend.revision_sync(&opaque_id)).await
+        run_backend!(self, revision_sync(&opaque_id))
     }
 
     async fn thumbnail(
@@ -443,14 +450,12 @@ impl ClipboardBackend for RingboardBackend {
         expected_revision: u64,
         edge: u32,
     ) -> BackendResult<EntryThumbnail> {
-        let backend = self.clone();
         let opaque_id = opaque_id.to_owned();
-        run_blocking(move || backend.thumbnail_sync(&opaque_id, expected_revision, edge)).await
+        run_backend!(self, thumbnail_sync(&opaque_id, expected_revision, edge))
     }
 
     async fn capture_screenshot(&self, region: ScreenshotRegion) -> BackendResult<OperationResult> {
-        let backend = self.clone();
-        run_blocking(move || backend.capture_region(region)).await
+        run_backend!(self, capture_region(region))
     }
 
     async fn mutate(
@@ -459,24 +464,14 @@ impl ClipboardBackend for RingboardBackend {
         expected_revision: Option<u64>,
         mutation: BackendMutation,
     ) -> BackendResult<OperationResult> {
-        if !matches!(mutation, BackendMutation::Wipe | BackendMutation::Cleanup)
-            && expected_revision.is_none()
-        {
-            return Err(BackendError::stale(
-                "An expected clipboard entry revision is required",
-            ));
-        }
+        mutation.require_revision(expected_revision)?;
         if mutation == BackendMutation::Annotate {
-            let backend = self.clone();
             let opaque_id = opaque_id.to_owned();
-            let staged =
-                run_blocking(move || backend.stage_annotation(&opaque_id, expected_revision))
-                    .await?;
+            let staged = run_backend!(self, stage_annotation(&opaque_id, expected_revision))?;
             return self.launch_annotation(staged);
         }
-        let backend = self.clone();
         let opaque_id = opaque_id.to_owned();
-        run_blocking(move || backend.mutate_sync(&opaque_id, expected_revision, mutation)).await
+        run_backend!(self, mutate_sync(&opaque_id, expected_revision, mutation))
     }
 
     async fn replace(
@@ -486,12 +481,13 @@ impl ClipboardBackend for RingboardBackend {
         mime: &str,
         bytes: &[u8],
     ) -> BackendResult<EntryDetails> {
-        let backend = self.clone();
         let opaque_id = opaque_id.to_owned();
         let mime = mime.to_owned();
         let bytes = bytes.to_vec();
-        run_blocking(move || backend.replace_sync(&opaque_id, expected_revision, &mime, &bytes))
-            .await
+        run_backend!(
+            self,
+            replace_sync(&opaque_id, expected_revision, &mime, &bytes)
+        )
     }
 
     async fn cancel_operation(&self, operation_id: &str) -> BackendResult<bool> {

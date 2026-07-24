@@ -107,6 +107,16 @@ impl BackendMutation {
             _ => None,
         }
     }
+
+    pub fn require_revision(self, revision: Option<u64>) -> BackendResult<bool> {
+        let targets_entry = !matches!(self, Self::Wipe | Self::Cleanup);
+        if targets_entry && revision.is_none() {
+            return Err(BackendError::stale(
+                "An expected clipboard entry revision is required",
+            ));
+        }
+        Ok(targets_entry)
+    }
 }
 
 #[async_trait]

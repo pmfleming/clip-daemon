@@ -51,7 +51,7 @@ pub(super) async fn start(
     };
     let id = daemon.next_id("subscription");
     let destination = emitter.set_destination(owner.clone().into()).to_owned();
-    let backend = daemon.api.backend();
+    let api_service = Arc::clone(&daemon.api);
     let subscriptions = Arc::clone(&daemon.subscriptions);
     let event_revision = Arc::clone(&daemon.event_revision);
     let task_id = id.clone();
@@ -68,7 +68,7 @@ pub(super) async fn start(
         }
         if requested.watches_clipboard() {
             tokio::select! {
-                () = poll_history(destination.clone(), backend, event_revision, task_id.clone(), requested) => {}
+                () = poll_history(destination, api_service, event_revision, task_id.clone(), requested) => {}
                 () = wait_for_owner_loss(connection, owner) => {}
             }
         } else {
@@ -94,7 +94,7 @@ pub(super) async fn start(
 
 async fn poll_history(
     emitter: SignalEmitter<'static>,
-    backend: Arc<dyn crate::backend::ClipboardBackend>,
+    api_service: Arc<crate::api::ApiService>,
     event_revision: Arc<std::sync::atomic::AtomicU64>,
     subscription_id: String,
     requested: RequestedStreams,
@@ -105,7 +105,7 @@ async fn poll_history(
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         timer.tick().await;
-        match backend.change_token().await {
+        match api_service.change_token().await {
             Ok(token) => {
                 let recovered = std::mem::replace(&mut unavailable, false);
                 let changed = previous.replace(token).is_some_and(|value| value != token);
@@ -156,11 +156,9 @@ async fn emit_unavailable(
     emitter: &SignalEmitter<'_>,
     subscription_id: &str,
     requested: RequestedStreams,
-    error: crate::backend::BackendError,
+    error: serde_json::Value,
 ) {
-    let data = Some(json!({
-        "error": { "code": error.kind.code(), "message": error.to_string() }
-    }));
+    let data = Some(error);
     if requested.history {
         emit_event(
             emitter,

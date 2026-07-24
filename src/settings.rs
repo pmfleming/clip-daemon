@@ -90,6 +90,10 @@ impl Default for SettingsManager {
     }
 }
 
+type SettingsWriter = fn(Option<&Path>, &ClipboardSettings) -> Result<(), String>;
+const SETTINGS_SAVED: &str = "Clipboard settings were saved";
+const CAPTURE_SAVED: &str = "Capture preference was saved";
+
 impl SettingsManager {
     pub fn get(&self) -> Result<ClipboardSettings, String> {
         let state = self
@@ -109,27 +113,38 @@ impl SettingsManager {
         if updated == current {
             return Ok(current);
         }
-        let path = self.path.clone();
-        let persisted = updated.clone();
-        spawn_blocking(move || persist_config_pair(path.as_deref(), &persisted))
-            .await
-            .map_err(|_| "Clipboard settings transaction failed")??;
-        self.commit(updated.clone())
-            .map_err(|error| format!("Clipboard settings were saved, but {error}"))?;
+        let updated = self
+            .save(updated, persist_config_pair, SETTINGS_SAVED)
+            .await?;
         if let Err(error) = restart_capture(&updated).await {
-            return Err(format!("Clipboard settings were saved, but {error}"));
+            return Err(format!("{SETTINGS_SAVED}, but {error}"));
         }
         Ok(updated)
     }
 
-    fn commit(&self, value: ClipboardSettings) -> Result<(), String> {
+    async fn save(
+        &self,
+        updated: ClipboardSettings,
+        write: SettingsWriter,
+        saved: &str,
+    ) -> Result<ClipboardSettings, String> {
+        let path = self.path.clone();
+        let persisted = updated.clone();
+        spawn_blocking(move || write(path.as_deref(), &persisted))
+            .await
+            .map_err(|_| "Clipboard settings transaction failed")??;
+        self.commit(updated)
+            .map_err(|error| format!("{saved}, but {error}"))
+    }
+
+    fn commit(&self, value: ClipboardSettings) -> Result<ClipboardSettings, String> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| "Clipboard settings are unavailable")?;
         state.value = value;
         state.load_error = None;
-        Ok(())
+        Ok(state.value.clone())
     }
 
     pub async fn set_paused(
@@ -138,23 +153,17 @@ impl SettingsManager {
         private: bool,
     ) -> Result<ClipboardSettings, String> {
         let _transaction = self.transaction.lock().await;
-        let current = self.get()?;
-        let mut updated = current.clone();
-        updated.capture_paused = paused;
-        updated.private_mode = paused && private;
-        if updated == current {
-            return Ok(current);
+        let mut updated = self.get()?;
+        let private_mode = paused && private;
+        if (updated.capture_paused, updated.private_mode) == (paused, private_mode) {
+            return Ok(updated);
         }
-        let path = self.path.clone();
-        let persisted = updated.clone();
-        spawn_blocking(move || persist(path.as_deref(), &persisted))
-            .await
-            .map_err(|_| "Clipboard settings transaction failed")??;
-        self.commit(updated.clone())
-            .map_err(|error| format!("Capture preference was saved, but {error}"))?;
+        updated.capture_paused = paused;
+        updated.private_mode = private_mode;
+        let updated = self.save(updated, persist, CAPTURE_SAVED).await?;
         let action = if paused { "stop" } else { "start" };
         if let Err(error) = control_units(action, &["ringboard-wayland.service"]).await {
-            return Err(format!("Capture preference was saved, but {error}"));
+            return Err(format!("{CAPTURE_SAVED}, but {error}"));
         }
         Ok(updated)
     }
@@ -232,56 +241,23 @@ fn load_settings(path: Option<&Path>) -> Result<ClipboardSettings, String> {
         .map_err(|_| "Clipboard settings file is invalid; refusing to use defaults".into())
 }
 
+const CLIPBOARD: &str = "Clipboard settings";
+const RINGBOARD: &str = "Ringboard settings";
+
 fn persist_config_pair(path: Option<&Path>, value: &ClipboardSettings) -> Result<(), String> {
-    let state_bytes = path
-        .map(|_| {
-            serde_json::to_vec_pretty(value)
-                .map_err(|_| "Clipboard settings could not be encoded".to_owned())
-        })
-        .transpose()?;
     let (ringboard_path, ringboard_bytes) = encoded_ringboard_config(value)?;
-    let previous_ringboard = read_existing(&ringboard_path)?;
-    let previous_state = path.map(read_existing).transpose()?.flatten();
-    let ringboard_temp = stage_write(
+    let mut writes = vec![stage_config(
         &ringboard_path,
         &ringboard_bytes,
         false,
-        "Ringboard settings",
-    )?;
-    let state_temp = match path.zip(state_bytes.as_deref()) {
-        Some((path, bytes)) => match stage_write(path, bytes, true, "Clipboard settings") {
-            Ok(temp) => Some((path, temp)),
-            Err(error) => {
-                let _ = fs::remove_file(ringboard_temp);
-                return Err(error);
-            }
-        },
-        None => None,
-    };
-    if let Err(error) = commit_staged(&ringboard_path, &ringboard_temp, "Ringboard settings") {
-        if let Some((_, temp)) = state_temp {
-            let _ = fs::remove_file(temp);
-        }
-        return rollback_error(
-            error,
-            [restore_previous(
-                &ringboard_path,
-                previous_ringboard.as_deref(),
-            )],
-        );
+        RINGBOARD,
+    )?];
+    if let Some(path) = path {
+        let bytes = serde_json::to_vec_pretty(value)
+            .map_err(|_| "Clipboard settings could not be encoded")?;
+        writes.push(stage_config(path, &bytes, true, CLIPBOARD)?);
     }
-    if let Some((state_path, temp)) = state_temp
-        && let Err(error) = commit_staged(state_path, &temp, "Clipboard settings")
-    {
-        return rollback_error(
-            error,
-            [
-                restore_previous(state_path, previous_state.as_deref()),
-                restore_previous(&ringboard_path, previous_ringboard.as_deref()),
-            ],
-        );
-    }
-    Ok(())
+    commit_all(writes)
 }
 
 fn persist(path: Option<&Path>, value: &ClipboardSettings) -> Result<(), String> {
@@ -290,11 +266,51 @@ fn persist(path: Option<&Path>, value: &ClipboardSettings) -> Result<(), String>
     };
     let bytes =
         serde_json::to_vec_pretty(value).map_err(|_| "Clipboard settings could not be encoded")?;
-    let previous = read_existing(path)?;
-    let temp = stage_write(path, &bytes, true, "Clipboard settings")?;
-    match commit_staged(path, &temp, "Clipboard settings") {
-        Ok(()) => Ok(()),
-        Err(error) => rollback_error(error, [restore_previous(path, previous.as_deref())]),
+    commit_all(vec![stage_config(path, &bytes, true, CLIPBOARD)?])
+}
+
+struct StagedWrite {
+    path: PathBuf,
+    temp: PathBuf,
+    previous: Option<Vec<u8>>,
+    label: &'static str,
+}
+
+fn stage_config(
+    path: &Path,
+    bytes: &[u8],
+    private_parent: bool,
+    label: &'static str,
+) -> Result<StagedWrite, String> {
+    Ok(StagedWrite {
+        path: path.to_owned(),
+        previous: read_existing(path)?,
+        temp: stage_write(path, bytes, private_parent, label)?,
+        label,
+    })
+}
+
+fn commit_all(writes: Vec<StagedWrite>) -> Result<(), String> {
+    for write in &writes {
+        if let Err(error) = commit_staged(&write.path, &write.temp, write.label) {
+            let failures: Vec<_> = writes
+                .iter()
+                .rev()
+                .filter_map(|write| restore_previous(&write.path, write.previous.as_deref()).err())
+                .collect();
+            return if failures.is_empty() {
+                Err(error)
+            } else {
+                Err(format!("{error}; rollback failed: {}", failures.join("; ")))
+            };
+        }
+    }
+    Ok(())
+}
+
+impl Drop for StagedWrite {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temp);
     }
 }
 
@@ -374,18 +390,6 @@ fn restore_previous(path: &Path, bytes: Option<&[u8]>) -> Result<(), String> {
     }
 }
 
-fn rollback_error<const N: usize>(
-    error: String,
-    rollbacks: [Result<(), String>; N],
-) -> Result<(), String> {
-    let failures: Vec<_> = rollbacks.into_iter().filter_map(Result::err).collect();
-    if failures.is_empty() {
-        Err(error)
-    } else {
-        Err(format!("{error}; rollback failed: {}", failures.join("; ")))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -410,16 +414,11 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_limits_are_rejected() {
-        let manager = manager(None);
-        assert!(
-            manager
-                .update(SettingsUpdate {
-                    max_entries: Some(0),
-                    ..Default::default()
-                })
-                .await
-                .is_err()
-        );
+        let update = SettingsUpdate {
+            max_entries: Some(0),
+            ..Default::default()
+        };
+        assert!(manager(None).update(update).await.is_err());
     }
 
     #[tokio::test]

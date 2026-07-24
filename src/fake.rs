@@ -49,10 +49,7 @@ impl FakeBackend {
             .iter()
             .find(|item| item.entry.id == opaque_id)
             .ok_or_else(unknown_entry)?;
-        Ok(OperationResult::completed(
-            action,
-            "Fake operation completed",
-        ))
+        completed(action, "Fake operation completed")
     }
 
     fn validate_revision(&self, opaque_id: &str, expected: Option<u64>) -> BackendResult<()> {
@@ -75,13 +72,13 @@ impl FakeBackend {
             .position(|item| item.entry.id == opaque_id)
             .ok_or_else(unknown_entry)?;
         entries.remove(position);
-        Ok(OperationResult::completed("delete", "Fake entry deleted"))
+        completed("delete", "Fake entry deleted")
     }
 
     fn favorite(&self, opaque_id: &str, favorite: bool) -> BackendResult<OperationResult> {
         self.mutate_entry(opaque_id, |entry| entry.entry.favorite = favorite)?;
         let action = if favorite { "favorite" } else { "unfavorite" };
-        Ok(OperationResult::completed(action, "Fake favorite updated"))
+        completed(action, "Fake favorite updated")
     }
 }
 
@@ -158,10 +155,7 @@ impl ClipboardBackend for FakeBackend {
         &self,
         _region: ScreenshotRegion,
     ) -> BackendResult<OperationResult> {
-        Ok(OperationResult::completed(
-            "screenshot",
-            "Fake screenshot copied",
-        ))
+        completed("screenshot", "Fake screenshot copied")
     }
 
     async fn mutate(
@@ -170,12 +164,7 @@ impl ClipboardBackend for FakeBackend {
         expected_revision: Option<u64>,
         mutation: BackendMutation,
     ) -> BackendResult<OperationResult> {
-        if !matches!(mutation, BackendMutation::Wipe | BackendMutation::Cleanup) {
-            if expected_revision.is_none() {
-                return Err(BackendError::stale(
-                    "An expected clipboard entry revision is required",
-                ));
-            }
+        if mutation.require_revision(expected_revision)? {
             self.validate_revision(opaque_id, expected_revision)?;
         }
         match mutation {
@@ -186,11 +175,9 @@ impl ClipboardBackend for FakeBackend {
             BackendMutation::SetFavorite(value) => self.favorite(opaque_id, value),
             BackendMutation::Wipe => {
                 self.entries.write().map_err(fake_unavailable)?.clear();
-                Ok(OperationResult::completed("wipe", "Fake history cleared"))
+                completed("wipe", "Fake history cleared")
             }
-            BackendMutation::Cleanup => {
-                Ok(OperationResult::completed("cleanup", "Fake caches cleared"))
-            }
+            BackendMutation::Cleanup => completed("cleanup", "Fake caches cleared"),
         }
     }
 
@@ -216,6 +203,10 @@ impl ClipboardBackend for FakeBackend {
     async fn cancel_operation(&self, _operation_id: &str) -> BackendResult<bool> {
         Ok(false)
     }
+}
+
+fn completed(action: &str, message: &str) -> BackendResult<OperationResult> {
+    Ok(OperationResult::completed(action, message))
 }
 
 fn fake_unavailable<T>(_: std::sync::PoisonError<T>) -> BackendError {

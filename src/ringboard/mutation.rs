@@ -65,10 +65,7 @@ impl RingboardBackend {
         let paste_server = paste_server()?;
         let (entry, mut reader, _) = self.selected(opaque_id, expected_revision)?;
         send_paste_buffer(paste_server, entry, &mut reader, false).map_err(operation_error)?;
-        Ok(OperationResult::completed(
-            "copy",
-            "Entry restored to the clipboard",
-        ))
+        Ok(completed("copy", "Entry restored to the clipboard"))
     }
 
     pub(super) fn save_image_file(
@@ -107,7 +104,7 @@ impl RingboardBackend {
         let (start, ready) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             if ready.await.is_ok() {
-                run_annotation(backend, staged, task_id.clone()).await;
+                run_annotation(backend, staged, &task_id).await;
             }
             if let Ok(mut active) = operations.lock() {
                 active.remove(&task_id);
@@ -184,10 +181,7 @@ impl RingboardBackend {
         let (entry, _, _) = self.selected(opaque_id, expected_revision)?;
         remove_raw(server, entry.id())?;
         self.clear_identity_state()?;
-        Ok(OperationResult::completed(
-            "delete",
-            "Clipboard entry deleted",
-        ))
+        Ok(completed("delete", "Clipboard entry deleted"))
     }
 
     pub(super) fn move_entry(
@@ -221,10 +215,7 @@ impl RingboardBackend {
         super::content::clear_cache()?;
         let runtime = runtime_directory("clip-daemon")?;
         fs::remove_dir_all(&runtime).map_err(operation_error)?;
-        Ok(OperationResult::completed(
-            "cleanup",
-            "Clipboard caches cleared",
-        ))
+        Ok(completed("cleanup", "Clipboard caches cleared"))
     }
 
     pub(super) fn wipe_entries(&self) -> BackendResult<OperationResult> {
@@ -240,10 +231,7 @@ impl RingboardBackend {
         }
         self.cleanup_artifacts()?;
         self.clear_identity_state()?;
-        Ok(OperationResult::completed(
-            "wipe",
-            "Clipboard history cleared",
-        ))
+        Ok(completed("wipe", "Clipboard history cleared"))
     }
 }
 
@@ -266,22 +254,39 @@ fn capture_and_restore(region: ScreenshotRegion, path: &Path) -> BackendResult<O
         ));
     }
     add_file_and_restore(path, "image/png")?;
-    Ok(OperationResult::completed(
-        "screenshot",
-        "Clipboard screenshot copied",
-    ))
+    Ok(completed("screenshot", "Clipboard screenshot copied"))
 }
 
-async fn run_annotation(backend: RingboardBackend, staged: AnnotationStage, operation_id: String) {
+async fn run_annotation(backend: RingboardBackend, staged: AnnotationStage, operation_id: &str) {
+    let AnnotationStage {
+        input,
+        output,
+        opaque_id,
+        revision,
+    } = staged;
+    if run_satty(&input, &output).await {
+        let edited = output.clone();
+        let result =
+            run_blocking(move || apply_annotation(&backend, &opaque_id, revision, &edited)).await;
+        if let Err(error) = result {
+            tracing::warn!(%operation_id, code = %error.kind.code(), "annotation result could not be restored");
+        }
+    }
+    let _ = run_blocking(move || {
+        remove_files(&[input, output]);
+        Ok(())
+    })
+    .await;
+}
+
+async fn run_satty(input: &Path, output: &Path) -> bool {
     let mut command = Command::new("satty");
     command.kill_on_drop(true);
-    let status = command
-        .args(["--filename", staged.input.to_string_lossy().as_ref()])
+    command
+        .args(["--filename", input.to_string_lossy().as_ref()])
         .args([
             "--output-filename",
-            staged.output.to_string_lossy().as_ref(),
-        ])
-        .args([
+            output.to_string_lossy().as_ref(),
             "--resize",
             "smart",
             "--early-exit",
@@ -289,36 +294,28 @@ async fn run_annotation(backend: RingboardBackend, staged: AnnotationStage, oper
             "save-to-file",
         ])
         .status()
-        .await;
-    if status.is_ok_and(|value| value.success()) {
-        let output = staged.output.clone();
-        let opaque_id = staged.opaque_id.clone();
-        let revision = staged.revision;
-        if let Err(error) = run_blocking(move || {
-            if !valid_edited_image(&output) {
-                return Err(operation_error("Annotation returned an invalid image"));
-            }
-            let (entry, _, summary) = backend.selected(&opaque_id, Some(revision))?;
-            replace_from_file(
-                entry.id(),
-                target_ring(summary.favorite),
-                &output,
-                "image/png",
-            )?;
-            backend.clear_identity_state()?;
-            restore_raw(entry.id())
-        })
         .await
-        {
-            tracing::warn!(%operation_id, code = %error.kind.code(), "annotation result could not be restored");
-        }
+        .is_ok_and(|status| status.success())
+}
+
+fn apply_annotation(
+    backend: &RingboardBackend,
+    opaque_id: &str,
+    revision: u64,
+    output: &Path,
+) -> BackendResult<()> {
+    if !valid_edited_image(output) {
+        return Err(operation_error("Annotation returned an invalid image"));
     }
-    let files = [staged.input, staged.output];
-    let _ = run_blocking(move || {
-        remove_files(&files);
-        Ok(())
-    })
-    .await;
+    let (entry, _, summary) = backend.selected(opaque_id, Some(revision))?;
+    replace_from_file(
+        entry.id(),
+        target_ring(summary.favorite),
+        output,
+        "image/png",
+    )?;
+    backend.clear_identity_state()?;
+    restore_raw(entry.id())
 }
 
 fn replace_from_file(raw_id: u64, ring: RingKind, path: &Path, mime: &str) -> BackendResult<()> {
@@ -419,9 +416,9 @@ fn valid_edited_image(path: &Path) -> bool {
     reader.decode().is_ok()
 }
 
-pub(super) fn remove_files(paths: &[PathBuf]) {
+pub(super) fn remove_files(paths: &[impl AsRef<Path>]) {
     for path in paths {
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(path.as_ref());
     }
 }
 
@@ -468,6 +465,10 @@ fn image_extension(mime: &str) -> &'static str {
     }
 }
 
+fn completed(action: &str, message: &str) -> OperationResult {
+    OperationResult::completed(action, message)
+}
+
 fn operation_error(error: impl std::fmt::Display) -> BackendError {
     BackendError::new(BackendErrorKind::OperationFailed, error.to_string())
 }
@@ -488,7 +489,7 @@ mod tests {
             fs::write(path, b"fixture").expect("write fixture");
         }
 
-        remove_files(&[first.clone(), second.clone()]);
+        remove_files(&[&first, &second]);
 
         assert!(!first.exists());
         assert!(!second.exists());

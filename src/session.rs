@@ -228,11 +228,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_sessions_never_prepare_a_paste() {
-        assert!(
-            SessionManager::default()
-                .prepare_paste("missing")
-                .await
-                .is_err()
-        );
+        let result = SessionManager::default().prepare_paste("missing").await;
+        assert!(result.is_err());
     }
 }
