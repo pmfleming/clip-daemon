@@ -5,8 +5,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use std::os::unix::fs::MetadataExt;
-
 use tokio::task::{JoinError, JoinHandle, spawn_blocking};
 
 use async_trait::async_trait;
@@ -215,8 +213,7 @@ impl RingboardBackend {
                     .map(|value| mime_or_default(value.as_str()))
             })
             .unwrap_or(DEFAULT_MIME);
-        let fingerprint =
-            entry_fingerprint(generation, entry.id(), byte_size, mime, &bytes, &metadata);
+        let fingerprint = entry_fingerprint(generation, entry.id(), byte_size, mime, &bytes);
         let id = opaque_id(&fingerprint);
         Ok(EntrySummary {
             revision: entry_revision(&fingerprint),
@@ -631,17 +628,13 @@ fn entry_fingerprint(
     size: u64,
     mime: &str,
     bytes: &[u8],
-    metadata: &std::fs::Metadata,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"clip-daemon:entry-fingerprint:v1:");
+    hasher.update(b"clip-daemon:entry-fingerprint:v2:");
     hasher.update(generation.to_le_bytes());
     hasher.update(raw_id.to_le_bytes());
     hasher.update(size.to_le_bytes());
     hasher.update(mime.as_bytes());
-    hasher.update(metadata.ino().to_le_bytes());
-    hasher.update(metadata.ctime().to_le_bytes());
-    hasher.update(metadata.ctime_nsec().to_le_bytes());
     hasher.update(bytes);
     hasher.finalize().into()
 }
@@ -650,15 +643,19 @@ fn opaque_id(fingerprint: &[u8; 32]) -> String {
     format!("entry-{}", hex::encode(&fingerprint[..16]))
 }
 
+const MAX_SAFE_JSON_INTEGER: u64 = (1 << 53) - 1;
+
 fn entry_revision(fingerprint: &[u8; 32]) -> u64 {
     let mut revision = [0; 8];
     revision.copy_from_slice(&fingerprint[16..24]);
-    u64::from_le_bytes(revision)
+    (u64::from_le_bytes(revision) & MAX_SAFE_JSON_INTEGER).max(1)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SummaryCache, entry_revision, history_token_from_parts, opaque_id};
+    use super::{
+        MAX_SAFE_JSON_INTEGER, SummaryCache, entry_revision, history_token_from_parts, opaque_id,
+    };
 
     #[test]
     fn summary_cache_is_retained_until_the_history_token_changes() {
@@ -695,5 +692,6 @@ mod tests {
         assert_eq!(opaque_id(&first), opaque_id(&first));
         assert_eq!(entry_revision(&first), entry_revision(&first));
         assert_ne!(entry_revision(&first), entry_revision(&second));
+        assert!(entry_revision(&[u8::MAX; 32]) <= MAX_SAFE_JSON_INTEGER);
     }
 }
