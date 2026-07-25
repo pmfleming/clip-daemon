@@ -32,7 +32,7 @@ use crate::{
 
 use super::{
     MAX_THUMBNAIL_BYTES, OperationTask, RingboardBackend,
-    content::{LocalImageSource, is_inline_image_mime, local_image_source},
+    content::{Publication, ResolvedContent, ResolvedImage},
     invalid_entry, run_blocking,
 };
 
@@ -56,6 +56,10 @@ impl RingboardBackend {
         let result = capture_and_publish(region, &path, &self.selection, max_bytes);
         let _ = fs::remove_file(path);
         if result.is_ok() {
+            self.artifacts
+                .lock()
+                .map_err(|_| operation_error("Generated-file registry is unavailable"))?
+                .clear_active_selection();
             self.clear_identity_state()?;
         }
         result
@@ -68,7 +72,11 @@ impl RingboardBackend {
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
         let (summary, bytes) = selected_bytes(self, opaque_id, expected_revision, max_bytes)?;
-        publish_entry(&self.selection, summary, bytes, max_bytes)?;
+        publish_entry(&self.selection, &summary, &bytes, max_bytes)?;
+        self.artifacts
+            .lock()
+            .map_err(|_| operation_error("Generated-file registry is unavailable"))?
+            .clear_active_selection();
         self.clear_identity_state()?;
         Ok(completed(
             "copy",
@@ -83,12 +91,34 @@ impl RingboardBackend {
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
         let (summary, bytes) = selected_image(self, opaque_id, expected_revision, max_bytes)?;
-        let (path, created) = prepare_image_file(&summary.mime, &bytes, max_bytes)?;
-        let published = publish_image_uri(&self.selection, &path, max_bytes);
-        if published.is_err() && created {
-            let _ = fs::remove_file(&path);
+        let content = ResolvedContent::resolve(&summary.mime, &bytes, effective_limit(max_bytes));
+        let (path, created) = prepare_image_file(&content, &bytes)?;
+        if created {
+            if let Err(error) = self
+                .artifacts
+                .lock()
+                .map_err(|_| operation_error("Generated-file registry is unavailable"))?
+                .register(&path, &summary.id, content.mime(), &bytes)
+            {
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+        } else {
+            self.artifacts
+                .lock()
+                .map_err(|_| operation_error("Generated-file registry is unavailable"))?
+                .activate_if_generated(&path);
         }
-        published?;
+        if let Err(error) = publish_image_uri(&self.selection, &path, max_bytes) {
+            if created {
+                self.artifacts
+                    .lock()
+                    .map_err(|_| operation_error("Generated-file registry is unavailable"))?
+                    .forget(&path);
+                let _ = fs::remove_file(&path);
+            }
+            return Err(error);
+        }
         self.clear_identity_state()?;
         let message = if created {
             "Image file copied"
@@ -147,11 +177,13 @@ impl RingboardBackend {
         let limit = max_bytes.min(MAX_THUMBNAIL_BYTES);
         let (summary, bytes) = selected_image(self, opaque_id, expected_revision, limit)?;
         let revision = summary.revision;
-        let (mime, image_bytes) = if is_inline_image_mime(&summary.mime) {
-            (summary.mime, bytes)
-        } else {
-            let source = require_local_image(&summary.mime, &bytes, limit)?;
-            (source.mime.into(), read_path(&source.path, limit)?)
+        let content = ResolvedContent::resolve(&summary.mime, &bytes, effective_limit(limit));
+        let (mime, image_bytes) = match content.image() {
+            Some(ResolvedImage::Inline { mime, .. }) => ((*mime).to_owned(), bytes),
+            Some(ResolvedImage::LocalFile(source)) => {
+                (source.mime.to_owned(), read_path(&source.path, limit)?)
+            }
+            None => return Err(invalid_entry("Only image entries support this action")),
         };
         let directory = runtime_directory("clip-daemon/edits")?;
         let input = unique_path(&directory, image_extension(&mime));
@@ -233,7 +265,16 @@ impl RingboardBackend {
         super::content::clear_cache()?;
         let runtime = runtime_directory("clip-daemon")?;
         fs::remove_dir_all(&runtime).map_err(operation_error)?;
-        Ok(completed("cleanup", "Clipboard caches cleared"))
+        let references = self.generated_artifact_references()?;
+        let removed = self
+            .artifacts
+            .lock()
+            .map_err(|_| operation_error("Generated-file registry is unavailable"))?
+            .reconcile(&references)?;
+        Ok(completed(
+            "cleanup",
+            &format!("Clipboard caches cleared; {removed} unreferenced generated files removed"),
+        ))
     }
 
     pub(super) fn wipe_entries(&self) -> BackendResult<OperationResult> {
@@ -248,6 +289,10 @@ impl RingboardBackend {
             remove_raw(&server, id)?;
         }
         self.cleanup_artifacts()?;
+        self.artifacts
+            .lock()
+            .map_err(|_| operation_error("Generated-file registry is unavailable"))?
+            .clear_all()?;
         self.clear_identity_state()?;
         Ok(completed("wipe", "Clipboard history cleared"))
     }
@@ -347,7 +392,13 @@ fn apply_annotation(
     backend.clear_identity_state()?;
     backend
         .selection
-        .publish_file("image/png", output, max_bytes)
+        .publish_file("image/png", output, max_bytes)?;
+    backend
+        .artifacts
+        .lock()
+        .map_err(|_| operation_error("Generated-file registry is unavailable"))?
+        .clear_active_selection();
+    Ok(())
 }
 
 fn replace_from_file(raw_id: u64, ring: RingKind, path: &Path, mime: &str) -> BackendResult<()> {
@@ -410,24 +461,32 @@ fn selected_image(
 
 fn publish_entry(
     selection: &SelectionService,
-    summary: crate::model::EntrySummary,
-    bytes: Vec<u8>,
+    summary: &crate::model::EntrySummary,
+    bytes: &[u8],
     max_bytes: u64,
 ) -> BackendResult<()> {
-    if summary.kind != EntryKind::Image || is_inline_image_mime(&summary.mime) {
-        return selection.publish(&summary.mime, bytes, max_bytes);
+    let content = ResolvedContent::resolve(&summary.mime, bytes, effective_limit(max_bytes));
+    if summary.kind == EntryKind::Image && content.kind() != EntryKind::Image {
+        return Err(invalid_entry(
+            "Clipboard image file is missing, unsafe, invalid, or exceeds the size limit",
+        ));
     }
-    let source = require_local_image(&summary.mime, &bytes, max_bytes)?;
-    selection.publish_file(source.mime, &source.path, max_bytes)
+    match content.default_publication() {
+        Publication::Bytes { mime } => selection.publish(mime, bytes.to_vec(), max_bytes),
+        Publication::File { mime, path } => selection.publish_file(mime, path, max_bytes),
+    }
 }
 
-fn prepare_image_file(mime: &str, bytes: &[u8], max_bytes: u64) -> BackendResult<(PathBuf, bool)> {
-    if !is_inline_image_mime(mime) {
-        return Ok((require_local_image(mime, bytes, max_bytes)?.path, false));
+fn prepare_image_file(content: &ResolvedContent, bytes: &[u8]) -> BackendResult<(PathBuf, bool)> {
+    match content.image() {
+        Some(ResolvedImage::LocalFile(source)) => Ok((source.path.clone(), false)),
+        Some(ResolvedImage::Inline { mime, .. }) => {
+            let path = unique_path(&image_directory()?, image_extension(mime));
+            write_private(&path, bytes)?;
+            Ok((path, true))
+        }
+        None => Err(invalid_entry("Only image entries support this action")),
     }
-    let path = unique_path(&image_directory()?, image_extension(mime));
-    write_private(&path, bytes)?;
-    Ok((path, true))
 }
 
 fn publish_image_uri(
@@ -442,16 +501,6 @@ fn publish_image_uri(
         format!("{uri}\r\n").into_bytes(),
         max_bytes,
     )
-}
-
-fn require_local_image(
-    mime: &str,
-    bytes: &[u8],
-    max_bytes: u64,
-) -> BackendResult<LocalImageSource> {
-    local_image_source(mime, bytes, effective_limit(max_bytes)).ok_or_else(|| {
-        invalid_entry("Clipboard image file is missing, unsafe, invalid, or exceeds the size limit")
-    })
 }
 
 fn read_entry(entry: Entry, reader: &mut EntryReader, max_bytes: u64) -> BackendResult<Vec<u8>> {

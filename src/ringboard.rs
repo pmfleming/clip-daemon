@@ -1,6 +1,7 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
+    io::{Seek, SeekFrom},
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -15,7 +16,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     backend::{
         BackendError, BackendErrorKind, BackendMutation, BackendResult, ClipboardBackend,
-        HistoryQuery, MAX_QUERY_LIMIT, ScreenshotRegion,
+        HistoryQuery, MAX_QUERY_LIMIT, MAX_WAYLAND_SELECTION_BYTES, ScreenshotRegion,
     },
     classification::{INSPECTION_LIMIT, bounded_preview},
     model::{
@@ -24,15 +25,15 @@ use crate::{
     selection::SelectionService,
 };
 
+mod artifacts;
 mod content;
 mod mutation;
 
+use artifacts::ArtifactRegistry;
 use content::{
-    create_file_thumbnail, create_thumbnail, detail_facts, detected_image_mime, invalid_entry,
-    is_inline_image_mime, prune_thumbnails, read_bounded, semantic_kind,
+    ResolvedContent, create_resolved_thumbnail, invalid_entry, prune_thumbnails, read_bounded,
 };
 
-const DEFAULT_MIME: &str = "text/plain";
 const MAX_DETAILS_BYTES: usize = 256 * 1024;
 const MAX_THUMBNAIL_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_FILES: usize = 100;
@@ -53,7 +54,14 @@ struct RevisionState {
 #[derive(Default)]
 struct SummaryCache {
     token: Option<u64>,
-    entries: HashMap<u64, Option<EntrySummary>>,
+    entries: HashMap<u64, Option<ResolvedEntry>>,
+}
+
+#[derive(Clone)]
+struct ResolvedEntry {
+    summary: EntrySummary,
+    generated_path: Option<PathBuf>,
+    echo_source_id: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -76,39 +84,31 @@ struct OperationTask {
     files: [PathBuf; 2],
 }
 
+struct QueryCandidate {
+    raw_id: u64,
+    resolved: ResolvedEntry,
+}
+
 struct QueryAccumulator<'a> {
     needle: &'a str,
     current_id: Option<u64>,
     limit: usize,
-    matched: usize,
+    collapse_echoes: bool,
+    complete: bool,
+    candidates: Vec<QueryCandidate>,
+}
+
+struct QueryProjection {
     current: Option<EntrySummary>,
     entries: Vec<EntrySummary>,
+    matched: usize,
     bindings: HashMap<String, IdentityBinding>,
     thumbnails: Vec<(String, u64)>,
+    artifact_references: HashSet<PathBuf>,
+    complete: bool,
 }
 
 impl QueryAccumulator<'_> {
-    fn add(&mut self, raw_id: u64, summary: EntrySummary) {
-        self.bindings.insert(
-            summary.id.clone(),
-            IdentityBinding {
-                raw_id,
-                revision: summary.revision,
-            },
-        );
-        self.thumbnails.push((summary.id.clone(), summary.revision));
-        if self.current_id == Some(raw_id) {
-            self.current = Some(summary.clone());
-        }
-        if !matches_query(&summary, self.needle) {
-            return;
-        }
-        self.matched += 1;
-        if self.entries.len() < self.limit {
-            self.entries.push(summary);
-        }
-    }
-
     fn load(
         &mut self,
         backend: &RingboardBackend,
@@ -117,12 +117,78 @@ impl QueryAccumulator<'_> {
         reader: &mut EntryReader,
     ) -> BackendResult<()> {
         let raw_id = entry.id();
-        if let Some(summary) =
-            backend.cached_summary(cache, entry, reader, self.current_id == Some(raw_id))?
-        {
-            self.add(raw_id, summary);
+        match backend.cached_summary(cache, entry, reader)? {
+            Some(resolved) => self.candidates.push(QueryCandidate { raw_id, resolved }),
+            None => self.complete = false,
         }
         Ok(())
+    }
+
+    fn finish(self) -> QueryProjection {
+        let ids: HashSet<_> = self
+            .candidates
+            .iter()
+            .map(|candidate| candidate.resolved.summary.id.clone())
+            .collect();
+        let collapsed = |candidate: &QueryCandidate| {
+            self.collapse_echoes
+                && candidate
+                    .resolved
+                    .echo_source_id
+                    .as_ref()
+                    .is_some_and(|source| ids.contains(source))
+        };
+        let current_id = self
+            .candidates
+            .iter()
+            .find(|candidate| self.current_id == Some(candidate.raw_id))
+            .map(|candidate| {
+                if collapsed(candidate) {
+                    candidate.resolved.echo_source_id.clone().unwrap()
+                } else {
+                    candidate.resolved.summary.id.clone()
+                }
+            });
+        let mut projection = QueryProjection {
+            current: None,
+            entries: Vec::with_capacity(self.limit),
+            matched: 0,
+            bindings: HashMap::new(),
+            thumbnails: Vec::new(),
+            artifact_references: self
+                .candidates
+                .iter()
+                .filter_map(|candidate| candidate.resolved.generated_path.clone())
+                .collect(),
+            complete: self.complete,
+        };
+        for candidate in self.candidates {
+            if collapsed(&candidate) {
+                continue;
+            }
+            let mut summary = candidate.resolved.summary;
+            summary.current = current_id.as_ref() == Some(&summary.id);
+            projection.bindings.insert(
+                summary.id.clone(),
+                IdentityBinding {
+                    raw_id: candidate.raw_id,
+                    revision: summary.revision,
+                },
+            );
+            projection
+                .thumbnails
+                .push((summary.id.clone(), summary.revision));
+            if summary.current {
+                projection.current = Some(summary.clone());
+            }
+            if matches_query(&summary, self.needle) {
+                projection.matched += 1;
+                if projection.entries.len() < self.limit {
+                    projection.entries.push(summary);
+                }
+            }
+        }
+        projection
     }
 }
 
@@ -132,6 +198,7 @@ pub struct RingboardBackend {
     revision: Arc<Mutex<RevisionState>>,
     summaries: Arc<Mutex<SummaryCache>>,
     operations: Arc<Mutex<HashMap<String, OperationTask>>>,
+    artifacts: Arc<Mutex<ArtifactRegistry>>,
     selection: SelectionService,
 }
 
@@ -142,6 +209,7 @@ impl Default for RingboardBackend {
             revision: Arc::new(Mutex::new(RevisionState::default())),
             summaries: Arc::new(Mutex::new(SummaryCache::default())),
             operations: Arc::new(Mutex::new(HashMap::new())),
+            artifacts: Arc::new(Mutex::new(ArtifactRegistry::default())),
             selection: SelectionService::default(),
         }
     }
@@ -191,7 +259,7 @@ impl RingboardBackend {
         let entry = database
             .get_raw(binding.raw_id)
             .map_err(|_| BackendError::stale("Clipboard entry is stale or missing"))?;
-        let summary = self.summarize(entry, &mut reader, false)?;
+        let summary = self.summarize(entry, &mut reader)?.summary;
         self.verify_selection(opaque_id, expected_revision, binding, &summary)?;
         Ok((entry, reader, summary))
     }
@@ -219,12 +287,7 @@ impl RingboardBackend {
         Err(BackendError::stale(message))
     }
 
-    fn summarize(
-        &self,
-        entry: Entry,
-        reader: &mut EntryReader,
-        current: bool,
-    ) -> BackendResult<EntrySummary> {
+    fn summarize(&self, entry: Entry, reader: &mut EntryReader) -> BackendResult<ResolvedEntry> {
         let mut loaded = entry
             .to_file(reader)
             .map_err(|_| invalid_entry("Could not open clipboard entry"))?;
@@ -233,31 +296,33 @@ impl RingboardBackend {
             .map_err(|_| invalid_entry("Could not read clipboard entry metadata"))?;
         let byte_size = metadata.len();
         let bytes = read_bounded(&mut loaded, INSPECTION_LIMIT)?;
-        let detected_mime = detected_image_mime(&bytes);
-        let mime_value = detected_mime
-            .is_none()
-            .then(|| stored_mime_type(&loaded))
-            .transpose()?;
-        let mime = detected_mime
-            .or_else(|| {
-                mime_value
-                    .as_ref()
-                    .map(|value| mime_or_default(value.as_str()))
-            })
-            .unwrap_or(DEFAULT_MIME);
-        let fingerprint = entry_fingerprint(entry.id(), byte_size, mime, &bytes);
+        let stored_mime = stored_mime_type(&loaded)?;
+        let content = ResolvedContent::resolve(&stored_mime, &bytes, MAX_WAYLAND_SELECTION_BYTES);
+        let fingerprint = entry_fingerprint(entry.id(), byte_size, content.mime(), &bytes);
         let id = opaque_id(&fingerprint);
-        let kind = semantic_kind(mime, &bytes);
-        Ok(EntrySummary {
-            revision: entry_revision(&fingerprint),
-            id,
-            kind,
-            mime: mime.to_owned(),
-            byte_size,
-            favorite: entry.ring()
-                == clipboard_history_client_sdk::core::protocol::RingKind::Favorites,
-            current,
-            preview: bounded_preview(&bytes, INSPECTION_LIMIT),
+        let artifact = {
+            let registry = self.artifacts.lock().map_err(|_| lock_error())?;
+            content
+                .local_image()
+                .and_then(|source| registry.match_local_image(source))
+                .or_else(|| {
+                    registry.match_file_uris(content.files().iter().map(|file| file.uri.clone()))
+                })
+        };
+        Ok(ResolvedEntry {
+            summary: EntrySummary {
+                revision: entry_revision(&fingerprint),
+                id,
+                kind: content.kind(),
+                mime: content.mime().to_owned(),
+                byte_size,
+                favorite: entry.ring()
+                    == clipboard_history_client_sdk::core::protocol::RingKind::Favorites,
+                current: false,
+                preview: bounded_preview(&bytes, INSPECTION_LIMIT),
+            },
+            generated_path: artifact.as_ref().map(|artifact| artifact.path.clone()),
+            echo_source_id: artifact.and_then(|artifact| artifact.source_entry_id),
         })
     }
 
@@ -266,14 +331,15 @@ impl RingboardBackend {
         cache: &mut SummaryCache,
         entry: Entry,
         reader: &mut EntryReader,
-        current: bool,
-    ) -> BackendResult<Option<EntrySummary>> {
-        if let Some(summary) = cache.entries.get(&entry.id()) {
+    ) -> BackendResult<Option<ResolvedEntry>> {
+        if let Some(summary) = cache.entries.get(&entry.id())
+            && summary
+                .as_ref()
+                .is_none_or(|summary| summary.generated_path.is_none())
+        {
             return Ok(summary.clone());
         }
-        let summary = match catch_unwind(AssertUnwindSafe(|| {
-            self.summarize(entry, reader, current)
-        })) {
+        let summary = match catch_unwind(AssertUnwindSafe(|| self.summarize(entry, reader))) {
             Ok(Ok(summary)) => Some(summary),
             Ok(Err(error))
                 if matches!(
@@ -294,6 +360,17 @@ impl RingboardBackend {
         Ok(summary)
     }
 
+    pub(super) fn generated_artifact_references(&self) -> BackendResult<HashSet<PathBuf>> {
+        let (database, mut reader) = Self::open()?;
+        let mut references = HashSet::new();
+        for entry in database.favorites().chain(database.main()) {
+            if let Some(path) = self.summarize(entry, &mut reader)?.generated_path {
+                references.insert(path);
+            }
+        }
+        Ok(references)
+    }
+
     fn query_sync(&self, query: HistoryQuery) -> BackendResult<HistoryPage> {
         let (database, mut reader) = Self::open()?;
         let token = history_token(&database);
@@ -305,11 +382,9 @@ impl RingboardBackend {
             needle: &needle,
             current_id,
             limit,
-            matched: 0,
-            current: None,
-            entries: Vec::with_capacity(limit),
-            bindings: HashMap::new(),
-            thumbnails: Vec::new(),
+            collapse_echoes: query.collapse_self_echoes,
+            complete: true,
+            candidates: Vec::new(),
         };
         let mut cache = self.summaries.lock().map_err(|_| lock_error())?;
         cache.select_token(token);
@@ -317,14 +392,25 @@ impl RingboardBackend {
             results.load(self, &mut cache, entry, &mut reader)?;
         }
         drop(cache);
-        *self.ids.lock().map_err(|_| lock_error())? = std::mem::take(&mut results.bindings);
-        prune_thumbnails(&results.thumbnails);
+        let mut projection = results.finish();
+        *self.ids.lock().map_err(|_| lock_error())? = std::mem::take(&mut projection.bindings);
+        prune_thumbnails(&projection.thumbnails);
+        if projection.complete {
+            let reconcile = self
+                .artifacts
+                .lock()
+                .map_err(|_| lock_error())?
+                .reconcile(&projection.artifact_references);
+            if let Err(error) = reconcile {
+                tracing::warn!(code = %error.kind.code(), "Generated-file reconciliation failed");
+            }
+        }
         Ok(HistoryPage {
             revision: self.revision_for(token)?,
             generation: query.generation,
-            current: results.current,
-            has_more: results.matched > results.entries.len(),
-            entries: results.entries,
+            current: projection.current,
+            has_more: projection.matched > projection.entries.len(),
+            entries: projection.entries,
         })
     }
 
@@ -343,7 +429,7 @@ impl RingboardBackend {
         let entry = database
             .get_raw(raw_id)
             .map_err(|_| BackendError::not_found("Clipboard entry is stale or missing"))?;
-        let summary = self.summarize(entry, &mut reader, false)?;
+        let summary = self.summarize(entry, &mut reader)?.summary;
         self.ids.lock().map_err(|_| lock_error())?.insert(
             summary.id.clone(),
             IdentityBinding {
@@ -364,13 +450,12 @@ impl RingboardBackend {
         let mut loaded = entry
             .to_file(&mut reader)
             .map_err(|_| invalid_entry("Could not open clipboard image"))?;
-        if summary.kind == crate::model::EntryKind::Image && !is_inline_image_mime(&summary.mime) {
-            create_file_thumbnail(&mut loaded, &summary, edge)
-        } else if summary.kind == crate::model::EntryKind::Image {
-            create_thumbnail(&loaded, &summary, edge)
-        } else {
-            Err(invalid_entry("Clipboard entry cannot be thumbnailed"))
-        }
+        let bytes = read_bounded(&mut loaded, INSPECTION_LIMIT)?;
+        loaded
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| invalid_entry("Could not rewind clipboard image"))?;
+        let content = ResolvedContent::resolve(&summary.mime, &bytes, MAX_THUMBNAIL_BYTES);
+        create_resolved_thumbnail(&loaded, &content, &summary, edge)
     }
 
     fn mutate_sync(
@@ -563,12 +648,12 @@ fn entry_details(
     let truncated = bytes.len() > limit;
     bytes.truncate(limit);
     let text = std::str::from_utf8(&bytes).ok().map(str::to_owned);
-    let (files, image) = detail_facts(&summary, &bytes);
+    let content = ResolvedContent::resolve(&summary.mime, &bytes, MAX_THUMBNAIL_BYTES);
     Ok(EntryDetails {
         entry: summary,
         text,
-        files,
-        image,
+        files: content.files().to_vec(),
+        image: content.image_metadata(),
         preview_truncated: truncated,
     })
 }
@@ -587,10 +672,6 @@ fn blocking_task_error(_: JoinError) -> BackendError {
         BackendErrorKind::OperationFailed,
         "Clipboard backend task failed",
     )
-}
-
-fn mime_or_default(mime: &str) -> &str {
-    if mime.is_empty() { DEFAULT_MIME } else { mime }
 }
 
 fn stored_mime_type(loaded: &LoadedEntry<'_, File>) -> BackendResult<String> {
@@ -677,9 +758,10 @@ fn entry_revision(fingerprint: &[u8; 32]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SAFE_JSON_INTEGER, SummaryCache, entry_fingerprint, entry_revision,
-        history_token_from_parts, opaque_id,
+        MAX_SAFE_JSON_INTEGER, QueryAccumulator, QueryCandidate, ResolvedEntry, SummaryCache,
+        entry_fingerprint, entry_revision, history_token_from_parts, opaque_id,
     };
+    use crate::model::{EntryKind, EntrySummary};
 
     #[test]
     fn summary_cache_is_retained_until_the_history_token_changes() {
@@ -691,6 +773,56 @@ mod tests {
 
         cache.select_token(2);
         assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn equivalent_generated_echoes_can_be_collapsed_into_the_source() {
+        let summary = |id: &str| EntrySummary {
+            id: id.into(),
+            revision: 1,
+            kind: EntryKind::Image,
+            mime: "image/png".into(),
+            byte_size: 10,
+            favorite: false,
+            current: false,
+            preview: "image".into(),
+        };
+        let candidates = vec![
+            QueryCandidate {
+                raw_id: 2,
+                resolved: ResolvedEntry {
+                    summary: summary("echo"),
+                    generated_path: Some("/generated/image.png".into()),
+                    echo_source_id: Some("source".into()),
+                },
+            },
+            QueryCandidate {
+                raw_id: 1,
+                resolved: ResolvedEntry {
+                    summary: summary("source"),
+                    generated_path: None,
+                    echo_source_id: None,
+                },
+            },
+        ];
+        let projection = QueryAccumulator {
+            needle: "",
+            current_id: Some(2),
+            limit: 10,
+            collapse_echoes: true,
+            complete: true,
+            candidates,
+        }
+        .finish();
+
+        assert_eq!(projection.entries.len(), 1);
+        assert_eq!(projection.entries[0].id, "source");
+        assert!(projection.entries[0].current);
+        assert!(
+            projection
+                .artifact_references
+                .contains(std::path::Path::new("/generated/image.png"))
+        );
     }
 
     #[test]

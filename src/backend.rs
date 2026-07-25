@@ -12,6 +12,7 @@ pub struct HistoryQuery {
     pub query: String,
     pub generation: u64,
     pub limit: usize,
+    pub collapse_self_echoes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

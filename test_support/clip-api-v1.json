@@ -118,6 +118,7 @@
       {
         "name": "clipboard.settings.update",
         "params_example": {
+          "collapse_self_echoes": true,
           "max_entries": 750,
           "max_entry_bytes": 16777216
         },

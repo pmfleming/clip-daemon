@@ -111,7 +111,11 @@ impl ClipboardService {
         }
     }
 
-    pub(crate) async fn query(&self, params: QueryParams) -> Result<Value, ApiError> {
+    pub(crate) async fn query(
+        &self,
+        params: QueryParams,
+        collapse_self_echoes: bool,
+    ) -> Result<Value, ApiError> {
         if !(1..=MAX_QUERY_LIMIT).contains(&params.limit) {
             return Err(ApiError::validation("limit must be between 1 and 200"));
         }
@@ -121,6 +125,7 @@ impl ClipboardService {
                 query: params.query,
                 generation: params.generation,
                 limit: params.limit,
+                collapse_self_echoes,
             })
             .await?;
         Ok(json!({ "history": history }))

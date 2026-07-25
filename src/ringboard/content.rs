@@ -8,10 +8,11 @@ use std::{
 };
 
 use image::{DynamicImage, ImageReader, Limits};
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
-    backend::{BackendError, BackendErrorKind, BackendResult, MAX_WAYLAND_SELECTION_BYTES},
+    backend::{BackendError, BackendErrorKind, BackendResult},
     classification::classify,
     model::{EntryKind, EntrySummary, EntryThumbnail, FilePreview, ImageMetadata},
 };
@@ -21,10 +22,114 @@ use super::{INSPECTION_LIMIT, MAX_FILES, MAX_THUMBNAIL_BYTES};
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_DECODED_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
+#[derive(Clone)]
 pub(super) struct LocalImageSource {
     pub path: PathBuf,
     pub mime: &'static str,
     pub dimensions: ImageMetadata,
+}
+
+/// Daemon-owned semantic interpretation of bytes and MIME stored by Ringboard.
+pub(super) struct ResolvedContent {
+    stored_mime: String,
+    kind: EntryKind,
+    files: Vec<FilePreview>,
+    image: Option<ResolvedImage>,
+}
+
+pub(super) enum ResolvedImage {
+    Inline {
+        mime: &'static str,
+        dimensions: Option<ImageMetadata>,
+    },
+    LocalFile(LocalImageSource),
+}
+
+pub(super) enum Publication<'a> {
+    Bytes { mime: &'a str },
+    File { mime: &'a str, path: &'a Path },
+}
+
+impl ResolvedContent {
+    pub fn resolve(stored_mime: &str, bytes: &[u8], max_file_bytes: u64) -> Self {
+        let stored_mime = mime_or_default(stored_mime).to_owned();
+        if let Some(mime) = detected_image_mime(bytes) {
+            return Self {
+                stored_mime,
+                kind: EntryKind::Image,
+                files: Vec::new(),
+                image: Some(ResolvedImage::Inline {
+                    mime,
+                    dimensions: image_dimensions(bytes),
+                }),
+            };
+        }
+
+        let semantic_mime = canonical_mime(&stored_mime).to_owned();
+        let files = if accepts_local_image_mime(&semantic_mime) {
+            parse_files(&semantic_mime, bytes)
+        } else {
+            Vec::new()
+        };
+        let local_image = local_image_source_from_files(&files, max_file_bytes);
+        let kind = if local_image.is_some() {
+            EntryKind::Image
+        } else {
+            classify(&semantic_mime, bytes)
+        };
+        Self {
+            stored_mime,
+            kind,
+            files,
+            image: local_image.map(ResolvedImage::LocalFile),
+        }
+    }
+
+    pub fn kind(&self) -> EntryKind {
+        self.kind
+    }
+
+    /// Sniffed inline images use their actual MIME. Other entries preserve the
+    /// exact MIME Ringboard captured for publication compatibility.
+    pub fn mime(&self) -> &str {
+        match &self.image {
+            Some(ResolvedImage::Inline { mime, .. }) => mime,
+            _ => &self.stored_mime,
+        }
+    }
+
+    pub fn files(&self) -> &[FilePreview] {
+        &self.files
+    }
+
+    pub fn image_metadata(&self) -> Option<ImageMetadata> {
+        match &self.image {
+            Some(ResolvedImage::Inline { dimensions, .. }) => dimensions.clone(),
+            Some(ResolvedImage::LocalFile(source)) => Some(source.dimensions.clone()),
+            None => None,
+        }
+    }
+
+    pub fn image(&self) -> Option<&ResolvedImage> {
+        self.image.as_ref()
+    }
+
+    pub fn local_image(&self) -> Option<&LocalImageSource> {
+        match &self.image {
+            Some(ResolvedImage::LocalFile(source)) => Some(source),
+            _ => None,
+        }
+    }
+
+    pub fn default_publication(&self) -> Publication<'_> {
+        match &self.image {
+            Some(ResolvedImage::LocalFile(source)) => Publication::File {
+                mime: source.mime,
+                path: &source.path,
+            },
+            _ => Publication::Bytes { mime: self.mime() },
+        }
+    }
 }
 
 pub(super) fn read_bounded(file: &mut File, limit: usize) -> BackendResult<Vec<u8>> {
@@ -50,52 +155,25 @@ pub(super) fn detected_image_mime(bytes: &[u8]) -> Option<&'static str> {
         .map(|format| format.to_mime_type())
 }
 
-pub(super) fn semantic_kind(mime: &str, bytes: &[u8]) -> EntryKind {
-    local_image_source(mime, bytes, MAX_WAYLAND_SELECTION_BYTES)
-        .map(|_| EntryKind::Image)
-        .unwrap_or_else(|| classify(mime, bytes))
-}
-
-pub(super) fn detail_facts(
-    summary: &EntrySummary,
-    bytes: &[u8],
-) -> (Vec<FilePreview>, Option<ImageMetadata>) {
-    if accepts_local_image_mime(&summary.mime) {
-        let files = parse_files(&summary.mime, bytes);
-        if let Some(source) = local_image_source_from_files(&files, MAX_THUMBNAIL_BYTES) {
-            return (files, Some(source.dimensions));
-        }
-        if is_file_list_mime(&summary.mime) {
-            return (files, None);
-        }
-    }
-    match summary.kind {
-        EntryKind::Image => (Vec::new(), image_dimensions(bytes)),
-        _ => (Vec::new(), None),
-    }
-}
-
-pub(super) fn create_thumbnail(
-    file: &File,
+pub(super) fn create_resolved_thumbnail(
+    stored_file: &File,
+    content: &ResolvedContent,
     summary: &EntrySummary,
     edge: u32,
 ) -> BackendResult<EntryThumbnail> {
-    if summary.kind != EntryKind::Image || summary.byte_size > MAX_THUMBNAIL_BYTES {
+    if summary.kind != EntryKind::Image {
         return Err(invalid_entry("Clipboard entry cannot be thumbnailed"));
     }
-    create_thumbnail_from_image(file, summary, edge)
-}
-
-pub(super) fn create_file_thumbnail(
-    file: &mut File,
-    summary: &EntrySummary,
-    edge: u32,
-) -> BackendResult<EntryThumbnail> {
-    let bytes = read_bounded(file, INSPECTION_LIMIT)?;
-    let source = local_image_source(&summary.mime, &bytes, MAX_THUMBNAIL_BYTES)
-        .ok_or_else(|| invalid_entry("Clipboard file is not a local image"))?;
-    let image_file = File::open(&source.path)
-        .map_err(|_| invalid_entry("Clipboard image file could not be opened"))?;
+    let image_file = match content.image() {
+        Some(ResolvedImage::Inline { .. }) if summary.byte_size <= MAX_THUMBNAIL_BYTES => {
+            stored_file
+                .try_clone()
+                .map_err(|_| invalid_entry("Could not open clipboard image"))?
+        }
+        Some(ResolvedImage::LocalFile(source)) => File::open(&source.path)
+            .map_err(|_| invalid_entry("Clipboard image file could not be opened"))?,
+        _ => return Err(invalid_entry("Clipboard entry cannot be thumbnailed")),
+    };
     create_thumbnail_from_image(&image_file, summary, edge)
 }
 
@@ -199,31 +277,45 @@ fn file_preview(uri: &str, operation: &str) -> Option<FilePreview> {
 
 fn is_file_list_mime(mime: &str) -> bool {
     matches!(
-        normalized_mime(mime),
+        canonical_mime(mime),
         "text/uri-list" | "x-special/gnome-copied-files"
     )
 }
 
 fn accepts_local_image_mime(mime: &str) -> bool {
-    is_file_list_mime(mime) || normalized_mime(mime) == "text/plain"
+    is_file_list_mime(mime) || canonical_mime(mime) == "text/plain"
 }
 
-pub(super) fn is_inline_image_mime(mime: &str) -> bool {
-    normalized_mime(mime).starts_with("image/")
+fn mime_or_default(mime: &str) -> &str {
+    if mime.is_empty() { "text/plain" } else { mime }
 }
 
-fn normalized_mime(mime: &str) -> &str {
-    mime.split(';').next().unwrap_or(mime).trim()
+fn canonical_mime(mime: &str) -> &str {
+    let essence = mime.split(';').next().unwrap_or(mime).trim();
+    if essence.eq_ignore_ascii_case("image/x-png") {
+        "image/png"
+    } else if essence.eq_ignore_ascii_case("image/jpg")
+        || essence.eq_ignore_ascii_case("image/pjpeg")
+    {
+        "image/jpeg"
+    } else if essence.eq_ignore_ascii_case("application/x-gnome-copied-files") {
+        "x-special/gnome-copied-files"
+    } else if essence.eq_ignore_ascii_case("text/x-uri")
+        || essence.eq_ignore_ascii_case("text/x-uri-list")
+    {
+        "text/uri-list"
+    } else {
+        essence
+    }
 }
 
-pub(super) fn local_image_source(
-    mime: &str,
-    bytes: &[u8],
-    max_bytes: u64,
-) -> Option<LocalImageSource> {
-    accepts_local_image_mime(mime)
-        .then(|| parse_files(mime, bytes))
-        .and_then(|files| local_image_source_from_files(&files, max_bytes))
+pub(super) fn image_identity(mime: &str, bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"clip-daemon:resolved-image:v1:");
+    hasher.update(canonical_mime(mime).as_bytes());
+    hasher.update((bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
 
 fn local_image_source_from_files(
@@ -325,9 +417,8 @@ mod tests {
     };
 
     use super::{
-        MAX_DECODED_IMAGE_BYTES, MAX_IMAGE_DIMENSION, detected_image_mime, file_preview,
-        image_decode_limits, local_image_source, parse_files, prune_thumbnail_directory,
-        read_bounded, semantic_kind,
+        MAX_DECODED_IMAGE_BYTES, MAX_IMAGE_DIMENSION, ResolvedContent, detected_image_mime,
+        file_preview, image_decode_limits, parse_files, prune_thumbnail_directory, read_bounded,
     };
 
     #[test]
@@ -371,29 +462,43 @@ mod tests {
         let uri = url::Url::from_file_path(&path)
             .expect("file URL")
             .to_string();
-        let inspect = |mime, value: &str| local_image_source(mime, value.as_bytes(), 1024 * 1024);
+        let inspect =
+            |mime, value: &str| ResolvedContent::resolve(mime, value.as_bytes(), 1024 * 1024);
         let uri_list = format!("{uri}\r\n");
-        let source = inspect("text/uri-list", &uri_list).expect("local image source");
+        let content = inspect("text/uri-list", &uri_list);
+        let source = content.local_image().expect("local image source");
 
         assert_eq!(source.path, path);
         assert_eq!(source.mime, "image/png");
         assert_eq!((source.dimensions.width, source.dimensions.height), (7, 5));
+        assert_eq!(content.kind(), crate::model::EntryKind::Image);
         assert_eq!(
-            semantic_kind("text/uri-list", uri_list.as_bytes()),
+            inspect("text/plain", &format!("{uri}\n")).kind(),
             crate::model::EntryKind::Image
         );
-        assert_eq!(
-            semantic_kind("text/plain", format!("{uri}\n").as_bytes()),
-            crate::model::EntryKind::Image
+        assert!(
+            inspect("text/uri-list", &format!("{uri}\r\n{uri}\r\n"))
+                .local_image()
+                .is_none()
         );
-        assert!(inspect("text/uri-list", &format!("{uri}\r\n{uri}\r\n")).is_none());
 
         let symlink_path = directory.path().join("screenshot-link.png");
         symlink(&path, &symlink_path).expect("image symlink");
         let symlink_uri = url::Url::from_file_path(symlink_path)
             .expect("symlink URL")
             .to_string();
-        assert!(inspect("text/uri-list", &format!("{symlink_uri}\r\n")).is_none());
+        assert!(
+            inspect("text/uri-list", &format!("{symlink_uri}\r\n"))
+                .local_image()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mime_aliases_share_semantic_policy_without_changing_stored_mime() {
+        let content = ResolvedContent::resolve("image/x-png", b"not an image", 1024);
+        assert_eq!(content.mime(), "image/x-png");
+        assert_eq!(content.kind(), crate::model::EntryKind::Image);
     }
 
     #[test]

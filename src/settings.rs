@@ -27,6 +27,7 @@ pub struct ClipboardSettings {
     pub max_entry_bytes: u64,
     pub capture_paused: bool,
     pub private_mode: bool,
+    pub collapse_self_echoes: bool,
 }
 
 impl Default for ClipboardSettings {
@@ -37,6 +38,7 @@ impl Default for ClipboardSettings {
             max_entry_bytes: 16 * 1024 * 1024,
             capture_paused: false,
             private_mode: false,
+            collapse_self_echoes: true,
         }
     }
 }
@@ -46,6 +48,7 @@ pub struct SettingsUpdate {
     pub max_entries: Option<u32>,
     pub max_favorites: Option<u32>,
     pub max_entry_bytes: Option<u64>,
+    pub collapse_self_echoes: Option<bool>,
 }
 
 impl SettingsUpdate {
@@ -60,6 +63,9 @@ impl SettingsUpdate {
             )?,
             capture_paused: value.capture_paused,
             private_mode: value.private_mode,
+            collapse_self_echoes: self
+                .collapse_self_echoes
+                .unwrap_or(value.collapse_self_echoes),
         })
     }
 }
@@ -113,10 +119,13 @@ impl SettingsManager {
         if updated == current {
             return Ok(current);
         }
+        let restart_required = updated.max_entries != current.max_entries
+            || updated.max_favorites != current.max_favorites
+            || updated.max_entry_bytes != current.max_entry_bytes;
         let updated = self
             .save(updated, persist_config_pair, SETTINGS_SAVED)
             .await?;
-        if let Err(error) = restart_capture(&updated).await {
+        if restart_required && let Err(error) = restart_capture(&updated).await {
             return Err(format!("{SETTINGS_SAVED}, but {error}"));
         }
         Ok(updated)

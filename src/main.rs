@@ -79,6 +79,7 @@ async fn probe_ringboard() -> Result<()> {
             query: String::new(),
             generation: 0,
             limit: 10,
+            collapse_self_echoes: true,
         })
         .await?;
     // Never print clipboard IDs, previews, MIME values, or content from a probe.

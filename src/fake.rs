@@ -257,6 +257,7 @@ mod tests {
                 query: "bet".into(),
                 generation: 7,
                 limit: 10,
+                collapse_self_echoes: true,
             })
             .await
             .unwrap();

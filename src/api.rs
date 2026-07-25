@@ -55,7 +55,14 @@ impl ApiService {
 
     async fn dispatch_method(&self, method: &str, params: Value) -> Result<Value, ApiError> {
         match method {
-            "clipboard.history.query" => self.actions.query(decode(params)?).await,
+            "clipboard.history.query" => {
+                let collapse = self
+                    .settings
+                    .get()
+                    .map_err(settings_error)?
+                    .collapse_self_echoes;
+                self.actions.query(decode(params)?, collapse).await
+            }
             "clipboard.entry.details" => self.actions.details(decode(params)?).await,
             "clipboard.entry.thumbnail" => self.actions.thumbnail(decode(params)?).await,
             value if value.starts_with("clipboard.entry.") => {

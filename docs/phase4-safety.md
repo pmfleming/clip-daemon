@@ -19,6 +19,13 @@
   URI names exactly one local, non-symlink regular file that passes size, format, and dimension
   validation; each operation revalidates it. Temporary files and thumbnails are private and cancellable.
 - Current entries can be pinned through the same favorite transaction.
+- Image files materialized by `image-as-file` are recorded in a private persistent ownership
+  registry. Reconciliation removes only registered, unreferenced files (after a short recapture
+  grace period), preserves the active selection and Ringboard URI references, and never deletes
+  unrelated files. Wipe removes all registered artifacts.
+- Ringboard may recapture a daemon-published generated URI. The history projection verifies the
+  generated file's image identity and, when `collapse_self_echoes` is enabled, maps an equivalent
+  echo back to its still-present source entry. Ringboard capture and storage remain unchanged.
 
 ## Ringboard and compositor boundaries
 
