@@ -60,7 +60,9 @@
 
       devShells = forAllSystems (system: pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo clippy dbus grim jq just pkg-config ringboard-wayland rust-analyzer rustc rustfmt wayland-utils ];
+          packages = with pkgs; [ cargo cargo-llvm-cov clippy dbus grim jq just llvmPackages.llvm pkg-config ringboard-wayland rust-analyzer rustc rustfmt wayland-utils ];
+          LLVM_COV = "${pkgs.llvmPackages.llvm}/bin/llvm-cov";
+          LLVM_PROFDATA = "${pkgs.llvmPackages.llvm}/bin/llvm-profdata";
           RUST_BACKTRACE = "1";
           RUST_LOG = "clip_daemon=debug";
           RUSTC_BOOTSTRAP = "1";

@@ -1,18 +1,49 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use futures::StreamExt;
-use serde_json::json;
-use tokio::time::MissedTickBehavior;
+use serde_json::{Value, json};
+use tokio::{sync::Mutex, task::JoinHandle, time::MissedTickBehavior};
 use zbus::{names::UniqueName, object_server::SignalEmitter};
 
-use crate::{api, protocol};
+use crate::{api, api::ApiService, protocol};
 
 use super::{ClipDaemon, emit_event};
+
+type Subscriptions = Arc<Mutex<HashMap<String, JoinHandle<()>>>>;
 
 #[derive(Clone, Copy)]
 struct RequestedStreams {
     history: bool,
     current: bool,
+}
+
+struct SubscriptionTask {
+    destination: SignalEmitter<'static>,
+    api_service: Arc<ApiService>,
+    subscriptions: Subscriptions,
+    event_revision: Arc<AtomicU64>,
+    id: String,
+    streams: Vec<String>,
+    owner: UniqueName<'static>,
+    requested: RequestedStreams,
+}
+
+#[derive(Default)]
+struct HistoryState {
+    previous: Option<u64>,
+    unavailable: bool,
+}
+
+enum HistoryUpdate {
+    Changed,
+    Unavailable(Value),
 }
 
 impl RequestedStreams {
@@ -36,6 +67,51 @@ impl RequestedStreams {
     }
 }
 
+impl SubscriptionTask {
+    async fn run(self) {
+        let connection = self.destination.connection().clone();
+        for stream in &self.streams {
+            emit_event(&self.destination, stream, "subscribed", &self.id, None).await;
+        }
+        if self.requested.watches_clipboard() {
+            tokio::select! {
+                () = poll_history(
+                    self.destination,
+                    self.api_service,
+                    self.event_revision,
+                    self.id.clone(),
+                    self.requested,
+                ) => {}
+                () = wait_for_owner_loss(connection, self.owner) => {}
+            }
+        } else {
+            wait_for_owner_loss(connection, self.owner).await;
+        }
+        self.subscriptions.lock().await.remove(&self.id);
+        tracing::debug!(subscription_id = %self.id, "clipboard subscription ended");
+    }
+}
+
+impl HistoryState {
+    fn update(&mut self, result: Result<u64, Value>) -> Option<HistoryUpdate> {
+        match result {
+            Ok(token) => self.changed(token).then_some(HistoryUpdate::Changed),
+            Err(error) if !std::mem::replace(&mut self.unavailable, true) => {
+                Some(HistoryUpdate::Unavailable(error))
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn changed(&mut self, token: u64) -> bool {
+        std::mem::replace(&mut self.unavailable, false)
+            || self
+                .previous
+                .replace(token)
+                .is_some_and(|previous| previous != token)
+    }
+}
+
 pub(super) async fn start(
     daemon: &ClipDaemon,
     streams: Vec<String>,
@@ -51,94 +127,69 @@ pub(super) async fn start(
     };
     let id = daemon.next_id("subscription");
     let destination = emitter.set_destination(owner.clone().into()).to_owned();
-    let api_service = Arc::clone(&daemon.api);
-    let subscriptions = Arc::clone(&daemon.subscriptions);
-    let event_revision = Arc::clone(&daemon.event_revision);
-    let task_id = id.clone();
-    let task_streams = streams.clone();
-    let connection = destination.connection().clone();
-    let (start_task, task_ready) = tokio::sync::oneshot::channel();
-
-    let task = tokio::spawn(async move {
-        if task_ready.await.is_err() {
-            return;
+    let mut active = daemon.subscriptions.lock().await;
+    let task = tokio::spawn(
+        SubscriptionTask {
+            destination,
+            api_service: Arc::clone(&daemon.api),
+            subscriptions: Arc::clone(&daemon.subscriptions),
+            event_revision: Arc::clone(&daemon.event_revision),
+            id: id.clone(),
+            streams: streams.clone(),
+            owner,
+            requested,
         }
-        for stream in &task_streams {
-            emit_event(&destination, stream, "subscribed", &task_id, None).await;
-        }
-        if requested.watches_clipboard() {
-            tokio::select! {
-                () = poll_history(destination, api_service, event_revision, task_id.clone(), requested) => {}
-                () = wait_for_owner_loss(connection, owner) => {}
-            }
-        } else {
-            wait_for_owner_loss(connection, owner).await;
-        }
-        subscriptions.lock().await.remove(&task_id);
-        tracing::debug!(subscription_id = %task_id, "clipboard subscription ended");
-    });
-    daemon.subscriptions.lock().await.insert(id.clone(), task);
-    if start_task.send(()).is_err() {
-        if let Some(task) = daemon.subscriptions.lock().await.remove(&id) {
-            task.abort();
-        }
-        return api::error(
-            "subscription-unavailable",
-            "Subscription task could not be started".into(),
-        )
-        .to_string();
-    }
+        .run(),
+    );
+    active.insert(id.clone(), task);
+    drop(active);
     tracing::debug!(subscription_id = %id, "clipboard subscription started");
     api::success(json!({ "subscription": { "id": id, "streams": streams } })).to_string()
 }
 
 async fn poll_history(
     emitter: SignalEmitter<'static>,
-    api_service: Arc<crate::api::ApiService>,
-    event_revision: Arc<std::sync::atomic::AtomicU64>,
+    api_service: Arc<ApiService>,
+    event_revision: Arc<AtomicU64>,
     subscription_id: String,
     requested: RequestedStreams,
 ) {
-    let mut previous = None;
-    let mut unavailable = false;
+    let mut state = HistoryState::default();
     let mut timer = tokio::time::interval(Duration::from_millis(500));
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         timer.tick().await;
-        match api_service.change_token().await {
-            Ok(token) => {
-                if history_changed(&mut previous, &mut unavailable, token) {
-                    let revision =
-                        event_revision.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    emit_requested(
-                        &emitter,
-                        &subscription_id,
-                        requested,
-                        ("reset", "changed"),
-                        json!({ "data": { "revision": revision, "change": "reset" } }),
-                    )
-                    .await;
-                }
-            }
-            Err(error) if !unavailable => {
-                unavailable = true;
-                emit_requested(
-                    &emitter,
-                    &subscription_id,
-                    requested,
-                    ("unavailable", "unavailable"),
-                    error,
-                )
-                .await;
-            }
-            Err(_) => {}
+        if let Some(update) = state.update(api_service.change_token().await) {
+            emit_update(
+                &emitter,
+                &event_revision,
+                &subscription_id,
+                requested,
+                update,
+            )
+            .await;
         }
     }
 }
 
-fn history_changed(previous: &mut Option<u64>, unavailable: &mut bool, token: u64) -> bool {
-    std::mem::replace(unavailable, false)
-        || previous.replace(token).is_some_and(|value| value != token)
+async fn emit_update(
+    emitter: &SignalEmitter<'_>,
+    event_revision: &AtomicU64,
+    subscription_id: &str,
+    requested: RequestedStreams,
+    update: HistoryUpdate,
+) {
+    let (events, data) = match update {
+        HistoryUpdate::Changed => {
+            let revision = event_revision.fetch_add(1, Ordering::Relaxed) + 1;
+            (
+                ("reset", "changed"),
+                json!({ "data": { "revision": revision, "change": "reset" } }),
+            )
+        }
+        HistoryUpdate::Unavailable(error) => (("unavailable", "unavailable"), error),
+    };
+    emit_requested(emitter, subscription_id, requested, events, data).await;
 }
 
 async fn emit_requested(
@@ -146,7 +197,7 @@ async fn emit_requested(
     subscription_id: &str,
     requested: RequestedStreams,
     events: (&str, &str),
-    data: serde_json::Value,
+    data: Value,
 ) {
     for (enabled, stream, event) in [
         (requested.history, protocol::stream::HISTORY, events.0),
@@ -181,5 +232,39 @@ async fn wait_for_owner_loss(connection: zbus::Connection, owner: UniqueName<'st
         if name == owner.as_str() && !old_owner.is_empty() && new_owner.is_empty() {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{HistoryState, HistoryUpdate, RequestedStreams};
+    use crate::protocol;
+
+    #[test]
+    fn requested_streams_reject_empty_and_unknown_subscriptions() {
+        assert!(RequestedStreams::parse(&[]).is_none());
+        assert!(RequestedStreams::parse(&["unknown".into()]).is_none());
+        let requested = RequestedStreams::parse(&[
+            protocol::stream::HISTORY.into(),
+            protocol::stream::CURRENT.into(),
+        ])
+        .expect("supported streams");
+        assert!(requested.history && requested.current && requested.watches_clipboard());
+    }
+
+    #[test]
+    fn history_state_emits_changes_outages_and_recovery_once() {
+        let mut state = HistoryState::default();
+        assert!(state.update(Ok(1)).is_none());
+        assert!(state.update(Ok(1)).is_none());
+        assert!(matches!(state.update(Ok(2)), Some(HistoryUpdate::Changed)));
+        assert!(matches!(
+            state.update(Err(json!({ "error": "offline" }))),
+            Some(HistoryUpdate::Unavailable(_))
+        ));
+        assert!(state.update(Err(json!({ "error": "offline" }))).is_none());
+        assert!(matches!(state.update(Ok(2)), Some(HistoryUpdate::Changed)));
     }
 }

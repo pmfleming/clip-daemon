@@ -83,10 +83,20 @@ struct QueryAccumulator<'a> {
     matched: usize,
     current: Option<EntrySummary>,
     entries: Vec<EntrySummary>,
+    bindings: HashMap<String, IdentityBinding>,
+    thumbnails: Vec<(String, u64)>,
 }
 
 impl QueryAccumulator<'_> {
     fn add(&mut self, raw_id: u64, summary: EntrySummary) {
+        self.bindings.insert(
+            summary.id.clone(),
+            IdentityBinding {
+                raw_id,
+                revision: summary.revision,
+            },
+        );
+        self.thumbnails.push((summary.id.clone(), summary.revision));
         if self.current_id == Some(raw_id) {
             self.current = Some(summary.clone());
         }
@@ -97,6 +107,22 @@ impl QueryAccumulator<'_> {
         if self.entries.len() < self.limit {
             self.entries.push(summary);
         }
+    }
+
+    fn load(
+        &mut self,
+        backend: &RingboardBackend,
+        cache: &mut SummaryCache,
+        entry: Entry,
+        reader: &mut EntryReader,
+    ) -> BackendResult<()> {
+        let raw_id = entry.id();
+        if let Some(summary) =
+            backend.cached_summary(cache, entry, reader, self.current_id == Some(raw_id))?
+        {
+            self.add(raw_id, summary);
+        }
+        Ok(())
     }
 }
 
@@ -282,30 +308,17 @@ impl RingboardBackend {
             matched: 0,
             current: None,
             entries: Vec::with_capacity(limit),
+            bindings: HashMap::new(),
+            thumbnails: Vec::new(),
         };
-        let mut current_ids = HashMap::new();
-        let mut valid_thumbnails = Vec::new();
         let mut cache = self.summaries.lock().map_err(|_| lock_error())?;
         cache.select_token(token);
         for entry in database.favorites().rev().chain(main) {
-            let raw_id = entry.id();
-            if let Some(summary) =
-                self.cached_summary(&mut cache, entry, &mut reader, current_id == Some(raw_id))?
-            {
-                current_ids.insert(
-                    summary.id.clone(),
-                    IdentityBinding {
-                        raw_id,
-                        revision: summary.revision,
-                    },
-                );
-                valid_thumbnails.push((summary.id.clone(), summary.revision));
-                results.add(raw_id, summary);
-            }
+            results.load(self, &mut cache, entry, &mut reader)?;
         }
         drop(cache);
-        *self.ids.lock().map_err(|_| lock_error())? = current_ids;
-        prune_thumbnails(&valid_thumbnails);
+        *self.ids.lock().map_err(|_| lock_error())? = std::mem::take(&mut results.bindings);
+        prune_thumbnails(&results.thumbnails);
         Ok(HistoryPage {
             revision: self.revision_for(token)?,
             generation: query.generation,

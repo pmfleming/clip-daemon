@@ -72,3 +72,20 @@ A full Rust Quality Lens pass after the phase-5 refactor reduced the largest fun
 The API now delegates session policy to the action service, raising API locality from 97.0 to 100.0 and leverage from 57.5 to 60.5. Token-clone records fell from 115 to 41, escape hatches remain at zero, and Rust source lines fell from 3,224 to 3,203. All 12 tests pass with no unknown results.
 
 Generated JSON remains under ignored `target/analysis/` and is intentionally not committed.
+
+## Subscription, query, and coverage follow-up
+
+The 2026-07-25 follow-up added deterministic subscription state tests, isolated subscription task lifecycle and change-state transitions, and moved Ringboard query bookkeeping into `QueryAccumulator`. The development shell now includes `cargo-llvm-cov` and matching LLVM tools, so Rust Quality Lens coverage is complete rather than partial.
+
+| Signal | Before | After |
+|---|---:|---:|
+| maximum function hotspot | 45.86 | 37.69 |
+| subscription startup | 45.86 | 3.92 |
+| Ringboard history query | 44.91 | 30.74 |
+| subscription history polling | 43.62 | 18.03 |
+| aggregate function effort | 2661.65 | 2618.81 |
+| functions scoring at least 35 | 7 | 4 |
+| clone records | 39 | 39 |
+| average locality | 99.83 | 99.83 |
+
+Coverage now reports 40.48% of lines, 42.51% of functions, and 40.19% of regions across 17 Rust files. All 30 discovered tests pass with no failed or unknown results, and escape-hatch count remains zero. The enabled partial-input and test-failure policies pass; the architecture map still reports the Ringboard module's aggregate 615.7 score above the informational 600 threshold.
