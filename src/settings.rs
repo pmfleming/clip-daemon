@@ -338,11 +338,7 @@ fn stage_write(
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
             .map_err(|_| format!("{label} directory permissions could not be set"))?;
     }
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("{label} path is invalid"))?;
-    let temp = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    let temp = parent.join(format!(".{}.tmp", Uuid::new_v4()));
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)

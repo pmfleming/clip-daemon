@@ -17,7 +17,7 @@ use crate::{
         BackendError, BackendErrorKind, BackendMutation, BackendResult, ClipboardBackend,
         HistoryQuery, MAX_QUERY_LIMIT, ScreenshotRegion,
     },
-    classification::{INSPECTION_LIMIT, bounded_preview, classify},
+    classification::{INSPECTION_LIMIT, bounded_preview},
     model::{
         BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
     },
@@ -29,7 +29,7 @@ mod mutation;
 
 use content::{
     create_file_thumbnail, create_thumbnail, detail_facts, detected_image_mime, invalid_entry,
-    prune_thumbnails, read_bounded,
+    is_inline_image_mime, prune_thumbnails, read_bounded, semantic_kind,
 };
 
 const DEFAULT_MIME: &str = "text/plain";
@@ -221,10 +221,11 @@ impl RingboardBackend {
             .unwrap_or(DEFAULT_MIME);
         let fingerprint = entry_fingerprint(entry.id(), byte_size, mime, &bytes);
         let id = opaque_id(&fingerprint);
+        let kind = semantic_kind(mime, &bytes);
         Ok(EntrySummary {
             revision: entry_revision(&fingerprint),
             id,
-            kind: classify(mime, &bytes),
+            kind,
             mime: mime.to_owned(),
             byte_size,
             favorite: entry.ring()
@@ -350,10 +351,12 @@ impl RingboardBackend {
         let mut loaded = entry
             .to_file(&mut reader)
             .map_err(|_| invalid_entry("Could not open clipboard image"))?;
-        match summary.kind {
-            crate::model::EntryKind::Image => create_thumbnail(&loaded, &summary, edge),
-            crate::model::EntryKind::Files => create_file_thumbnail(&mut loaded, &summary, edge),
-            _ => Err(invalid_entry("Clipboard entry cannot be thumbnailed")),
+        if summary.kind == crate::model::EntryKind::Image && !is_inline_image_mime(&summary.mime) {
+            create_file_thumbnail(&mut loaded, &summary, edge)
+        } else if summary.kind == crate::model::EntryKind::Image {
+            create_thumbnail(&loaded, &summary, edge)
+        } else {
+            Err(invalid_entry("Clipboard entry cannot be thumbnailed"))
         }
     }
 

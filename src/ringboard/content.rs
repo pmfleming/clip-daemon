@@ -11,7 +11,8 @@ use image::{DynamicImage, ImageReader, Limits};
 use url::Url;
 
 use crate::{
-    backend::{BackendError, BackendErrorKind, BackendResult},
+    backend::{BackendError, BackendErrorKind, BackendResult, MAX_WAYLAND_SELECTION_BYTES},
+    classification::classify,
     model::{EntryKind, EntrySummary, EntryThumbnail, FilePreview, ImageMetadata},
 };
 
@@ -19,6 +20,12 @@ use super::{INSPECTION_LIMIT, MAX_FILES, MAX_THUMBNAIL_BYTES};
 
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_DECODED_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
+
+pub(super) struct LocalImageSource {
+    pub path: PathBuf,
+    pub mime: &'static str,
+    pub dimensions: ImageMetadata,
+}
 
 pub(super) fn read_bounded(file: &mut File, limit: usize) -> BackendResult<Vec<u8>> {
     let mut bytes = Vec::with_capacity(limit.min(INSPECTION_LIMIT));
@@ -43,15 +50,26 @@ pub(super) fn detected_image_mime(bytes: &[u8]) -> Option<&'static str> {
         .map(|format| format.to_mime_type())
 }
 
+pub(super) fn semantic_kind(mime: &str, bytes: &[u8]) -> EntryKind {
+    local_image_source(mime, bytes, MAX_WAYLAND_SELECTION_BYTES)
+        .map(|_| EntryKind::Image)
+        .unwrap_or_else(|| classify(mime, bytes))
+}
+
 pub(super) fn detail_facts(
     summary: &EntrySummary,
     bytes: &[u8],
 ) -> (Vec<FilePreview>, Option<ImageMetadata>) {
+    if accepts_local_image_mime(&summary.mime) {
+        let files = parse_files(&summary.mime, bytes);
+        if let Some(source) = local_image_source_from_files(&files, MAX_THUMBNAIL_BYTES) {
+            return (files, Some(source.dimensions));
+        }
+        if is_file_list_mime(&summary.mime) {
+            return (files, None);
+        }
+    }
     match summary.kind {
-        EntryKind::Files => (
-            parse_files(&summary.mime, bytes),
-            image_file_path(&summary.mime, bytes).and_then(|path| image_file_dimensions(&path)),
-        ),
         EntryKind::Image => (Vec::new(), image_dimensions(bytes)),
         _ => (Vec::new(), None),
     }
@@ -73,23 +91,11 @@ pub(super) fn create_file_thumbnail(
     summary: &EntrySummary,
     edge: u32,
 ) -> BackendResult<EntryThumbnail> {
-    if summary.kind != EntryKind::Files {
-        return Err(invalid_entry("Clipboard entry cannot be thumbnailed"));
-    }
     let bytes = read_bounded(file, INSPECTION_LIMIT)?;
-    let path = image_file_path(&summary.mime, &bytes)
+    let source = local_image_source(&summary.mime, &bytes, MAX_THUMBNAIL_BYTES)
         .ok_or_else(|| invalid_entry("Clipboard file is not a local image"))?;
-    let image_file =
-        File::open(&path).map_err(|_| invalid_entry("Clipboard image file could not be opened"))?;
-    if image_file
-        .metadata()
-        .map(|metadata| metadata.len() > MAX_THUMBNAIL_BYTES)
-        .unwrap_or(true)
-    {
-        return Err(invalid_entry(
-            "Clipboard image file is too large to preview",
-        ));
-    }
+    let image_file = File::open(&source.path)
+        .map_err(|_| invalid_entry("Clipboard image file could not be opened"))?;
     create_thumbnail_from_image(&image_file, summary, edge)
 }
 
@@ -125,7 +131,7 @@ fn create_thumbnail_from_image(
     })
 }
 
-fn cached_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+fn cached_dimensions(path: &Path) -> Option<(u32, u32)> {
     ImageReader::open(path)
         .and_then(ImageReader::with_guessed_format)
         .ok()?
@@ -191,29 +197,54 @@ fn file_preview(uri: &str, operation: &str) -> Option<FilePreview> {
     })
 }
 
-fn image_file_path(mime: &str, bytes: &[u8]) -> Option<PathBuf> {
-    let files = parse_files(mime, bytes);
-    let [file] = files.as_slice() else {
-        return None;
-    };
-    if !file.exists {
-        return None;
-    }
-    let path = Url::parse(&file.uri).ok()?.to_file_path().ok()?;
-    path.is_file().then_some(path)
+fn is_file_list_mime(mime: &str) -> bool {
+    matches!(
+        normalized_mime(mime),
+        "text/uri-list" | "x-special/gnome-copied-files"
+    )
 }
 
-fn image_file_dimensions(path: &Path) -> Option<ImageMetadata> {
-    let metadata = path.metadata().ok()?;
-    if metadata.len() > MAX_THUMBNAIL_BYTES {
-        return None;
-    }
-    let mut reader = ImageReader::open(path)
+fn accepts_local_image_mime(mime: &str) -> bool {
+    is_file_list_mime(mime) || normalized_mime(mime) == "text/plain"
+}
+
+pub(super) fn is_inline_image_mime(mime: &str) -> bool {
+    normalized_mime(mime).starts_with("image/")
+}
+
+fn normalized_mime(mime: &str) -> &str {
+    mime.split(';').next().unwrap_or(mime).trim()
+}
+
+pub(super) fn local_image_source(
+    mime: &str,
+    bytes: &[u8],
+    max_bytes: u64,
+) -> Option<LocalImageSource> {
+    accepts_local_image_mime(mime)
+        .then(|| parse_files(mime, bytes))
+        .and_then(|files| local_image_source_from_files(&files, max_bytes))
+}
+
+fn local_image_source_from_files(
+    files: &[FilePreview],
+    max_bytes: u64,
+) -> Option<LocalImageSource> {
+    let [file] = files else { return None };
+    let path = Url::parse(&file.uri).ok()?.to_file_path().ok()?;
+    let metadata = path.symlink_metadata().ok()?;
+    (metadata.file_type().is_file() && metadata.len() <= max_bytes).then_some(())?;
+    let mut reader = ImageReader::open(&path)
         .and_then(ImageReader::with_guessed_format)
         .ok()?;
+    let format = reader.format()?;
     reader.limits(image_decode_limits());
     let (width, height) = reader.into_dimensions().ok()?;
-    Some(ImageMetadata { width, height })
+    Some(LocalImageSource {
+        path,
+        mime: format.to_mime_type(),
+        dimensions: ImageMetadata { width, height },
+    })
 }
 
 fn image_dimensions(bytes: &[u8]) -> Option<ImageMetadata> {
@@ -233,7 +264,7 @@ pub(super) fn prune_thumbnails(valid: &[(String, u64)]) {
     prune_thumbnail_directory(&directory, valid);
 }
 
-fn prune_thumbnail_directory(directory: &std::path::Path, valid: &[(String, u64)]) {
+fn prune_thumbnail_directory(directory: &Path, valid: &[(String, u64)]) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
@@ -276,7 +307,7 @@ fn cache_root() -> BackendResult<PathBuf> {
         .ok_or_else(|| BackendError::unavailable("Clipboard cache directory is unavailable"))
 }
 
-fn private_permissions(path: &std::path::Path, mode: u32) -> BackendResult<()> {
+fn private_permissions(path: &Path, mode: u32) -> BackendResult<()> {
     fs::set_permissions(path, Permissions::from_mode(mode))
         .map_err(|_| BackendError::unavailable("Clipboard thumbnail cache is unavailable"))
 }
@@ -290,12 +321,13 @@ mod tests {
     use std::{
         fs::File,
         io::{Seek, SeekFrom, Write},
+        os::unix::fs::symlink,
     };
 
     use super::{
         MAX_DECODED_IMAGE_BYTES, MAX_IMAGE_DIMENSION, detected_image_mime, file_preview,
-        image_decode_limits, image_file_dimensions, image_file_path, parse_files,
-        prune_thumbnail_directory, read_bounded,
+        image_decode_limits, local_image_source, parse_files, prune_thumbnail_directory,
+        read_bounded, semantic_kind,
     };
 
     #[test]
@@ -339,16 +371,29 @@ mod tests {
         let uri = url::Url::from_file_path(&path)
             .expect("file URL")
             .to_string();
+        let inspect = |mime, value: &str| local_image_source(mime, value.as_bytes(), 1024 * 1024);
+        let uri_list = format!("{uri}\r\n");
+        let source = inspect("text/uri-list", &uri_list).expect("local image source");
 
-        let detected = image_file_path("text/uri-list", format!("{uri}\r\n").as_bytes())
-            .expect("local image path");
-        let dimensions = image_file_dimensions(&detected).expect("image dimensions");
-
-        assert_eq!(detected, path);
-        assert_eq!((dimensions.width, dimensions.height), (7, 5));
-        assert!(
-            image_file_path("text/uri-list", format!("{uri}\r\n{uri}\r\n").as_bytes()).is_none()
+        assert_eq!(source.path, path);
+        assert_eq!(source.mime, "image/png");
+        assert_eq!((source.dimensions.width, source.dimensions.height), (7, 5));
+        assert_eq!(
+            semantic_kind("text/uri-list", uri_list.as_bytes()),
+            crate::model::EntryKind::Image
         );
+        assert_eq!(
+            semantic_kind("text/plain", format!("{uri}\n").as_bytes()),
+            crate::model::EntryKind::Image
+        );
+        assert!(inspect("text/uri-list", &format!("{uri}\r\n{uri}\r\n")).is_none());
+
+        let symlink_path = directory.path().join("screenshot-link.png");
+        symlink(&path, &symlink_path).expect("image symlink");
+        let symlink_uri = url::Url::from_file_path(symlink_path)
+            .expect("symlink URL")
+            .to_string();
+        assert!(inspect("text/uri-list", &format!("{symlink_uri}\r\n")).is_none());
     }
 
     #[test]

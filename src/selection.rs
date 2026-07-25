@@ -4,7 +4,7 @@ use wl_clipboard_rs::copy::{ClipboardType, MimeType, Options, Seat, Source};
 
 use crate::backend::{BackendError, BackendErrorKind, BackendResult};
 
-pub const MAX_WAYLAND_SELECTION_BYTES: u64 = 64 * 1024 * 1024;
+pub use crate::backend::MAX_WAYLAND_SELECTION_BYTES;
 
 pub trait SelectionPublisher: Send + Sync {
     fn publish(&self, mime: &str, bytes: Vec<u8>) -> BackendResult<()>;
@@ -92,23 +92,29 @@ fn validate_size(size: u64, configured_limit: u64) -> BackendResult<()> {
 }
 
 fn validate_mime(mime: &str) -> BackendResult<()> {
-    let valid_ascii = !mime.is_empty()
+    (valid_mime_ascii(mime) && valid_mime_essence(mime))
+        .then_some(())
+        .ok_or_else(|| {
+            BackendError::new(
+                BackendErrorKind::InvalidData,
+                "Clipboard MIME type is invalid for Wayland publishing",
+            )
+        })
+}
+
+fn valid_mime_ascii(mime: &str) -> bool {
+    !mime.is_empty()
         && mime.len() <= 255
         && mime
             .bytes()
-            .all(|byte| byte.is_ascii() && !byte.is_ascii_control());
-    let essence = mime.split(';').next().unwrap_or_default().trim();
-    let mut parts = essence.split('/');
-    let valid_essence = parts.next().is_some_and(valid_mime_token)
+            .all(|byte| byte.is_ascii() && !byte.is_ascii_control())
+}
+
+fn valid_mime_essence(mime: &str) -> bool {
+    let mut parts = mime.split(';').next().unwrap_or_default().trim().split('/');
+    parts.next().is_some_and(valid_mime_token)
         && parts.next().is_some_and(valid_mime_token)
-        && parts.next().is_none();
-    if !valid_ascii || !valid_essence {
-        return Err(BackendError::new(
-            BackendErrorKind::InvalidData,
-            "Clipboard MIME type is invalid for Wayland publishing",
-        ));
-    }
-    Ok(())
+        && parts.next().is_none()
 }
 
 fn valid_mime_token(value: &str) -> bool {

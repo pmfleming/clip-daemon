@@ -30,7 +30,11 @@ use crate::{
     selection::{SelectionService, effective_limit},
 };
 
-use super::{MAX_THUMBNAIL_BYTES, OperationTask, RingboardBackend, invalid_entry, run_blocking};
+use super::{
+    MAX_THUMBNAIL_BYTES, OperationTask, RingboardBackend,
+    content::{LocalImageSource, is_inline_image_mime, local_image_source},
+    invalid_entry, run_blocking,
+};
 
 pub(super) struct AnnotationStage {
     input: PathBuf,
@@ -63,9 +67,8 @@ impl RingboardBackend {
         expected_revision: Option<u64>,
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
-        let (entry, mut reader, summary) = self.selected(opaque_id, expected_revision)?;
-        let bytes = read_entry(entry, &mut reader, max_bytes)?;
-        self.selection.publish(&summary.mime, bytes, max_bytes)?;
+        let (summary, bytes) = selected_bytes(self, opaque_id, expected_revision, max_bytes)?;
+        publish_entry(&self.selection, summary, bytes, max_bytes)?;
         self.clear_identity_state()?;
         Ok(completed(
             "copy",
@@ -79,28 +82,20 @@ impl RingboardBackend {
         expected_revision: Option<u64>,
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
-        let (entry, mut reader, summary) = self.selected(opaque_id, expected_revision)?;
-        if summary.kind != EntryKind::Image {
-            return Err(invalid_entry("Only image entries can be saved as files"));
-        }
-        let directory = image_directory()?;
-        let path = unique_path(&directory, image_extension(&summary.mime));
-        let mut publish = || {
-            copy_entry(entry, &mut reader, &path, max_bytes)?;
-            let uri = Url::from_file_path(&path)
-                .map_err(|_| operation_error("Could not create image file URI"))?;
-            self.selection.publish(
-                "text/uri-list",
-                format!("{uri}\r\n").into_bytes(),
-                max_bytes,
-            )
-        };
-        if let Err(error) = publish() {
+        let (summary, bytes) = selected_image(self, opaque_id, expected_revision, max_bytes)?;
+        let (path, created) = prepare_image_file(&summary.mime, &bytes, max_bytes)?;
+        let published = publish_image_uri(&self.selection, &path, max_bytes);
+        if published.is_err() && created {
             let _ = fs::remove_file(&path);
-            return Err(error);
         }
+        published?;
         self.clear_identity_state()?;
-        let mut result = OperationResult::completed("image-as-file", "Image file copied");
+        let message = if created {
+            "Image file copied"
+        } else {
+            "Image file link copied"
+        };
+        let mut result = OperationResult::completed("image-as-file", message);
         result.path = Some(path.to_string_lossy().into_owned());
         Ok(result)
     }
@@ -149,25 +144,25 @@ impl RingboardBackend {
         expected_revision: Option<u64>,
         max_bytes: u64,
     ) -> BackendResult<AnnotationStage> {
-        let (entry, mut reader, summary) = self.selected(opaque_id, expected_revision)?;
-        if summary.kind != EntryKind::Image {
-            return Err(invalid_entry("Only image entries can be annotated"));
-        }
+        let limit = max_bytes.min(MAX_THUMBNAIL_BYTES);
+        let (summary, bytes) = selected_image(self, opaque_id, expected_revision, limit)?;
+        let revision = summary.revision;
+        let (mime, image_bytes) = if is_inline_image_mime(&summary.mime) {
+            (summary.mime, bytes)
+        } else {
+            let source = require_local_image(&summary.mime, &bytes, limit)?;
+            (source.mime.into(), read_path(&source.path, limit)?)
+        };
         let directory = runtime_directory("clip-daemon/edits")?;
-        let input = unique_path(&directory, image_extension(&summary.mime));
+        let input = unique_path(&directory, image_extension(&mime));
         let output = unique_path(&directory, "png");
-        copy_entry(
-            entry,
-            &mut reader,
-            &input,
-            max_bytes.min(MAX_THUMBNAIL_BYTES),
-        )?;
+        write_private(&input, &image_bytes)?;
         Ok(AnnotationStage {
             input,
             output,
             opaque_id: opaque_id.to_owned(),
-            revision: summary.revision,
-            max_bytes: max_bytes.min(MAX_THUMBNAIL_BYTES),
+            revision,
+            max_bytes: limit,
         })
     }
 
@@ -390,15 +385,94 @@ fn socket_address(path: PathBuf) -> BackendResult<SocketAddrUnix> {
     SocketAddrUnix::new(path).map_err(operation_error)
 }
 
+fn selected_bytes(
+    backend: &RingboardBackend,
+    opaque_id: &str,
+    expected_revision: Option<u64>,
+    max_bytes: u64,
+) -> BackendResult<(crate::model::EntrySummary, Vec<u8>)> {
+    let (entry, mut reader, summary) = backend.selected(opaque_id, expected_revision)?;
+    let bytes = read_entry(entry, &mut reader, max_bytes)?;
+    Ok((summary, bytes))
+}
+
+fn selected_image(
+    backend: &RingboardBackend,
+    opaque_id: &str,
+    expected_revision: Option<u64>,
+    max_bytes: u64,
+) -> BackendResult<(crate::model::EntrySummary, Vec<u8>)> {
+    let selected = selected_bytes(backend, opaque_id, expected_revision, max_bytes)?;
+    (selected.0.kind == EntryKind::Image)
+        .then_some(selected)
+        .ok_or_else(|| invalid_entry("Only image entries support this action"))
+}
+
+fn publish_entry(
+    selection: &SelectionService,
+    summary: crate::model::EntrySummary,
+    bytes: Vec<u8>,
+    max_bytes: u64,
+) -> BackendResult<()> {
+    if summary.kind != EntryKind::Image || is_inline_image_mime(&summary.mime) {
+        return selection.publish(&summary.mime, bytes, max_bytes);
+    }
+    let source = require_local_image(&summary.mime, &bytes, max_bytes)?;
+    selection.publish_file(source.mime, &source.path, max_bytes)
+}
+
+fn prepare_image_file(mime: &str, bytes: &[u8], max_bytes: u64) -> BackendResult<(PathBuf, bool)> {
+    if !is_inline_image_mime(mime) {
+        return Ok((require_local_image(mime, bytes, max_bytes)?.path, false));
+    }
+    let path = unique_path(&image_directory()?, image_extension(mime));
+    write_private(&path, bytes)?;
+    Ok((path, true))
+}
+
+fn publish_image_uri(
+    selection: &SelectionService,
+    path: &Path,
+    max_bytes: u64,
+) -> BackendResult<()> {
+    let uri = Url::from_file_path(path)
+        .map_err(|_| operation_error("Could not create image file URI"))?;
+    selection.publish(
+        "text/uri-list",
+        format!("{uri}\r\n").into_bytes(),
+        max_bytes,
+    )
+}
+
+fn require_local_image(
+    mime: &str,
+    bytes: &[u8],
+    max_bytes: u64,
+) -> BackendResult<LocalImageSource> {
+    local_image_source(mime, bytes, effective_limit(max_bytes)).ok_or_else(|| {
+        invalid_entry("Clipboard image file is missing, unsafe, invalid, or exceeds the size limit")
+    })
+}
+
 fn read_entry(entry: Entry, reader: &mut EntryReader, max_bytes: u64) -> BackendResult<Vec<u8>> {
     let mut source = entry.to_file(reader).map_err(operation_error)?;
     let size = source.metadata().map_err(operation_error)?.len();
+    read_source(&mut *source, size, max_bytes)
+}
+
+fn read_path(path: &Path, max_bytes: u64) -> BackendResult<Vec<u8>> {
+    let mut source = File::open(path).map_err(operation_error)?;
+    let size = source.metadata().map_err(operation_error)?.len();
+    read_source(&mut source, size, max_bytes)
+}
+
+fn read_source(source: impl Read, size: u64, max_bytes: u64) -> BackendResult<Vec<u8>> {
     let limit = effective_limit(max_bytes);
     if size > limit {
         return Err(selection_size_error(size, limit));
     }
     let mut bytes = Vec::with_capacity(size as usize);
-    (&mut *source)
+    source
         .take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(operation_error)?;
@@ -406,18 +480,6 @@ fn read_entry(entry: Entry, reader: &mut EntryReader, max_bytes: u64) -> Backend
         return Err(selection_size_error(bytes.len() as u64, limit));
     }
     Ok(bytes)
-}
-
-fn copy_entry(
-    entry: Entry,
-    reader: &mut EntryReader,
-    path: &Path,
-    max_bytes: u64,
-) -> BackendResult<()> {
-    let bytes = read_entry(entry, reader, max_bytes)?;
-    private_file(path)?
-        .write_all(&bytes)
-        .map_err(operation_error)
 }
 
 fn selection_size_error(size: u64, limit: u64) -> BackendError {
@@ -483,6 +545,15 @@ fn private_file(path: &Path) -> BackendResult<File> {
         .mode(0o600)
         .open(path)
         .map_err(operation_error)
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> BackendResult<()> {
+    let result =
+        private_file(path).and_then(|mut file| file.write_all(bytes).map_err(operation_error));
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
 }
 
 fn unique_path(directory: &Path, extension: &str) -> PathBuf {

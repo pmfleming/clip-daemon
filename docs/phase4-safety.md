@@ -15,7 +15,9 @@
   explicitly after a successful commit. Size limits are validated and persisted.
 - Annotation output is accepted only when it is a decodable image no larger than 32 MiB.
   Image inspection and thumbnail decoding cap dimensions at 16,384 pixels per edge and decoded
-  allocation at 128 MiB. Temporary files and thumbnails are private and cancellable.
+  allocation at 128 MiB. A file-backed image is dereferenced only when its file-list or plain-text
+  URI names exactly one local, non-symlink regular file that passes size, format, and dimension
+  validation; each operation revalidates it. Temporary files and thumbnails are private and cancellable.
 - Current entries can be pinned through the same favorite transaction.
 
 ## Ringboard and compositor boundaries

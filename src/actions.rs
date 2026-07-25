@@ -209,7 +209,7 @@ impl ClipboardService {
         let details = self
             .load_details(&params.entry_id, Some(params.revision))
             .await?;
-        validate_action_kind(details.entry.kind, &params.action)?;
+        validate_action(&details, &params.action)?;
         self.execute_action(params, details, max_entry_bytes).await
     }
 
@@ -483,13 +483,14 @@ fn launch_error(message: &'static str) -> ApiError {
     BackendError::new(BackendErrorKind::OperationFailed, message).into()
 }
 
-fn validate_action_kind(kind: EntryKind, action: &str) -> Result<(), ApiError> {
+fn validate_action(details: &EntryDetails, action: &str) -> Result<(), ApiError> {
+    let kind = details.entry.kind;
     let allowed = match action {
         "copy" | "delete" | "favorite" | "unfavorite" | "pin-current" | "cleanup" => true,
         "paste" => kind != EntryKind::Binary,
         "image-as-file" | "annotate" => kind == EntryKind::Image,
         "open-url" => kind == EntryKind::Link,
-        "open-file" | "reveal-file" => kind == EntryKind::Files,
+        "open-file" | "reveal-file" => !details.files.is_empty(),
         _ => false,
     };
     allowed

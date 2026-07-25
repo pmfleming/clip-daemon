@@ -107,77 +107,54 @@ async fn poll_history(
         timer.tick().await;
         match api_service.change_token().await {
             Ok(token) => {
-                let recovered = std::mem::replace(&mut unavailable, false);
-                let changed = previous.replace(token).is_some_and(|value| value != token);
-                if recovered || changed {
-                    emit_changes(&emitter, &event_revision, &subscription_id, requested).await;
+                if history_changed(&mut previous, &mut unavailable, token) {
+                    let revision =
+                        event_revision.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    emit_requested(
+                        &emitter,
+                        &subscription_id,
+                        requested,
+                        ("reset", "changed"),
+                        json!({ "data": { "revision": revision, "change": "reset" } }),
+                    )
+                    .await;
                 }
             }
             Err(error) if !unavailable => {
                 unavailable = true;
-                emit_unavailable(&emitter, &subscription_id, requested, error).await;
+                emit_requested(
+                    &emitter,
+                    &subscription_id,
+                    requested,
+                    ("unavailable", "unavailable"),
+                    error,
+                )
+                .await;
             }
             Err(_) => {}
         }
     }
 }
 
-async fn emit_changes(
-    emitter: &SignalEmitter<'_>,
-    event_revision: &std::sync::atomic::AtomicU64,
-    subscription_id: &str,
-    requested: RequestedStreams,
-) {
-    let revision = event_revision.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    let data = Some(json!({ "data": { "revision": revision, "change": "reset" } }));
-    if requested.history {
-        emit_event(
-            emitter,
-            protocol::stream::HISTORY,
-            "reset",
-            subscription_id,
-            data.clone(),
-        )
-        .await;
-    }
-    if requested.current {
-        emit_event(
-            emitter,
-            protocol::stream::CURRENT,
-            "changed",
-            subscription_id,
-            data,
-        )
-        .await;
-    }
+fn history_changed(previous: &mut Option<u64>, unavailable: &mut bool, token: u64) -> bool {
+    std::mem::replace(unavailable, false)
+        || previous.replace(token).is_some_and(|value| value != token)
 }
 
-async fn emit_unavailable(
+async fn emit_requested(
     emitter: &SignalEmitter<'_>,
     subscription_id: &str,
     requested: RequestedStreams,
-    error: serde_json::Value,
+    events: (&str, &str),
+    data: serde_json::Value,
 ) {
-    let data = Some(error);
-    if requested.history {
-        emit_event(
-            emitter,
-            protocol::stream::HISTORY,
-            "unavailable",
-            subscription_id,
-            data.clone(),
-        )
-        .await;
-    }
-    if requested.current {
-        emit_event(
-            emitter,
-            protocol::stream::CURRENT,
-            "unavailable",
-            subscription_id,
-            data,
-        )
-        .await;
+    for (enabled, stream, event) in [
+        (requested.history, protocol::stream::HISTORY, events.0),
+        (requested.current, protocol::stream::CURRENT, events.1),
+    ] {
+        if enabled {
+            emit_event(emitter, stream, event, subscription_id, Some(data.clone())).await;
+        }
     }
 }
 
