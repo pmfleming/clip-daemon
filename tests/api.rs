@@ -13,7 +13,12 @@ fn entry(id: &str, kind: EntryKind, text: Option<&str>) -> EntryDetails {
             id: id.into(),
             revision: 1,
             kind,
-            mime: "text/plain".into(),
+            mime: if kind == EntryKind::Image {
+                "image/png"
+            } else {
+                "text/plain"
+            }
+            .into(),
             byte_size: 4,
             favorite: false,
             current: false,
@@ -71,6 +76,7 @@ async fn edit_and_type_action_policy_are_daemon_enforced() {
     let backend = FakeBackend::with_entries(vec![
         entry("text", EntryKind::Text, Some("old")),
         entry("link", EntryKind::Link, Some("not a URL")),
+        entry("image", EntryKind::Image, None),
         entry("binary", EntryKind::Binary, None),
     ]);
     let api = ApiService::new(Arc::new(backend));
@@ -106,4 +112,33 @@ async fn edit_and_type_action_policy_are_daemon_enforced() {
         )
         .await;
     assert_eq!(malformed_url["error"]["code"], "invalid-entry");
+
+    let missing_session = api
+        .dispatch(
+            "clipboard.entry.action",
+            json!({
+                "entry_id":"image","revision":1,"action":"image-as-file","session_id":null
+            }),
+        )
+        .await;
+    assert_eq!(missing_session["error"]["code"], "validation-error");
+
+    let session = api.dispatch("clipboard.session.begin", json!({})).await;
+    let session_id = session["data"]["session"]["id"].as_str().unwrap();
+    for action in ["paste", "image-as-file"] {
+        let result = api
+            .dispatch(
+                "clipboard.entry.action",
+                json!({
+                    "entry_id":"image", "revision":1, "action":action,
+                    "session_id":session_id
+                }),
+            )
+            .await;
+        assert_eq!(result["data"]["operation"]["action"], action);
+        assert!(matches!(
+            result["data"]["operation"]["status"].as_str(),
+            Some("completed" | "paste-prepared")
+        ));
+    }
 }

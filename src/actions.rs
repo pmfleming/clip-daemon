@@ -215,7 +215,7 @@ impl ClipboardService {
         ) {
             return launch_action(&params, &details).await;
         }
-        if params.action == "paste" {
+        if matches!(params.action.as_str(), "paste" | "image-as-file") {
             return self.paste(params).await;
         }
         let mutation = BackendMutation::for_action(&params.action)
@@ -238,18 +238,24 @@ impl ClipboardService {
             .prepare_paste(session_id)
             .await
             .map_err(stale_target)?;
+        let image_as_file = params.action == "image-as-file";
+        let mutation = if image_as_file {
+            BackendMutation::ImageAsFile
+        } else {
+            BackendMutation::Restore
+        };
         let mut operation = self
             .backend
-            .mutate(
-                &params.entry_id,
-                Some(params.revision),
-                BackendMutation::Restore,
-            )
+            .mutate(&params.entry_id, Some(params.revision), mutation)
             .await?;
-        let feedback = if has_target {
-            ("paste-prepared", "Paste prepared; hide the picker")
-        } else {
-            ("completed", "Copied; paste manually")
+        let feedback = match (has_target, image_as_file) {
+            (true, true) => (
+                "paste-prepared",
+                "Image file link prepared; hide the picker",
+            ),
+            (true, false) => ("paste-prepared", "Paste prepared; hide the picker"),
+            (false, true) => ("completed", "Image file link copied; paste manually"),
+            (false, false) => ("completed", "Copied; paste manually"),
         };
         operation.status = feedback.0.into();
         operation.message = feedback.1.into();
