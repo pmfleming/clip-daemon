@@ -59,7 +59,10 @@ impl ApiService {
             "clipboard.entry.details" => self.actions.details(decode(params)?).await,
             "clipboard.entry.thumbnail" => self.actions.thumbnail(decode(params)?).await,
             value if value.starts_with("clipboard.entry.") => {
-                self.actions.dispatch_entry(value, params).await
+                let max_entry_bytes = self.settings.get().map_err(settings_error)?.max_entry_bytes;
+                self.actions
+                    .dispatch_entry(value, params, max_entry_bytes)
+                    .await
             }
             value if value.starts_with("clipboard.session.") => {
                 self.actions.dispatch_session(value, params).await
@@ -83,7 +86,10 @@ impl ApiService {
         match method {
             "clipboard.capture.setPaused" => self.set_paused(decode(params)?).await,
             "clipboard.capture.screenshot" => {
-                self.actions.capture_screenshot(decode(params)?).await
+                let max_entry_bytes = self.settings.get().map_err(settings_error)?.max_entry_bytes;
+                self.actions
+                    .capture_screenshot(decode(params)?, max_entry_bytes)
+                    .await
             }
             "clipboard.settings.get" => self.get_settings(),
             "clipboard.settings.update" => self.update_settings(decode(params)?).await,

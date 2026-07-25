@@ -73,13 +73,18 @@ impl ClipboardService {
         }
     }
 
-    pub async fn dispatch_entry(&self, method: &str, params: Value) -> Result<Value, ApiError> {
+    pub async fn dispatch_entry(
+        &self,
+        method: &str,
+        params: Value,
+        max_entry_bytes: u64,
+    ) -> Result<Value, ApiError> {
         self.edits
             .lock()
             .await
             .retain(|_, lease| lease.expires > Instant::now());
         match method {
-            "clipboard.entry.action" => self.action(decode(params)?).await,
+            "clipboard.entry.action" => self.action(decode(params)?, max_entry_bytes).await,
             "clipboard.entry.edit.begin" => self.begin_edit(decode(params)?).await,
             "clipboard.entry.edit.commit" => self.commit_edit(decode(params)?).await,
             "clipboard.entry.edit.cancel" => self.cancel_edit(decode(params)?).await,
@@ -155,6 +160,7 @@ impl ClipboardService {
     pub(crate) async fn capture_screenshot(
         &self,
         params: ScreenshotParams,
+        max_entry_bytes: u64,
     ) -> Result<Value, ApiError> {
         if !(1..=MAX_SCREENSHOT_EDGE).contains(&params.width)
             || !(1..=MAX_SCREENSHOT_EDGE).contains(&params.height)
@@ -165,12 +171,15 @@ impl ClipboardService {
         }
         let operation = self
             .backend
-            .capture_screenshot(ScreenshotRegion {
-                x: params.x,
-                y: params.y,
-                width: params.width,
-                height: params.height,
-            })
+            .capture_screenshot(
+                ScreenshotRegion {
+                    x: params.x,
+                    y: params.y,
+                    width: params.width,
+                    height: params.height,
+                },
+                max_entry_bytes,
+            )
             .await?;
         Ok(json!({ "operation": operation }))
     }
@@ -196,18 +205,19 @@ impl ClipboardService {
         self.edits.lock().await.clear();
     }
 
-    async fn action(&self, params: ActionParams) -> Result<Value, ApiError> {
+    async fn action(&self, params: ActionParams, max_entry_bytes: u64) -> Result<Value, ApiError> {
         let details = self
             .load_details(&params.entry_id, Some(params.revision))
             .await?;
         validate_action_kind(details.entry.kind, &params.action)?;
-        self.execute_action(params, details).await
+        self.execute_action(params, details, max_entry_bytes).await
     }
 
     async fn execute_action(
         &self,
         params: ActionParams,
         details: EntryDetails,
+        max_entry_bytes: u64,
     ) -> Result<Value, ApiError> {
         if matches!(
             params.action.as_str(),
@@ -216,9 +226,9 @@ impl ClipboardService {
             return launch_action(&params, &details).await;
         }
         if matches!(params.action.as_str(), "paste" | "image-as-file") {
-            return self.paste(params).await;
+            return self.paste(params, max_entry_bytes).await;
         }
-        let mutation = BackendMutation::for_action(&params.action)
+        let mutation = BackendMutation::for_action(&params.action, max_entry_bytes)
             .ok_or_else(|| ApiError::validation("unsupported entry action"))?;
         let mut operation = self
             .backend
@@ -228,7 +238,7 @@ impl ClipboardService {
         Ok(json!({ "operation": operation }))
     }
 
-    async fn paste(&self, params: ActionParams) -> Result<Value, ApiError> {
+    async fn paste(&self, params: ActionParams, max_entry_bytes: u64) -> Result<Value, ApiError> {
         let session_id = params
             .session_id
             .as_deref()
@@ -240,9 +250,13 @@ impl ClipboardService {
             .map_err(stale_target)?;
         let image_as_file = params.action == "image-as-file";
         let mutation = if image_as_file {
-            BackendMutation::ImageAsFile
+            BackendMutation::ImageAsFile {
+                max_bytes: max_entry_bytes,
+            }
         } else {
-            BackendMutation::Restore
+            BackendMutation::Restore {
+                max_bytes: max_entry_bytes,
+            }
         };
         let mut operation = self
             .backend

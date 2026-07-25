@@ -1,9 +1,9 @@
 # ADR 0001: Ringboard behind clip-daemon
 
-- Status: provisional, qualification required
+- Status: accepted for capture/history; selection ownership superseded by ADR 0002
 - Decision: use pinned Nixpkgs `ringboard-server`/`ringboard-wayland`; Shelllist talks only to `clip-api`.
 
-The initial implementation reads Ringboard through `clipboard-history-client-sdk` 0.16.2 and exposes opaque IDs, bounded previews, semantic classification, a session D-Bus service, and a JSONL bridge. Mutations and paste remain disabled until the hardware qualification gate passes. This intentionally produces copy-only session metadata rather than unsafe input injection.
+The initial implementation reads Ringboard through `clipboard-history-client-sdk` 0.16.2 and exposes opaque IDs, bounded previews, semantic classification, a session D-Bus service, and a JSONL bridge. The qualification gate originally kept mutation and paste disabled. Those operations are now enabled under daemon policy; ADR 0002 replaces Ringboard paste-server use with daemon-owned Wayland selection publication.
 
 ## Qualification record
 

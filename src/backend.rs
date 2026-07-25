@@ -85,9 +85,9 @@ pub type BackendResult<T> = Result<T, BackendError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendMutation {
-    Restore,
-    ImageAsFile,
-    Annotate,
+    Restore { max_bytes: u64 },
+    ImageAsFile { max_bytes: u64 },
+    Annotate { max_bytes: u64 },
     Remove,
     SetFavorite(bool),
     Wipe,
@@ -95,11 +95,11 @@ pub enum BackendMutation {
 }
 
 impl BackendMutation {
-    pub fn for_action(action: &str) -> Option<Self> {
+    pub fn for_action(action: &str, max_bytes: u64) -> Option<Self> {
         match action {
-            "copy" | "paste" => Some(Self::Restore),
-            "image-as-file" => Some(Self::ImageAsFile),
-            "annotate" => Some(Self::Annotate),
+            "copy" | "paste" => Some(Self::Restore { max_bytes }),
+            "image-as-file" => Some(Self::ImageAsFile { max_bytes }),
+            "annotate" => Some(Self::Annotate { max_bytes }),
             "delete" => Some(Self::Remove),
             "favorite" | "pin-current" => Some(Self::SetFavorite(true)),
             "unfavorite" => Some(Self::SetFavorite(false)),
@@ -132,7 +132,11 @@ pub trait ClipboardBackend: Send + Sync {
         expected_revision: u64,
         edge: u32,
     ) -> BackendResult<EntryThumbnail>;
-    async fn capture_screenshot(&self, region: ScreenshotRegion) -> BackendResult<OperationResult>;
+    async fn capture_screenshot(
+        &self,
+        region: ScreenshotRegion,
+        max_bytes: u64,
+    ) -> BackendResult<OperationResult>;
     async fn mutate(
         &self,
         opaque_id: &str,

@@ -154,6 +154,7 @@ impl ClipboardBackend for FakeBackend {
     async fn capture_screenshot(
         &self,
         _region: ScreenshotRegion,
+        _max_bytes: u64,
     ) -> BackendResult<OperationResult> {
         completed("screenshot", "Fake screenshot copied")
     }
@@ -168,9 +169,9 @@ impl ClipboardBackend for FakeBackend {
             self.validate_revision(opaque_id, expected_revision)?;
         }
         match mutation {
-            BackendMutation::Restore => self.operation(opaque_id, "copy"),
-            BackendMutation::ImageAsFile => self.operation(opaque_id, "image-as-file"),
-            BackendMutation::Annotate => self.operation(opaque_id, "annotate"),
+            BackendMutation::Restore { .. } => self.operation(opaque_id, "copy"),
+            BackendMutation::ImageAsFile { .. } => self.operation(opaque_id, "image-as-file"),
+            BackendMutation::Annotate { .. } => self.operation(opaque_id, "annotate"),
             BackendMutation::Remove => self.remove(opaque_id),
             BackendMutation::SetFavorite(value) => self.favorite(opaque_id, value),
             BackendMutation::Wipe => {

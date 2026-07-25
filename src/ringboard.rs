@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fs::File,
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -8,7 +9,7 @@ use std::{
 use tokio::task::{JoinError, JoinHandle, spawn_blocking};
 
 use async_trait::async_trait;
-use clipboard_history_client_sdk::{DatabaseReader, Entry, EntryReader};
+use clipboard_history_client_sdk::{DatabaseReader, Entry, EntryReader, LoadedEntry};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -20,6 +21,7 @@ use crate::{
     model::{
         BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
     },
+    selection::SelectionService,
 };
 
 mod content;
@@ -104,6 +106,7 @@ pub struct RingboardBackend {
     revision: Arc<Mutex<RevisionState>>,
     summaries: Arc<Mutex<SummaryCache>>,
     operations: Arc<Mutex<HashMap<String, OperationTask>>>,
+    selection: SelectionService,
 }
 
 impl Default for RingboardBackend {
@@ -113,6 +116,7 @@ impl Default for RingboardBackend {
             revision: Arc::new(Mutex::new(RevisionState::default())),
             summaries: Arc::new(Mutex::new(SummaryCache::default())),
             operations: Arc::new(Mutex::new(HashMap::new())),
+            selection: SelectionService::default(),
         }
     }
 }
@@ -206,9 +210,8 @@ impl RingboardBackend {
         let detected_mime = detected_image_mime(&bytes);
         let mime_value = detected_mime
             .is_none()
-            .then(|| loaded.mime_type())
-            .transpose()
-            .map_err(|_| invalid_entry("Could not read clipboard MIME metadata"))?;
+            .then(|| stored_mime_type(&loaded))
+            .transpose()?;
         let mime = detected_mime
             .or_else(|| {
                 mime_value
@@ -358,15 +361,19 @@ impl RingboardBackend {
     ) -> BackendResult<OperationResult> {
         mutation.require_revision(expected_revision)?;
         match mutation {
-            BackendMutation::Restore => self.restore_entry(opaque_id, expected_revision),
-            BackendMutation::ImageAsFile => self.save_image_file(opaque_id, expected_revision),
+            BackendMutation::Restore { max_bytes } => {
+                self.restore_entry(opaque_id, expected_revision, max_bytes)
+            }
+            BackendMutation::ImageAsFile { max_bytes } => {
+                self.save_image_file(opaque_id, expected_revision, max_bytes)
+            }
             BackendMutation::Remove => self.remove_entry(opaque_id, expected_revision),
             BackendMutation::SetFavorite(value) => {
                 self.move_entry(opaque_id, expected_revision, value)
             }
             BackendMutation::Wipe => self.wipe_entries(),
             BackendMutation::Cleanup => self.cleanup_artifacts(),
-            BackendMutation::Annotate => Err(BackendError::new(
+            BackendMutation::Annotate { .. } => Err(BackendError::new(
                 BackendErrorKind::OperationFailed,
                 "Annotation must be started asynchronously",
             )),
@@ -382,7 +389,11 @@ impl RingboardBackend {
     ) -> BackendResult<EntryDetails> {
         let raw_id = self.replace_entry(opaque_id, Some(expected_revision), mime, bytes)?;
         let details = self.details_raw_sync(raw_id, MAX_DETAILS_BYTES)?;
-        self.restore_entry(&details.entry.id, Some(details.entry.revision))?;
+        self.restore_entry(
+            &details.entry.id,
+            Some(details.entry.revision),
+            MAX_DETAILS_BYTES as u64,
+        )?;
         Ok(details)
     }
 
@@ -454,8 +465,12 @@ impl ClipboardBackend for RingboardBackend {
         run_backend!(self, thumbnail_sync(&opaque_id, expected_revision, edge))
     }
 
-    async fn capture_screenshot(&self, region: ScreenshotRegion) -> BackendResult<OperationResult> {
-        run_backend!(self, capture_region(region))
+    async fn capture_screenshot(
+        &self,
+        region: ScreenshotRegion,
+        max_bytes: u64,
+    ) -> BackendResult<OperationResult> {
+        run_backend!(self, capture_region(region, max_bytes))
     }
 
     async fn mutate(
@@ -465,9 +480,12 @@ impl ClipboardBackend for RingboardBackend {
         mutation: BackendMutation,
     ) -> BackendResult<OperationResult> {
         mutation.require_revision(expected_revision)?;
-        if mutation == BackendMutation::Annotate {
+        if let BackendMutation::Annotate { max_bytes } = mutation {
             let opaque_id = opaque_id.to_owned();
-            let staged = run_backend!(self, stage_annotation(&opaque_id, expected_revision))?;
+            let staged = run_backend!(
+                self,
+                stage_annotation(&opaque_id, expected_revision, max_bytes)
+            )?;
             return self.launch_annotation(staged);
         }
         let opaque_id = opaque_id.to_owned();
@@ -553,6 +571,24 @@ fn blocking_task_error(_: JoinError) -> BackendError {
 
 fn mime_or_default(mime: &str) -> &str {
     if mime.is_empty() { DEFAULT_MIME } else { mime }
+}
+
+fn stored_mime_type(loaded: &LoadedEntry<'_, File>) -> BackendResult<String> {
+    let Some(file) = loaded.backing_file() else {
+        return loaded
+            .mime_type()
+            .map(|mime| mime.as_str().to_owned())
+            .map_err(|_| invalid_entry("Could not read clipboard MIME metadata"));
+    };
+    let mut bytes = [0_u8; 255];
+    let length = match rustix::fs::fgetxattr(file, c"user.mime_type", &mut bytes[..]) {
+        Ok(length) => length,
+        Err(rustix::io::Errno::NODATA) => return Ok(String::new()),
+        Err(_) => return Err(invalid_entry("Could not read clipboard MIME metadata")),
+    };
+    std::str::from_utf8(&bytes[..length])
+        .map(str::to_owned)
+        .map_err(|_| invalid_entry("Clipboard MIME metadata is not valid UTF-8"))
 }
 
 fn history_token(database: &DatabaseReader) -> u64 {

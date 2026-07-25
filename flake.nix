@@ -35,7 +35,7 @@
                 --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.grim pkgs.hyprland pkgs.libnotify pkgs.satty pkgs.systemd pkgs.xdg-utils ]}
             '';
             meta = {
-              description = "Ringboard policy and clip-api daemon for Shelllist";
+              description = "Wayland clipboard policy and clip-api daemon for Shelllist";
               mainProgram = "clip-daemon";
               platforms = pkgs.lib.platforms.linux;
             };

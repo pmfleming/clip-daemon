@@ -1,6 +1,6 @@
 # clip-daemon
 
-Rust clipboard policy and `clip-api` facade for the Shelllist clipboard surface. Ringboard owns Wayland capture, storage, selection ownership, and low-level paste; this daemon owns the stable UI boundary and product policy.
+Rust clipboard policy and `clip-api` facade for the Shelllist clipboard surface. Ringboard owns capture, persistent history, favorites, and retention; this daemon owns the stable UI boundary, Wayland selection publication, paste targeting, and product policy.
 
 ## Local Rust environment
 
@@ -32,7 +32,7 @@ nix run .#qualify
 
 The daemon supports bounded history queries, semantic details, private image thumbnails, exact-MIME restoration through Ringboard, opaque entry IDs, structured errors, D-Bus/JSONL transport, and the checked `clip-api` v1 registry. History metadata is polled only while a frontend subscription exists.
 
-Phase 3 adds copy and compositor-aware paste sessions, terminal/GUI shortcuts after the picker is hidden, image-as-file materialization, Satty annotation with validated PNG return, and two-phase history wipe. Phase 4 adds delete, favorite/current pinning, pause/private mode, native Ringboard retention settings, cancellation, and cache cleanup. Phase 5 adds bounded inline editing, explicit validated URL/file launch actions, a daemon-enforced type/action matrix, and position-preserving text/image replacement. Generated files use collision-safe names and private runtime/cache permissions. Ringboard remains the only selection owner, avoiding a second restore/capture pipeline.
+Phase 3 adds copy and compositor-aware paste sessions, terminal/GUI shortcuts after the picker is hidden, image-as-file materialization, Satty annotation with validated PNG return, and two-phase history wipe. Phase 4 adds delete, favorite/current pinning, pause/private mode, native Ringboard retention settings, cancellation, and cache cleanup. Phase 5 adds bounded inline editing, explicit validated URL/file launch actions, a daemon-enforced type/action matrix, and position-preserving text/image replacement. Generated files use collision-safe names and private runtime/cache permissions. `clip-daemon` publishes exact-MIME Wayland selections directly while Ringboard remains the sole capture/history engine.
 
 See [`docs/phase4-safety.md`](docs/phase4-safety.md) for enforced privacy behavior and explicit Ringboard/Wayland limitations, and [`docs/phase5-actions.md`](docs/phase5-actions.md) for intelligent-action policy.
 
@@ -42,4 +42,4 @@ Run the local quality review with:
 nix develop --command ../rust-quality-lens/target/debug/rqlens measure all --config rqlens.toml
 ```
 
-See [`docs/adr-0001-ringboard-facade.md`](docs/adr-0001-ringboard-facade.md) and [`docs/quality-review.md`](docs/quality-review.md).
+See [`docs/adr-0001-ringboard-facade.md`](docs/adr-0001-ringboard-facade.md), [`docs/adr-0002-wayland-selection-ownership.md`](docs/adr-0002-wayland-selection-ownership.md), and [`docs/quality-review.md`](docs/quality-review.md).

@@ -5,7 +5,8 @@
 - Entry IDs are bound to the observed Ringboard history generation and content fingerprint.
   Backend mutations revalidate the expected revision immediately before acting, including
   delayed annotation results.
-- Paste sessions expire after 15 seconds, retain compositor targets only in daemon memory, and never expose raw addresses or titles.
+- Paste sessions expire after five minutes, retain compositor targets only in daemon memory, and never expose raw addresses or titles.
+- Wayland selection publication validates exact MIME values and applies the configured entry limit plus a 64 MiB hard ceiling before retaining bytes in the daemon-owned publisher.
 - Delete and favorite changes use Ringboard's server protocol rather than writing database files.
 - Wipe requires a one-use, 30-second challenge and clears regular history, favorites, thumbnails, temporary transfers, and pending annotation tasks.
 - Pause and private mode stop `ringboard-wayland.service`; resuming starts it again. The visible API state is stored with user-only permissions.
@@ -29,4 +30,4 @@ Ringboard 0.16.2 has no configurable pre-write byte limit. `max_entry_bytes` is 
 
 Hyprland targets are revalidated by the compositor when the post-hide shortcut is sent. If the target disappeared, the item remains selected and a copy-only notification is shown. Unsupported compositors remain copy-only. Terminal classes are configurable only in code at this phase and use `Ctrl+Shift+V`; other targets use `Ctrl+V`.
 
-Ringboard does not expose observable paste-completion acknowledgement. The API reports `paste-prepared` and the post-hide fallback dispatch, but does not claim application-level insertion completion.
+Wayland selection ownership does not expose target-application paste acknowledgement. The API reports `paste-prepared` after the compositor accepts the selection and requests picker hiding, but it does not claim application-level insertion completion.

@@ -1,7 +1,7 @@
 use std::{
     env,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{Read, Write},
     os::{
         fd::{AsFd, OwnedFd},
         unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -11,13 +11,10 @@ use std::{
 };
 
 use clipboard_history_client_sdk::{
-    DatabaseReader, EntryReader,
-    api::{
-        AddRequest, MoveToFrontRequest, RemoveRequest, SwapRequest, connect_to_paste_server,
-        connect_to_server, send_paste_buffer,
-    },
+    Entry, EntryReader,
+    api::{AddRequest, MoveToFrontRequest, RemoveRequest, SwapRequest, connect_to_server},
     core::{
-        dirs::{data_dir, paste_socket_file, socket_file},
+        dirs::socket_file,
         protocol::{AddResponse, MimeType, MoveToFrontResponse, RingKind},
     },
 };
@@ -30,6 +27,7 @@ use uuid::Uuid;
 use crate::{
     backend::{BackendError, BackendErrorKind, BackendResult, ScreenshotRegion},
     model::{EntryKind, OperationResult},
+    selection::{SelectionService, effective_limit},
 };
 
 use super::{MAX_THUMBNAIL_BYTES, OperationTask, RingboardBackend, invalid_entry, run_blocking};
@@ -39,17 +37,19 @@ pub(super) struct AnnotationStage {
     output: PathBuf,
     opaque_id: String,
     revision: u64,
+    max_bytes: u64,
 }
 
 impl RingboardBackend {
     pub(super) fn capture_region(
         &self,
         region: ScreenshotRegion,
+        max_bytes: u64,
     ) -> BackendResult<OperationResult> {
         let directory = runtime_directory("clip-daemon/screenshots")?;
         let path = unique_path(&directory, "png");
         drop(private_file(&path)?);
-        let result = capture_and_restore(region, &path);
+        let result = capture_and_publish(region, &path, &self.selection, max_bytes);
         let _ = fs::remove_file(path);
         if result.is_ok() {
             self.clear_identity_state()?;
@@ -61,17 +61,23 @@ impl RingboardBackend {
         &self,
         opaque_id: &str,
         expected_revision: Option<u64>,
+        max_bytes: u64,
     ) -> BackendResult<OperationResult> {
-        let paste_server = paste_server()?;
-        let (entry, mut reader, _) = self.selected(opaque_id, expected_revision)?;
-        send_paste_buffer(paste_server, entry, &mut reader, false).map_err(operation_error)?;
-        Ok(completed("copy", "Entry restored to the clipboard"))
+        let (entry, mut reader, summary) = self.selected(opaque_id, expected_revision)?;
+        let bytes = read_entry(entry, &mut reader, max_bytes)?;
+        self.selection.publish(&summary.mime, bytes, max_bytes)?;
+        self.clear_identity_state()?;
+        Ok(completed(
+            "copy",
+            "Entry published to the Wayland clipboard",
+        ))
     }
 
     pub(super) fn save_image_file(
         &self,
         opaque_id: &str,
         expected_revision: Option<u64>,
+        max_bytes: u64,
     ) -> BackendResult<OperationResult> {
         let (entry, mut reader, summary) = self.selected(opaque_id, expected_revision)?;
         if summary.kind != EntryKind::Image {
@@ -79,10 +85,20 @@ impl RingboardBackend {
         }
         let directory = image_directory()?;
         let path = unique_path(&directory, image_extension(&summary.mime));
-        copy_entry(entry, &mut reader, &path)?;
-        let uri = Url::from_file_path(&path)
-            .map_err(|_| operation_error("Could not create image file URI"))?;
-        add_and_restore(format!("{uri}\r\n").as_bytes(), "text/uri-list")?;
+        let mut publish = || {
+            copy_entry(entry, &mut reader, &path, max_bytes)?;
+            let uri = Url::from_file_path(&path)
+                .map_err(|_| operation_error("Could not create image file URI"))?;
+            self.selection.publish(
+                "text/uri-list",
+                format!("{uri}\r\n").into_bytes(),
+                max_bytes,
+            )
+        };
+        if let Err(error) = publish() {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
         self.clear_identity_state()?;
         let mut result = OperationResult::completed("image-as-file", "Image file copied");
         result.path = Some(path.to_string_lossy().into_owned());
@@ -131,6 +147,7 @@ impl RingboardBackend {
         &self,
         opaque_id: &str,
         expected_revision: Option<u64>,
+        max_bytes: u64,
     ) -> BackendResult<AnnotationStage> {
         let (entry, mut reader, summary) = self.selected(opaque_id, expected_revision)?;
         if summary.kind != EntryKind::Image {
@@ -139,12 +156,18 @@ impl RingboardBackend {
         let directory = runtime_directory("clip-daemon/edits")?;
         let input = unique_path(&directory, image_extension(&summary.mime));
         let output = unique_path(&directory, "png");
-        copy_entry(entry, &mut reader, &input)?;
+        copy_entry(
+            entry,
+            &mut reader,
+            &input,
+            max_bytes.min(MAX_THUMBNAIL_BYTES),
+        )?;
         Ok(AnnotationStage {
             input,
             output,
             opaque_id: opaque_id.to_owned(),
             revision: summary.revision,
+            max_bytes: max_bytes.min(MAX_THUMBNAIL_BYTES),
         })
     }
 
@@ -235,7 +258,12 @@ impl RingboardBackend {
     }
 }
 
-fn capture_and_restore(region: ScreenshotRegion, path: &Path) -> BackendResult<OperationResult> {
+fn capture_and_publish(
+    region: ScreenshotRegion,
+    path: &Path,
+    selection: &SelectionService,
+    max_bytes: u64,
+) -> BackendResult<OperationResult> {
     let geometry = format!(
         "{},{} {}x{}",
         region.x, region.y, region.width, region.height
@@ -248,13 +276,16 @@ fn capture_and_restore(region: ScreenshotRegion, path: &Path) -> BackendResult<O
     if !status.success() {
         return Err(operation_error("Screenshot capture failed"));
     }
-    if !valid_edited_image(path) {
+    if !valid_edited_image(path, max_bytes.min(MAX_THUMBNAIL_BYTES)) {
         return Err(operation_error(
             "Screenshot capture returned an invalid image",
         ));
     }
-    add_file_and_restore(path, "image/png")?;
-    Ok(completed("screenshot", "Clipboard screenshot copied"))
+    selection.publish_file("image/png", path, max_bytes.min(MAX_THUMBNAIL_BYTES))?;
+    Ok(completed(
+        "screenshot",
+        "Screenshot published to the Wayland clipboard",
+    ))
 }
 
 async fn run_annotation(backend: RingboardBackend, staged: AnnotationStage, operation_id: &str) {
@@ -263,11 +294,14 @@ async fn run_annotation(backend: RingboardBackend, staged: AnnotationStage, oper
         output,
         opaque_id,
         revision,
+        max_bytes,
     } = staged;
     if run_satty(&input, &output).await {
         let edited = output.clone();
-        let result =
-            run_blocking(move || apply_annotation(&backend, &opaque_id, revision, &edited)).await;
+        let result = run_blocking(move || {
+            apply_annotation(&backend, &opaque_id, revision, &edited, max_bytes)
+        })
+        .await;
         if let Err(error) = result {
             tracing::warn!(%operation_id, code = %error.kind.code(), "annotation result could not be restored");
         }
@@ -303,8 +337,9 @@ fn apply_annotation(
     opaque_id: &str,
     revision: u64,
     output: &Path,
+    max_bytes: u64,
 ) -> BackendResult<()> {
-    if !valid_edited_image(output) {
+    if !valid_edited_image(output, max_bytes) {
         return Err(operation_error("Annotation returned an invalid image"));
     }
     let (entry, _, summary) = backend.selected(opaque_id, Some(revision))?;
@@ -315,7 +350,9 @@ fn apply_annotation(
         "image/png",
     )?;
     backend.clear_identity_state()?;
-    restore_raw(entry.id())
+    backend
+        .selection
+        .publish_file("image/png", output, max_bytes)
 }
 
 fn replace_from_file(raw_id: u64, ring: RingKind, path: &Path, mime: &str) -> BackendResult<()> {
@@ -326,30 +363,6 @@ fn replace_from_file(raw_id: u64, ring: RingKind, path: &Path, mime: &str) -> Ba
         return Err(operation_error("Ringboard rejected the replacement swap"));
     }
     remove_raw(server, replacement)
-}
-
-fn restore_raw(raw_id: u64) -> BackendResult<()> {
-    let mut directory = data_dir();
-    let database = DatabaseReader::open(&mut directory).map_err(operation_error)?;
-    let mut reader = EntryReader::open(&mut directory).map_err(operation_error)?;
-    let entry = database.get_raw(raw_id).map_err(operation_error)?;
-    send_paste_buffer(paste_server()?, entry, &mut reader, false).map_err(operation_error)
-}
-
-fn add_and_restore(bytes: &[u8], mime: &str) -> BackendResult<()> {
-    let directory = runtime_directory("clip-daemon/transfers")?;
-    let path = unique_path(&directory, "data");
-    private_file(&path)?
-        .write_all(bytes)
-        .map_err(operation_error)?;
-    let result = add_file_and_restore(&path, mime);
-    let _ = fs::remove_file(path);
-    result
-}
-
-fn add_file_and_restore(path: &Path, mime: &str) -> BackendResult<()> {
-    let id = add_file(server()?, path, mime, RingKind::Main)?;
-    restore_raw(id)
 }
 
 fn add_file(server: impl AsFd, path: &Path, mime: &str, ring: RingKind) -> BackendResult<u64> {
@@ -373,22 +386,45 @@ fn server() -> BackendResult<OwnedFd> {
     connect_to_server(&socket_address(socket_file())?).map_err(operation_error)
 }
 
-fn paste_server() -> BackendResult<OwnedFd> {
-    connect_to_paste_server(&socket_address(paste_socket_file())?).map_err(operation_error)
-}
-
 fn socket_address(path: PathBuf) -> BackendResult<SocketAddrUnix> {
     SocketAddrUnix::new(path).map_err(operation_error)
 }
 
+fn read_entry(entry: Entry, reader: &mut EntryReader, max_bytes: u64) -> BackendResult<Vec<u8>> {
+    let mut source = entry.to_file(reader).map_err(operation_error)?;
+    let size = source.metadata().map_err(operation_error)?.len();
+    let limit = effective_limit(max_bytes);
+    if size > limit {
+        return Err(selection_size_error(size, limit));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    (&mut *source)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(operation_error)?;
+    if bytes.len() as u64 > limit {
+        return Err(selection_size_error(bytes.len() as u64, limit));
+    }
+    Ok(bytes)
+}
+
 fn copy_entry(
-    entry: clipboard_history_client_sdk::Entry,
+    entry: Entry,
     reader: &mut EntryReader,
     path: &Path,
+    max_bytes: u64,
 ) -> BackendResult<()> {
-    let mut source = entry.to_file(reader).map_err(operation_error)?;
-    io::copy(&mut *source, &mut private_file(path)?).map_err(operation_error)?;
-    Ok(())
+    let bytes = read_entry(entry, reader, max_bytes)?;
+    private_file(path)?
+        .write_all(&bytes)
+        .map_err(operation_error)
+}
+
+fn selection_size_error(size: u64, limit: u64) -> BackendError {
+    BackendError::new(
+        BackendErrorKind::InvalidData,
+        format!("Clipboard entry is {size} bytes; Wayland publishing is limited to {limit} bytes"),
+    )
 }
 
 fn target_ring(favorite: bool) -> RingKind {
@@ -399,10 +435,10 @@ fn target_ring(favorite: bool) -> RingKind {
     }
 }
 
-fn valid_edited_image(path: &Path) -> bool {
+fn valid_edited_image(path: &Path, max_bytes: u64) -> bool {
     if !path
         .metadata()
-        .is_ok_and(|metadata| metadata.len() <= MAX_THUMBNAIL_BYTES)
+        .is_ok_and(|metadata| metadata.len() <= max_bytes.min(MAX_THUMBNAIL_BYTES))
     {
         return false;
     }
@@ -506,7 +542,7 @@ mod tests {
             .expect("write valid image");
         fs::write(&malformed, b"\x89PNG\r\n\x1a\n").expect("write malformed image");
 
-        assert!(valid_edited_image(&valid));
-        assert!(!valid_edited_image(&malformed));
+        assert!(valid_edited_image(&valid, super::MAX_THUMBNAIL_BYTES));
+        assert!(!valid_edited_image(&malformed, super::MAX_THUMBNAIL_BYTES));
     }
 }
