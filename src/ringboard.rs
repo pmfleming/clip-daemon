@@ -28,8 +28,8 @@ mod content;
 mod mutation;
 
 use content::{
-    create_thumbnail, detail_facts, detected_image_mime, invalid_entry, prune_thumbnails,
-    read_bounded,
+    create_file_thumbnail, create_thumbnail, detail_facts, detected_image_mime, invalid_entry,
+    prune_thumbnails, read_bounded,
 };
 
 const DEFAULT_MIME: &str = "text/plain";
@@ -347,10 +347,14 @@ impl RingboardBackend {
         edge: u32,
     ) -> BackendResult<EntryThumbnail> {
         let (entry, mut reader, summary) = self.selected(opaque_id, Some(expected_revision))?;
-        let loaded = entry
+        let mut loaded = entry
             .to_file(&mut reader)
             .map_err(|_| invalid_entry("Could not open clipboard image"))?;
-        create_thumbnail(&loaded, &summary, edge)
+        match summary.kind {
+            crate::model::EntryKind::Image => create_thumbnail(&loaded, &summary, edge),
+            crate::model::EntryKind::Files => create_file_thumbnail(&mut loaded, &summary, edge),
+            _ => Err(invalid_entry("Clipboard entry cannot be thumbnailed")),
+        }
     }
 
     fn mutate_sync(

@@ -4,7 +4,7 @@ use std::{
     fs::{self, File, Permissions},
     io::{BufReader, Read},
     os::unix::fs::PermissionsExt,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use image::{DynamicImage, ImageReader, Limits};
@@ -48,7 +48,10 @@ pub(super) fn detail_facts(
     bytes: &[u8],
 ) -> (Vec<FilePreview>, Option<ImageMetadata>) {
     match summary.kind {
-        EntryKind::Files => (parse_files(&summary.mime, bytes), None),
+        EntryKind::Files => (
+            parse_files(&summary.mime, bytes),
+            image_file_path(&summary.mime, bytes).and_then(|path| image_file_dimensions(&path)),
+        ),
         EntryKind::Image => (Vec::new(), image_dimensions(bytes)),
         _ => (Vec::new(), None),
     }
@@ -62,6 +65,39 @@ pub(super) fn create_thumbnail(
     if summary.kind != EntryKind::Image || summary.byte_size > MAX_THUMBNAIL_BYTES {
         return Err(invalid_entry("Clipboard entry cannot be thumbnailed"));
     }
+    create_thumbnail_from_image(file, summary, edge)
+}
+
+pub(super) fn create_file_thumbnail(
+    file: &mut File,
+    summary: &EntrySummary,
+    edge: u32,
+) -> BackendResult<EntryThumbnail> {
+    if summary.kind != EntryKind::Files {
+        return Err(invalid_entry("Clipboard entry cannot be thumbnailed"));
+    }
+    let bytes = read_bounded(file, INSPECTION_LIMIT)?;
+    let path = image_file_path(&summary.mime, &bytes)
+        .ok_or_else(|| invalid_entry("Clipboard file is not a local image"))?;
+    let image_file =
+        File::open(&path).map_err(|_| invalid_entry("Clipboard image file could not be opened"))?;
+    if image_file
+        .metadata()
+        .map(|metadata| metadata.len() > MAX_THUMBNAIL_BYTES)
+        .unwrap_or(true)
+    {
+        return Err(invalid_entry(
+            "Clipboard image file is too large to preview",
+        ));
+    }
+    create_thumbnail_from_image(&image_file, summary, edge)
+}
+
+fn create_thumbnail_from_image(
+    file: &File,
+    summary: &EntrySummary,
+    edge: u32,
+) -> BackendResult<EntryThumbnail> {
     let edge = edge.clamp(32, 1024);
     let path =
         thumbnail_directory()?.join(format!("{}-{}-{edge}.png", summary.id, summary.revision));
@@ -155,6 +191,31 @@ fn file_preview(uri: &str, operation: &str) -> Option<FilePreview> {
     })
 }
 
+fn image_file_path(mime: &str, bytes: &[u8]) -> Option<PathBuf> {
+    let files = parse_files(mime, bytes);
+    let [file] = files.as_slice() else {
+        return None;
+    };
+    if !file.exists {
+        return None;
+    }
+    let path = Url::parse(&file.uri).ok()?.to_file_path().ok()?;
+    path.is_file().then_some(path)
+}
+
+fn image_file_dimensions(path: &Path) -> Option<ImageMetadata> {
+    let metadata = path.metadata().ok()?;
+    if metadata.len() > MAX_THUMBNAIL_BYTES {
+        return None;
+    }
+    let mut reader = ImageReader::open(path)
+        .and_then(ImageReader::with_guessed_format)
+        .ok()?;
+    reader.limits(image_decode_limits());
+    let (width, height) = reader.into_dimensions().ok()?;
+    Some(ImageMetadata { width, height })
+}
+
 fn image_dimensions(bytes: &[u8]) -> Option<ImageMetadata> {
     let mut reader = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -233,7 +294,8 @@ mod tests {
 
     use super::{
         MAX_DECODED_IMAGE_BYTES, MAX_IMAGE_DIMENSION, detected_image_mime, file_preview,
-        image_decode_limits, parse_files, prune_thumbnail_directory, read_bounded,
+        image_decode_limits, image_file_dimensions, image_file_path, parse_files,
+        prune_thumbnail_directory, read_bounded,
     };
 
     #[test]
@@ -265,6 +327,28 @@ mod tests {
         assert_eq!(files[0].display_name, "one.txt");
         assert_eq!(files[0].operation, "cut");
         assert_eq!(file_preview("not a uri", "copy"), None);
+    }
+
+    #[test]
+    fn a_single_local_image_file_can_supply_preview_dimensions() {
+        let directory = tempfile::tempdir().expect("image directory");
+        let path = directory.path().join("screenshot.png");
+        image::RgbaImage::new(7, 5)
+            .save(&path)
+            .expect("write image fixture");
+        let uri = url::Url::from_file_path(&path)
+            .expect("file URL")
+            .to_string();
+
+        let detected = image_file_path("text/uri-list", format!("{uri}\r\n").as_bytes())
+            .expect("local image path");
+        let dimensions = image_file_dimensions(&detected).expect("image dimensions");
+
+        assert_eq!(detected, path);
+        assert_eq!((dimensions.width, dimensions.height), (7, 5));
+        assert!(
+            image_file_path("text/uri-list", format!("{uri}\r\n{uri}\r\n").as_bytes()).is_none()
+        );
     }
 
     #[test]
