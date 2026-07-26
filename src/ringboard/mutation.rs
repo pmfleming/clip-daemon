@@ -8,6 +8,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Command as StdCommand,
+    time::Duration,
 };
 
 use clipboard_history_client_sdk::{
@@ -336,6 +337,8 @@ async fn run_annotation(backend: RingboardBackend, staged: AnnotationStage, oper
         revision,
         max_bytes,
     } = staged;
+    // Give the picker time to hide so Satty becomes the focused surface when it maps.
+    tokio::time::sleep(Duration::from_millis(150)).await;
     if run_satty(&input, &output).await {
         let edited = output.clone();
         let result = run_blocking(move || {
@@ -383,12 +386,16 @@ fn apply_annotation(
         return Err(operation_error("Annotation returned an invalid image"));
     }
     let (entry, _, summary) = backend.selected(opaque_id, Some(revision))?;
-    replace_from_file(
-        entry.id(),
-        target_ring(summary.favorite),
-        output,
-        "image/png",
-    )?;
+    let raw_id = entry.id();
+    replace_from_file(raw_id, target_ring(summary.favorite), output, "image/png")?;
+    backend.clear_identity_state()?;
+    let source = backend.details_raw_sync(raw_id, super::MAX_DETAILS_BYTES)?;
+    let bytes = fs::read(output).map_err(operation_error)?;
+    backend
+        .artifacts
+        .lock()
+        .map_err(|_| operation_error("Generated-file registry is unavailable"))?
+        .register_inline_echo(&source.entry.id, "image/png", &bytes)?;
     backend.clear_identity_state()?;
     backend
         .selection
@@ -496,11 +503,7 @@ fn publish_image_uri(
 ) -> BackendResult<()> {
     let uri = Url::from_file_path(path)
         .map_err(|_| operation_error("Could not create image file URI"))?;
-    selection.publish(
-        "text/uri-list",
-        format!("{uri}\r\n").into_bytes(),
-        max_bytes,
-    )
+    selection.publish_file_link(format!("{uri}\r\n").into_bytes(), max_bytes)
 }
 
 fn read_entry(entry: Entry, reader: &mut EntryReader, max_bytes: u64) -> BackendResult<Vec<u8>> {

@@ -31,9 +31,19 @@ struct ArtifactRecord {
     created_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InlineEchoRecord {
+    source_entry_id: String,
+    image_identity: String,
+    #[serde(default)]
+    created_at: u64,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Manifest {
     records: Vec<ArtifactRecord>,
+    #[serde(default)]
+    inline_echoes: Vec<InlineEchoRecord>,
 }
 
 /// Tracks only files created by clip-daemon. Cleanup never infers ownership
@@ -42,6 +52,7 @@ pub(super) struct ArtifactRegistry {
     root: Option<PathBuf>,
     manifest_path: Option<PathBuf>,
     records: HashMap<PathBuf, ArtifactRecord>,
+    inline_echoes: HashMap<String, InlineEchoRecord>,
     active_selection: Option<PathBuf>,
 }
 
@@ -55,23 +66,27 @@ impl Default for ArtifactRegistry {
 
 impl ArtifactRegistry {
     fn load(root: Option<PathBuf>, manifest_path: Option<PathBuf>) -> Self {
-        let records = manifest_path
+        let manifest = manifest_path
             .as_deref()
             .and_then(|path| fs::read(path).ok())
             .and_then(|bytes| serde_json::from_slice::<Manifest>(&bytes).ok())
-            .map(|manifest| {
-                manifest
-                    .records
-                    .into_iter()
-                    .filter(|record| owned_path(root.as_deref(), &record.path))
-                    .map(|record| (record.path.clone(), record))
-                    .collect()
-            })
             .unwrap_or_default();
+        let records = manifest
+            .records
+            .into_iter()
+            .filter(|record| owned_path(root.as_deref(), &record.path))
+            .map(|record| (record.path.clone(), record))
+            .collect();
+        let inline_echoes = manifest
+            .inline_echoes
+            .into_iter()
+            .map(|record| (record.image_identity.clone(), record))
+            .collect();
         Self {
             root,
             manifest_path,
             records,
+            inline_echoes,
             active_selection: None,
         }
     }
@@ -120,6 +135,40 @@ impl ArtifactRegistry {
         self.active_selection = None;
     }
 
+    pub fn register_inline_echo(
+        &mut self,
+        source_entry_id: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> BackendResult<()> {
+        let identity = inline_image_identity(mime, bytes);
+        self.inline_echoes.insert(
+            identity.clone(),
+            InlineEchoRecord {
+                source_entry_id: source_entry_id.to_owned(),
+                image_identity: identity,
+                created_at: unix_time(),
+            },
+        );
+        if self.inline_echoes.len() > MAX_INLINE_ECHOES
+            && let Some(oldest) = self
+                .inline_echoes
+                .values()
+                .min_by_key(|record| record.created_at)
+                .map(|record| record.image_identity.clone())
+        {
+            self.inline_echoes.remove(&oldest);
+        }
+        self.persist()
+    }
+
+    pub fn match_inline_echo(&self, mime: &str, bytes: &[u8], entry_id: &str) -> Option<String> {
+        let record = self
+            .inline_echoes
+            .get(&inline_image_identity(mime, bytes))?;
+        (record.source_entry_id != entry_id).then(|| record.source_entry_id.clone())
+    }
+
     pub fn match_local_image(&self, source: &LocalImageSource) -> Option<ArtifactMatch> {
         let record = self.records.get(&source.path)?;
         let source_entry_id = read_registered_image(source)
@@ -146,6 +195,7 @@ impl ArtifactRegistry {
 
     pub fn clear_all(&mut self) -> BackendResult<usize> {
         self.active_selection = None;
+        self.inline_echoes.clear();
         self.prune(&HashSet::new(), true)
     }
 
@@ -191,6 +241,7 @@ impl ArtifactRegistry {
         let result = (|| {
             let manifest = Manifest {
                 records: self.records.values().cloned().collect(),
+                inline_echoes: self.inline_echoes.values().cloned().collect(),
             };
             let bytes = serde_json::to_vec_pretty(&manifest).map_err(artifact_error)?;
             let mut file = OpenOptions::new()
@@ -208,6 +259,10 @@ impl ArtifactRegistry {
         }
         result
     }
+}
+
+fn inline_image_identity(mime: &str, bytes: &[u8]) -> String {
+    image_identity(mime, &bytes[..bytes.len().min(super::INSPECTION_LIMIT)])
 }
 
 fn read_registered_image(source: &LocalImageSource) -> Option<String> {
@@ -253,6 +308,7 @@ fn state_root() -> Option<PathBuf> {
 }
 
 const PRUNE_GRACE_SECONDS: u64 = 60;
+const MAX_INLINE_ECHOES: usize = 128;
 
 fn unix_time() -> u64 {
     SystemTime::now()
@@ -268,6 +324,44 @@ fn artifact_error(error: impl std::fmt::Display) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::ArtifactRegistry;
+
+    #[test]
+    fn annotation_echoes_match_duplicates_but_not_the_replacement_source() {
+        let state = tempfile::tempdir().unwrap();
+        let manifest = state.path().join("manifest.json");
+        let mut registry = ArtifactRegistry::load(None, Some(manifest.clone()));
+        registry
+            .register_inline_echo("replacement", "image/png", b"edited-image")
+            .unwrap();
+
+        assert_eq!(
+            registry.match_inline_echo("image/png", b"edited-image", "captured-echo"),
+            Some("replacement".into())
+        );
+        assert_eq!(
+            registry.match_inline_echo("image/png", b"edited-image", "replacement"),
+            None
+        );
+
+        let restored = ArtifactRegistry::load(None, Some(manifest));
+        assert_eq!(
+            restored.match_inline_echo("image/png", b"edited-image", "captured-echo"),
+            Some("replacement".into())
+        );
+
+        let large = vec![7; super::super::INSPECTION_LIMIT + 10];
+        registry
+            .register_inline_echo("large-replacement", "image/png", &large)
+            .unwrap();
+        assert_eq!(
+            registry.match_inline_echo(
+                "image/png",
+                &large[..super::super::INSPECTION_LIMIT],
+                "large-echo"
+            ),
+            Some("large-replacement".into())
+        );
+    }
 
     #[test]
     fn cleanup_removes_only_registered_unreferenced_files() {

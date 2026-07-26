@@ -300,14 +300,19 @@ impl RingboardBackend {
         let content = ResolvedContent::resolve(&stored_mime, &bytes, MAX_WAYLAND_SELECTION_BYTES);
         let fingerprint = entry_fingerprint(entry.id(), byte_size, content.mime(), &bytes);
         let id = opaque_id(&fingerprint);
-        let artifact = {
+        let (artifact, inline_echo_source) = {
             let registry = self.artifacts.lock().map_err(|_| lock_error())?;
-            content
+            let artifact = content
                 .local_image()
                 .and_then(|source| registry.match_local_image(source))
                 .or_else(|| {
                     registry.match_file_uris(content.files().iter().map(|file| file.uri.clone()))
-                })
+                });
+            let inline_echo_source =
+                matches!(content.image(), Some(content::ResolvedImage::Inline { .. }))
+                    .then(|| registry.match_inline_echo(content.mime(), &bytes, &id))
+                    .flatten();
+            (artifact, inline_echo_source)
         };
         Ok(ResolvedEntry {
             summary: EntrySummary {
@@ -322,7 +327,9 @@ impl RingboardBackend {
                 preview: bounded_preview(&bytes, INSPECTION_LIMIT),
             },
             generated_path: artifact.as_ref().map(|artifact| artifact.path.clone()),
-            echo_source_id: artifact.and_then(|artifact| artifact.source_entry_id),
+            echo_source_id: artifact
+                .and_then(|artifact| artifact.source_entry_id)
+                .or(inline_echo_source),
         })
     }
 

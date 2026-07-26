@@ -1,6 +1,6 @@
 use std::{fs::File, io::Read, path::Path, sync::Arc};
 
-use wl_clipboard_rs::copy::{ClipboardType, MimeType, Options, Seat, Source};
+use wl_clipboard_rs::copy::{ClipboardType, MimeSource, MimeType, Options, Seat, Source};
 
 use crate::backend::{BackendError, BackendErrorKind, BackendResult};
 
@@ -8,6 +8,10 @@ pub use crate::backend::MAX_WAYLAND_SELECTION_BYTES;
 
 pub trait SelectionPublisher: Send + Sync {
     fn publish(&self, mime: &str, bytes: Vec<u8>) -> BackendResult<()>;
+
+    fn publish_file_link(&self, uri: Vec<u8>) -> BackendResult<()> {
+        self.publish("text/uri-list", uri)
+    }
 }
 
 #[derive(Default)]
@@ -25,6 +29,24 @@ impl SelectionPublisher for WaylandSelectionPublisher {
                 Source::Bytes(bytes.into_boxed_slice()),
                 MimeType::Specific(mime.to_owned()),
             )
+            .map_err(|error| selection_error(error.to_string()))
+    }
+
+    fn publish_file_link(&self, uri: Vec<u8>) -> BackendResult<()> {
+        let text = uri.strip_suffix(b"\r\n").unwrap_or(&uri).to_vec();
+        let mut options = Options::new();
+        options.clipboard(ClipboardType::Regular).seat(Seat::All);
+        options
+            .copy_multi(vec![
+                MimeSource {
+                    source: Source::Bytes(uri.into_boxed_slice()),
+                    mime_type: MimeType::Specific("text/uri-list".into()),
+                },
+                MimeSource {
+                    source: Source::Bytes(text.into_boxed_slice()),
+                    mime_type: MimeType::Text,
+                },
+            ])
             .map_err(|error| selection_error(error.to_string()))
     }
 }
@@ -52,6 +74,11 @@ impl SelectionService {
         validate_mime(mime)?;
         validate_size(bytes.len() as u64, configured_limit)?;
         self.publisher.publish(mime, bytes)
+    }
+
+    pub fn publish_file_link(&self, uri: Vec<u8>, configured_limit: u64) -> BackendResult<()> {
+        validate_size(uri.len() as u64, configured_limit)?;
+        self.publisher.publish_file_link(uri)
     }
 
     pub fn publish_file(
@@ -158,6 +185,14 @@ mod tests {
             self.values.lock().unwrap().push((mime.to_owned(), bytes));
             Ok(())
         }
+
+        fn publish_file_link(&self, uri: Vec<u8>) -> BackendResult<()> {
+            let text = uri.strip_suffix(b"\r\n").unwrap_or(&uri).to_vec();
+            let mut values = self.values.lock().unwrap();
+            values.push(("text/uri-list".into(), uri));
+            values.push(("text/plain".into(), text));
+            Ok(())
+        }
     }
 
     #[test]
@@ -166,7 +201,7 @@ mod tests {
         let service = SelectionService::with_publisher(publisher.clone());
         service.publish("image/png", vec![1, 2, 3], 1024).unwrap();
         service
-            .publish("text/uri-list", b"file:///tmp/image.png\r\n".to_vec(), 1024)
+            .publish_file_link(b"file:///tmp/image.png\r\n".to_vec(), 1024)
             .unwrap();
         assert_eq!(
             publisher.values.lock().unwrap().as_slice(),
@@ -175,7 +210,8 @@ mod tests {
                 (
                     "text/uri-list".into(),
                     b"file:///tmp/image.png\r\n".to_vec()
-                )
+                ),
+                ("text/plain".into(), b"file:///tmp/image.png".to_vec())
             ]
         );
     }
