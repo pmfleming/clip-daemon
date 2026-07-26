@@ -19,6 +19,7 @@ use crate::{
         HistoryQuery, MAX_QUERY_LIMIT, MAX_WAYLAND_SELECTION_BYTES, ScreenshotRegion,
     },
     classification::{INSPECTION_LIMIT, bounded_preview},
+    editor::ImageEditorCommand,
     model::{
         BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
     },
@@ -199,6 +200,7 @@ pub struct RingboardBackend {
     summaries: Arc<Mutex<SummaryCache>>,
     operations: Arc<Mutex<HashMap<String, OperationTask>>>,
     artifacts: Arc<Mutex<ArtifactRegistry>>,
+    editor: ImageEditorCommand,
     selection: SelectionService,
 }
 
@@ -210,6 +212,7 @@ impl Default for RingboardBackend {
             summaries: Arc::new(Mutex::new(SummaryCache::default())),
             operations: Arc::new(Mutex::new(HashMap::new())),
             artifacts: Arc::new(Mutex::new(ArtifactRegistry::default())),
+            editor: ImageEditorCommand::configured(),
             selection: SelectionService::default(),
         }
     }

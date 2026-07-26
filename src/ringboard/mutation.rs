@@ -21,12 +21,12 @@ use clipboard_history_client_sdk::{
 };
 use image::ImageReader;
 use rustix::net::SocketAddrUnix;
-use tokio::process::Command;
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
     backend::{BackendError, BackendErrorKind, BackendResult, ScreenshotRegion},
+    editor::ImageEditorCommand,
     model::{EntryKind, OperationResult},
     selection::{SelectionService, effective_limit},
 };
@@ -135,18 +135,19 @@ impl RingboardBackend {
         &self,
         staged: AnnotationStage,
     ) -> BackendResult<OperationResult> {
-        let mut operation = OperationResult::completed("annotate", "Satty annotation started");
+        let mut operation = OperationResult::completed("annotate", "Image editor started");
         operation.status = "started".into();
         let operation_id = operation.id.clone();
         let files = [staged.input.clone(), staged.output.clone()];
         let cleanup_files = files.clone();
         let operations = self.operations.clone();
         let backend = self.clone();
+        let editor = self.editor.clone();
         let task_id = operation_id.clone();
         let (start, ready) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
             if ready.await.is_ok() {
-                run_annotation(backend, staged, &task_id).await;
+                run_annotation(backend, editor, staged, &task_id).await;
             }
             if let Ok(mut active) = operations.lock() {
                 active.remove(&task_id);
@@ -329,7 +330,12 @@ fn capture_and_publish(
     ))
 }
 
-async fn run_annotation(backend: RingboardBackend, staged: AnnotationStage, operation_id: &str) {
+async fn run_annotation(
+    backend: RingboardBackend,
+    editor: ImageEditorCommand,
+    staged: AnnotationStage,
+    operation_id: &str,
+) {
     let AnnotationStage {
         input,
         output,
@@ -337,9 +343,9 @@ async fn run_annotation(backend: RingboardBackend, staged: AnnotationStage, oper
         revision,
         max_bytes,
     } = staged;
-    // Give the picker time to hide so Satty becomes the focused surface when it maps.
+    // Give the picker time to hide so the editor becomes focused when it maps.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    if run_satty(&input, &output).await && output.is_file() {
+    if run_editor(&editor, &input, &output).await && output.is_file() {
         let edited = output.clone();
         let result = run_blocking(move || {
             apply_annotation(&backend, &opaque_id, revision, &edited, max_bytes)
@@ -356,39 +362,12 @@ async fn run_annotation(backend: RingboardBackend, staged: AnnotationStage, oper
     .await;
 }
 
-async fn run_satty(input: &Path, output: &Path) -> bool {
-    satty_command(input, output)
+async fn run_editor(editor: &ImageEditorCommand, input: &Path, output: &Path) -> bool {
+    editor
+        .command(input, output)
         .status()
         .await
         .is_ok_and(|status| status.success())
-}
-
-fn satty_command(input: &Path, output: &Path) -> Command {
-    let mut command = Command::new("satty");
-    command.kill_on_drop(true);
-    command
-        .arg("--filename")
-        .arg(input)
-        .arg("--output-filename")
-        .arg(output)
-        .args([
-            "--resize",
-            "smart",
-            "--early-exit",
-            "--actions-on-enter",
-            "save-to-file",
-            "--actions-on-escape",
-            "exit",
-            "--actions-on-right-click",
-            "save-to-file",
-            // Route Satty's Copy button through the same validated output path. The
-            // daemon publishes the result only after Satty exits, avoiding a race
-            // between two independent Wayland clipboard owners.
-            "--save-after-copy",
-            "--copy-command",
-            "cat >/dev/null",
-        ]);
-    command
 }
 
 fn apply_annotation(
@@ -650,9 +629,9 @@ fn operation_error(error: impl std::fmt::Display) -> BackendError {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::Path};
+    use std::fs;
 
-    use super::{remove_files, satty_command, valid_edited_image};
+    use super::{remove_files, valid_edited_image};
 
     #[test]
     fn operation_cleanup_only_removes_its_own_files() {
@@ -669,29 +648,6 @@ mod tests {
         assert!(!first.exists());
         assert!(!second.exists());
         assert!(unrelated.exists());
-    }
-
-    #[test]
-    fn satty_save_and_copy_actions_return_through_the_daemon_output() {
-        let command = satty_command(Path::new("input image.png"), Path::new("edited image.png"));
-        let arguments: Vec<_> = command
-            .as_std()
-            .get_args()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect();
-
-        for pair in [
-            ["--filename", "input image.png"],
-            ["--output-filename", "edited image.png"],
-            ["--actions-on-enter", "save-to-file"],
-            ["--actions-on-escape", "exit"],
-            ["--actions-on-right-click", "save-to-file"],
-            ["--copy-command", "cat >/dev/null"],
-        ] {
-            assert!(arguments.windows(2).any(|window| window == pair));
-        }
-        assert!(arguments.iter().any(|value| value == "--save-after-copy"));
-        assert!(arguments.iter().any(|value| value == "--early-exit"));
     }
 
     #[test]

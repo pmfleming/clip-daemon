@@ -5,6 +5,7 @@ pub mod backend;
 pub mod classification;
 pub mod client;
 pub mod daemon;
+pub mod editor;
 pub mod fake;
 pub mod model;
 pub mod protocol;
