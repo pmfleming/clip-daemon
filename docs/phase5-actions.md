@@ -15,4 +15,4 @@ File reveal uses the desktop-neutral `org.freedesktop.FileManager1.ShowItems` D-
 
 Edit leases are one-use, expire after 60 seconds, and are limited to 256 KiB of valid UTF-8. Commit revalidates the entry revision. Ringboard replacement uses add/swap/remove so the original ring and favorite position are retained before the replacement becomes the current selection. Wipe clears all pending edit leases.
 
-Satty output is decoded and size-checked, replaces the original image in its ring, and is then restored to the clipboard. Cancellation aborts the tracked task. OCR remains an optional later milestone and is not part of phase 5.
+Satty receives a private staging copy rather than the original file. Its Save, Enter, and Copy actions write a separate daemon-owned output; clipboard publication is suppressed inside Satty so the daemon can decode and size-check the result, replace the original history entry, and then publish it exactly once. Save As remains an explicit external export and is not imported unless the user subsequently uses Save, Enter, or Copy. Cancellation aborts the tracked task. OCR remains an optional later milestone and is not part of phase 5.
