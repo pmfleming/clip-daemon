@@ -21,6 +21,7 @@ rustix = { version = "1", features = ["fs", "net"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+shlex = "1"
 toml = "0.9"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"

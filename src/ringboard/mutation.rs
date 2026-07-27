@@ -25,8 +25,8 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    backend::{BackendError, BackendErrorKind, BackendResult, ScreenshotRegion},
-    editor::ImageEditorCommand,
+    backend::{BackendError, BackendErrorKind, BackendResult, ClipboardBackend, ScreenshotRegion},
+    editor::{ImageEditorCommand, TextEditorCommand},
     model::{EntryKind, OperationResult},
     selection::{SelectionService, effective_limit},
 };
@@ -42,6 +42,14 @@ pub(super) struct AnnotationStage {
     output: PathBuf,
     opaque_id: String,
     revision: u64,
+    max_bytes: u64,
+}
+
+pub(super) struct TextEditStage {
+    file: PathBuf,
+    opaque_id: String,
+    revision: u64,
+    mime: String,
     max_bytes: u64,
 }
 
@@ -161,13 +169,78 @@ impl RingboardBackend {
                 return Err(operation_error("Clipboard operation state is unavailable"));
             }
         };
-        active.insert(operation_id, OperationTask { handle, files });
+        active.insert(
+            operation_id,
+            OperationTask {
+                handle,
+                files: files.to_vec(),
+            },
+        );
         drop(active);
         if start.send(()).is_err() {
             remove_files(&cleanup_files);
             return Err(operation_error("Annotation task could not be started"));
         }
         Ok(operation)
+    }
+
+    pub(super) fn launch_text_edit(&self, staged: TextEditStage) -> BackendResult<OperationResult> {
+        let mut operation = OperationResult::completed("edit-external", "Text editor started");
+        operation.status = "started".into();
+        let operation_id = operation.id.clone();
+        let files = vec![staged.file.clone()];
+        let cleanup_files = files.clone();
+        let operations = self.operations.clone();
+        let backend = self.clone();
+        let editor = self.text_editor.clone();
+        let task_id = operation_id.clone();
+        let (start, ready) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            if ready.await.is_ok() {
+                run_text_edit(backend, editor, staged, &task_id).await;
+            }
+            if let Ok(mut active) = operations.lock() {
+                active.remove(&task_id);
+            }
+        });
+        let mut active = match self.operations.lock() {
+            Ok(active) => active,
+            Err(_) => {
+                handle.abort();
+                remove_files(&cleanup_files);
+                return Err(operation_error("Clipboard operation state is unavailable"));
+            }
+        };
+        active.insert(operation_id, OperationTask { handle, files });
+        drop(active);
+        if start.send(()).is_err() {
+            remove_files(&cleanup_files);
+            return Err(operation_error("Text editor task could not be started"));
+        }
+        Ok(operation)
+    }
+
+    pub(super) fn stage_text_edit(
+        &self,
+        opaque_id: &str,
+        expected_revision: Option<u64>,
+        max_bytes: u64,
+    ) -> BackendResult<TextEditStage> {
+        let limit = max_bytes.min(super::MAX_DETAILS_BYTES as u64);
+        let (summary, bytes) = selected_bytes(self, opaque_id, expected_revision, limit)?;
+        if summary.kind != EntryKind::Text || std::str::from_utf8(&bytes).is_err() {
+            return Err(invalid_entry("Only UTF-8 text entries support this action"));
+        }
+        let directory = runtime_directory("clip-daemon/edits")?;
+        let file = unique_path(&directory, "txt");
+        write_private(&file, &bytes)?;
+        Ok(TextEditStage {
+            file,
+            opaque_id: opaque_id.to_owned(),
+            revision: summary.revision,
+            mime: summary.mime,
+            max_bytes: limit,
+        })
     }
 
     pub(super) fn stage_annotation(
@@ -357,6 +430,46 @@ async fn run_annotation(
     }
     let _ = run_blocking(move || {
         remove_files(&[input, output]);
+        Ok(())
+    })
+    .await;
+}
+
+async fn run_text_edit(
+    backend: RingboardBackend,
+    editor: TextEditorCommand,
+    staged: TextEditStage,
+    operation_id: &str,
+) {
+    let TextEditStage {
+        file,
+        opaque_id,
+        revision,
+        mime,
+        max_bytes,
+    } = staged;
+    // Give the picker time to hide so the editor becomes focused when it maps.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let edited = editor
+        .command(&file)
+        .status()
+        .await
+        .is_ok_and(|status| status.success());
+    if edited {
+        match read_path(&file, max_bytes) {
+            Ok(bytes) if std::str::from_utf8(&bytes).is_ok() => {
+                if let Err(error) = backend.replace(&opaque_id, revision, &mime, &bytes).await {
+                    tracing::warn!(%operation_id, code = %error.kind.code(), "text editor result could not be restored");
+                }
+            }
+            Ok(_) => tracing::warn!(%operation_id, "text editor returned non-UTF-8 content"),
+            Err(error) => {
+                tracing::warn!(%operation_id, code = %error.kind.code(), "text editor result could not be read")
+            }
+        }
+    }
+    let _ = run_blocking(move || {
+        remove_files(&[file]);
         Ok(())
     })
     .await;

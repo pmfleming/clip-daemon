@@ -42,6 +42,14 @@ export CLIP_DAEMON_IMAGE_EDITOR_COMMAND='["image-tool","--input","{input}","--ou
 
 Both placeholders must be separate arguments. The custom editor must not publish the Wayland clipboard itself; `clip-daemon` validates and publishes the returned image.
 
+Plain-text entries can be opened in an external editor. The daemon uses `CLIP_DAEMON_TEXT_EDITOR_COMMAND` when set, otherwise `VISUAL`, then `EDITOR`, and finally `code --wait`. The explicit override is a shell-free JSON argv template containing a separate `{file}` argument; the editor must block until it closes and edit that private file in place:
+
+```sh
+export CLIP_DAEMON_TEXT_EDITOR_COMMAND='["code","--wait","{file}"]'
+```
+
+After the editor exits successfully, `clip-daemon` validates the UTF-8 text, replaces the history item, and republishes it to the Wayland clipboard.
+
 See [`docs/phase4-safety.md`](docs/phase4-safety.md) for enforced privacy behavior and explicit Ringboard/Wayland limitations, and [`docs/phase5-actions.md`](docs/phase5-actions.md) for intelligent-action policy.
 
 Run the local quality review with:

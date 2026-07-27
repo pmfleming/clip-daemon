@@ -172,6 +172,7 @@ impl ClipboardBackend for FakeBackend {
             BackendMutation::Restore { .. } => self.operation(opaque_id, "copy"),
             BackendMutation::ImageAsFile { .. } => self.operation(opaque_id, "image-as-file"),
             BackendMutation::Annotate { .. } => self.operation(opaque_id, "annotate"),
+            BackendMutation::EditExternal { .. } => self.operation(opaque_id, "edit-external"),
             BackendMutation::Remove => self.remove(opaque_id),
             BackendMutation::SetFavorite(value) => self.favorite(opaque_id, value),
             BackendMutation::Wipe => {

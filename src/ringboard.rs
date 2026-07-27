@@ -19,7 +19,7 @@ use crate::{
         HistoryQuery, MAX_QUERY_LIMIT, MAX_WAYLAND_SELECTION_BYTES, ScreenshotRegion,
     },
     classification::{INSPECTION_LIMIT, bounded_preview},
-    editor::ImageEditorCommand,
+    editor::{ImageEditorCommand, TextEditorCommand},
     model::{
         BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
     },
@@ -82,7 +82,7 @@ impl SummaryCache {
 
 struct OperationTask {
     handle: JoinHandle<()>,
-    files: [PathBuf; 2],
+    files: Vec<PathBuf>,
 }
 
 struct QueryCandidate {
@@ -201,6 +201,7 @@ pub struct RingboardBackend {
     operations: Arc<Mutex<HashMap<String, OperationTask>>>,
     artifacts: Arc<Mutex<ArtifactRegistry>>,
     editor: ImageEditorCommand,
+    text_editor: TextEditorCommand,
     selection: SelectionService,
 }
 
@@ -213,6 +214,7 @@ impl Default for RingboardBackend {
             operations: Arc::new(Mutex::new(HashMap::new())),
             artifacts: Arc::new(Mutex::new(ArtifactRegistry::default())),
             editor: ImageEditorCommand::configured(),
+            text_editor: TextEditorCommand::configured(),
             selection: SelectionService::default(),
         }
     }
@@ -488,10 +490,12 @@ impl RingboardBackend {
             }
             BackendMutation::Wipe => self.wipe_entries(),
             BackendMutation::Cleanup => self.cleanup_artifacts(),
-            BackendMutation::Annotate { .. } => Err(BackendError::new(
-                BackendErrorKind::OperationFailed,
-                "Annotation must be started asynchronously",
-            )),
+            BackendMutation::Annotate { .. } | BackendMutation::EditExternal { .. } => {
+                Err(BackendError::new(
+                    BackendErrorKind::OperationFailed,
+                    "External editing must be started asynchronously",
+                ))
+            }
         }
     }
 
@@ -602,6 +606,14 @@ impl ClipboardBackend for RingboardBackend {
                 stage_annotation(&opaque_id, expected_revision, max_bytes)
             )?;
             return self.launch_annotation(staged);
+        }
+        if let BackendMutation::EditExternal { max_bytes } = mutation {
+            let opaque_id = opaque_id.to_owned();
+            let staged = run_backend!(
+                self,
+                stage_text_edit(&opaque_id, expected_revision, max_bytes)
+            )?;
+            return self.launch_text_edit(staged);
         }
         let opaque_id = opaque_id.to_owned();
         run_backend!(self, mutate_sync(&opaque_id, expected_revision, mutation))
