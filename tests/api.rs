@@ -46,6 +46,11 @@ async fn validation_unknown_methods_and_wipe_challenges_are_stable() {
             json!({"x":0,"y":0,"width":0,"height":720}),
             "validation-error",
         ),
+        (
+            "clipboard.selection.publishFiles",
+            json!({"operation":"copy","paths":["relative.txt"]}),
+            "validation-error",
+        ),
         ("clipboard.nope", json!({}), "unsupported-method"),
     ] {
         assert_eq!(api.dispatch(method, params).await["error"]["code"], code);
@@ -57,6 +62,14 @@ async fn validation_unknown_methods_and_wipe_challenges_are_stable() {
         )
         .await;
     assert_eq!(screenshot["data"]["operation"]["action"], "screenshot");
+
+    let published = api
+        .dispatch(
+            "clipboard.selection.publishFiles",
+            json!({"operation":"cut","paths":["/tmp/one.txt","/tmp/two.txt"]}),
+        )
+        .await;
+    assert_eq!(published["data"]["operation"]["action"], "publish-files");
 
     let challenge = api
         .dispatch("clipboard.history.wipe.prepare", json!({}))

@@ -4,8 +4,8 @@ use async_trait::async_trait;
 
 use crate::{
     backend::{
-        BackendError, BackendMutation, BackendResult, ClipboardBackend, HistoryQuery,
-        ScreenshotRegion,
+        BackendError, BackendMutation, BackendResult, ClipboardBackend, FileSelection,
+        HistoryQuery, ScreenshotRegion,
     },
     classification::{bounded_preview, classify},
     model::{
@@ -157,6 +157,20 @@ impl ClipboardBackend for FakeBackend {
         _max_bytes: u64,
     ) -> BackendResult<OperationResult> {
         completed("screenshot", "Fake screenshot copied")
+    }
+
+    async fn publish_files(
+        &self,
+        selection: FileSelection,
+        _max_bytes: u64,
+    ) -> BackendResult<OperationResult> {
+        if selection.paths.is_empty() {
+            return Err(BackendError::new(
+                crate::backend::BackendErrorKind::InvalidData,
+                "File selection is empty",
+            ));
+        }
+        completed("publish-files", "Fake file selection published")
     }
 
     async fn mutate(

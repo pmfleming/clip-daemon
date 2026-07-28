@@ -98,6 +98,12 @@ impl ApiService {
                     .capture_screenshot(decode(params)?, max_entry_bytes)
                     .await
             }
+            "clipboard.selection.publishFiles" => {
+                let max_entry_bytes = self.settings.get().map_err(settings_error)?.max_entry_bytes;
+                self.actions
+                    .publish_files(decode(params)?, max_entry_bytes)
+                    .await
+            }
             "clipboard.settings.get" => self.get_settings(),
             "clipboard.settings.update" => self.update_settings(decode(params)?).await,
             _ if protocol::METHODS.contains(&method) => Err(ApiError::new(

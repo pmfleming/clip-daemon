@@ -1,4 +1,4 @@
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, path::PathBuf};
 
 use async_trait::async_trait;
 
@@ -21,6 +21,27 @@ pub struct ScreenshotRegion {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileSelectionOperation {
+    Copy,
+    Cut,
+}
+
+impl FileSelectionOperation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Cut => "cut",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSelection {
+    pub operation: FileSelectionOperation,
+    pub paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +160,11 @@ pub trait ClipboardBackend: Send + Sync {
     async fn capture_screenshot(
         &self,
         region: ScreenshotRegion,
+        max_bytes: u64,
+    ) -> BackendResult<OperationResult>;
+    async fn publish_files(
+        &self,
+        selection: FileSelection,
         max_bytes: u64,
     ) -> BackendResult<OperationResult>;
     async fn mutate(

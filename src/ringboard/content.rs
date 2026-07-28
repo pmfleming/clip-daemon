@@ -261,14 +261,20 @@ fn gnome_operation<'a>(mime: &str, lines: &mut impl Iterator<Item = &'a str>) ->
 
 fn file_preview(uri: &str, operation: &str) -> Option<FilePreview> {
     let url = Url::parse(uri).ok()?;
-    let display_name = url
-        .path_segments()
-        .and_then(Iterator::last)
-        .filter(|name| !name.is_empty())
-        .unwrap_or("File")
-        .to_owned();
+    let local_path = url.to_file_path().ok();
+    let display_name = local_path
+        .as_deref()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .or_else(|| {
+            url.path_segments()
+                .and_then(Iterator::last)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "File".into());
     Some(FilePreview {
-        exists: url.to_file_path().ok().is_some_and(|path| path.exists()),
+        exists: local_path.is_some_and(|path| path.exists()),
         uri: url.to_string(),
         display_name,
         operation: operation.to_owned(),
@@ -449,6 +455,12 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].display_name, "one.txt");
         assert_eq!(files[0].operation, "cut");
+        assert_eq!(
+            file_preview("file:///tmp/file%20with%20spaces.txt", "copy")
+                .expect("encoded local file URI")
+                .display_name,
+            "file with spaces.txt"
+        );
         assert_eq!(file_preview("not a uri", "copy"), None);
     }
 

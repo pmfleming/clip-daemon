@@ -13,14 +13,15 @@ use uuid::Uuid;
 
 use crate::{
     backend::{
-        BackendError, BackendErrorKind, BackendMutation, ClipboardBackend, HistoryQuery,
-        MAX_QUERY_LIMIT, ScreenshotRegion,
+        BackendError, BackendErrorKind, BackendMutation, ClipboardBackend, FileSelection,
+        FileSelectionOperation, HistoryQuery, MAX_QUERY_LIMIT, ScreenshotRegion,
     },
     model::{EntryDetails, EntryKind, FilePreview, OperationResult},
     session::SessionManager,
 };
 
 const MAX_EDIT_BYTES: usize = 256 * 1024;
+const MAX_PUBLISHED_FILES: usize = 100;
 pub type Backend = Arc<dyn ClipboardBackend>;
 
 #[derive(Debug)]
@@ -182,6 +183,37 @@ impl ClipboardService {
                     y: params.y,
                     width: params.width,
                     height: params.height,
+                },
+                max_entry_bytes,
+            )
+            .await?;
+        Ok(json!({ "operation": operation }))
+    }
+
+    pub(crate) async fn publish_files(
+        &self,
+        params: PublishFilesParams,
+        max_entry_bytes: u64,
+    ) -> Result<Value, ApiError> {
+        let operation = match params.operation.as_str() {
+            "copy" => FileSelectionOperation::Copy,
+            "cut" => FileSelectionOperation::Cut,
+            _ => return Err(ApiError::validation("operation must be copy or cut")),
+        };
+        if !(1..=MAX_PUBLISHED_FILES).contains(&params.paths.len()) {
+            return Err(ApiError::validation(
+                "paths must contain between 1 and 100 files",
+            ));
+        }
+        if params.paths.iter().any(|path| !path.is_absolute()) {
+            return Err(ApiError::validation("every file path must be absolute"));
+        }
+        let operation = self
+            .backend
+            .publish_files(
+                FileSelection {
+                    operation,
+                    paths: params.paths,
                 },
                 max_entry_bytes,
             )
@@ -372,6 +404,12 @@ pub(crate) struct QueryParams {
     generation: u64,
     #[serde(default = "default_query_limit")]
     limit: usize,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct PublishFilesParams {
+    operation: String,
+    paths: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]

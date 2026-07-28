@@ -25,9 +25,12 @@
               install -Dm644 ${./packaging/systemd/clip-daemon.service} $out/share/systemd/user/clip-daemon.service
               install -Dm644 ${./packaging/dbus/org.laufan.ClipDaemon.service} \
                 $out/share/dbus-1/services/org.laufan.ClipDaemon.service
+              install -Dm644 ${./integrations/yazi/yank-to-clip-daemon.yazi/main.lua} \
+                $out/share/yazi/plugins/yank-to-clip-daemon.yazi/main.lua
               substituteInPlace \
                 $out/share/systemd/user/clip-daemon.service \
                 $out/share/dbus-1/services/org.laufan.ClipDaemon.service \
+                $out/share/yazi/plugins/yank-to-clip-daemon.yazi/main.lua \
                 --replace-fail @out@ $out
             '';
             postFixup = ''

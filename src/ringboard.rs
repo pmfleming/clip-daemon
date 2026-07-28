@@ -12,11 +12,13 @@ use tokio::task::{JoinError, JoinHandle, spawn_blocking};
 use async_trait::async_trait;
 use clipboard_history_client_sdk::{DatabaseReader, Entry, EntryReader, LoadedEntry};
 use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::{
     backend::{
         BackendError, BackendErrorKind, BackendMutation, BackendResult, ClipboardBackend,
-        HistoryQuery, MAX_QUERY_LIMIT, MAX_WAYLAND_SELECTION_BYTES, ScreenshotRegion,
+        FileSelection, HistoryQuery, MAX_QUERY_LIMIT, MAX_WAYLAND_SELECTION_BYTES,
+        ScreenshotRegion,
     },
     classification::{INSPECTION_LIMIT, bounded_preview},
     editor::{ImageEditorCommand, TextEditorCommand},
@@ -533,6 +535,47 @@ impl RingboardBackend {
         Ok(())
     }
 
+    fn publish_files_sync(
+        &self,
+        file_selection: FileSelection,
+        max_bytes: u64,
+    ) -> BackendResult<OperationResult> {
+        let file_count = file_selection.paths.len();
+        if !(1..=MAX_FILES).contains(&file_count) {
+            return Err(BackendError::new(
+                BackendErrorKind::InvalidData,
+                "File selection must contain between 1 and 100 paths",
+            ));
+        }
+
+        let mut uri_list = Vec::new();
+        for path in &file_selection.paths {
+            if !path.is_absolute() {
+                return Err(BackendError::new(
+                    BackendErrorKind::InvalidData,
+                    "File selection paths must be absolute",
+                ));
+            }
+            let uri = Url::from_file_path(path).map_err(|_| {
+                BackendError::new(
+                    BackendErrorKind::InvalidData,
+                    "File selection path is invalid",
+                )
+            })?;
+            uri_list.extend_from_slice(uri.as_str().as_bytes());
+            uri_list.extend_from_slice(b"\r\n");
+        }
+        self.selection
+            .publish_files(file_selection.operation.as_str(), uri_list, max_bytes)?;
+        Ok(OperationResult::completed(
+            "publish-files",
+            &format!(
+                "Mirrored {file_count} file{} to the clipboard",
+                if file_count == 1 { "" } else { "s" }
+            ),
+        ))
+    }
+
     fn resolve(&self, opaque: &str) -> BackendResult<IdentityBinding> {
         self.ids
             .lock()
@@ -590,6 +633,14 @@ impl ClipboardBackend for RingboardBackend {
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
         run_backend!(self, capture_region(region, max_bytes))
+    }
+
+    async fn publish_files(
+        &self,
+        selection: FileSelection,
+        max_bytes: u64,
+    ) -> BackendResult<OperationResult> {
+        run_backend!(self, publish_files_sync(selection, max_bytes))
     }
 
     async fn mutate(

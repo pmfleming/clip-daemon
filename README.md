@@ -42,6 +42,12 @@ export CLIP_DAEMON_IMAGE_EDITOR_COMMAND='["image-tool","--input","{input}","--ou
 
 Both placeholders must be separate arguments. The custom editor must not publish the Wayland clipboard itself; `clip-daemon` validates and publishes the returned image.
 
+## Yazi copied files
+
+Yazi keeps its normal file yank state internally. The bundled `yank-to-clip-daemon.yazi` plugin mirrors each non-empty yank to `clipboard.selection.publishFiles`, preserving copy/cut mode and multi-file selections. The daemon validates up to 100 absolute local paths, encodes them as file URIs, and publishes both `x-special/gnome-copied-files` and `text/uri-list` in one Wayland selection. No `wl-copy` process or additional runtime dependency is required.
+
+When packaged, the plugin is available at `$out/share/yazi/plugins/yank-to-clip-daemon.yazi`. Configure it through Yazi or Home Manager and call its `setup` function. Empty unyank events intentionally leave the current system clipboard unchanged.
+
 Plain-text entries can be opened in an external editor. The daemon uses `CLIP_DAEMON_TEXT_EDITOR_COMMAND` when set, otherwise `VISUAL`, then `EDITOR`, and finally `code --wait`. The explicit override is a shell-free JSON argv template containing a separate `{file}` argument; the editor must block until it closes and edit that private file in place:
 
 ```sh

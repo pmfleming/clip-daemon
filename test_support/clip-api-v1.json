@@ -110,6 +110,18 @@
         "stream": "clipboard.operation"
       },
       {
+        "name": "clipboard.selection.publishFiles",
+        "params_example": {
+          "operation": "copy",
+          "paths": [
+            "/home/user/Documents/one.txt",
+            "/home/user/Documents/two.txt"
+          ]
+        },
+        "response_key": "operation",
+        "stream": "clipboard.operation"
+      },
+      {
         "name": "clipboard.settings.get",
         "params_example": {},
         "response_key": "settings",

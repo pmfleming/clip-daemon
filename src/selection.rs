@@ -12,6 +12,11 @@ pub trait SelectionPublisher: Send + Sync {
     fn publish_file_link(&self, uri: Vec<u8>) -> BackendResult<()> {
         self.publish("text/uri-list", uri)
     }
+
+    fn publish_files(&self, gnome_payload: Vec<u8>, uri_list: Vec<u8>) -> BackendResult<()> {
+        let _ = uri_list;
+        self.publish("x-special/gnome-copied-files", gnome_payload)
+    }
 }
 
 #[derive(Default)]
@@ -49,6 +54,26 @@ impl SelectionPublisher for WaylandSelectionPublisher {
             ])
             .map_err(|error| selection_error(error.to_string()))
     }
+
+    fn publish_files(&self, gnome_payload: Vec<u8>, uri_list: Vec<u8>) -> BackendResult<()> {
+        let mut options = Options::new();
+        options
+            .clipboard(ClipboardType::Regular)
+            .seat(Seat::All)
+            .omit_additional_text_mime_types(true);
+        options
+            .copy_multi(vec![
+                MimeSource {
+                    source: Source::Bytes(gnome_payload.into_boxed_slice()),
+                    mime_type: MimeType::Specific("x-special/gnome-copied-files".into()),
+                },
+                MimeSource {
+                    source: Source::Bytes(uri_list.into_boxed_slice()),
+                    mime_type: MimeType::Specific("text/uri-list".into()),
+                },
+            ])
+            .map_err(|error| selection_error(error.to_string()))
+    }
 }
 
 #[derive(Clone)]
@@ -79,6 +104,27 @@ impl SelectionService {
     pub fn publish_file_link(&self, uri: Vec<u8>, configured_limit: u64) -> BackendResult<()> {
         validate_size(uri.len() as u64, configured_limit)?;
         self.publisher.publish_file_link(uri)
+    }
+
+    pub fn publish_files(
+        &self,
+        operation: &str,
+        uri_list: Vec<u8>,
+        configured_limit: u64,
+    ) -> BackendResult<()> {
+        if !matches!(operation, "copy" | "cut") {
+            return Err(BackendError::new(
+                BackendErrorKind::InvalidData,
+                "File selection operation must be copy or cut",
+            ));
+        }
+        let mut gnome_payload = Vec::with_capacity(operation.len() + 1 + uri_list.len());
+        gnome_payload.extend_from_slice(operation.as_bytes());
+        gnome_payload.push(b'\n');
+        gnome_payload.extend_from_slice(&uri_list);
+        validate_size(uri_list.len() as u64, configured_limit)?;
+        validate_size(gnome_payload.len() as u64, configured_limit)?;
+        self.publisher.publish_files(gnome_payload, uri_list)
     }
 
     pub fn publish_file(
@@ -193,6 +239,13 @@ mod tests {
             values.push(("text/plain".into(), text));
             Ok(())
         }
+
+        fn publish_files(&self, gnome_payload: Vec<u8>, uri_list: Vec<u8>) -> BackendResult<()> {
+            let mut values = self.values.lock().unwrap();
+            values.push(("x-special/gnome-copied-files".into(), gnome_payload));
+            values.push(("text/uri-list".into(), uri_list));
+            Ok(())
+        }
     }
 
     #[test]
@@ -203,6 +256,13 @@ mod tests {
         service
             .publish_file_link(b"file:///tmp/image.png\r\n".to_vec(), 1024)
             .unwrap();
+        service
+            .publish_files(
+                "cut",
+                b"file:///tmp/one.txt\r\nfile:///tmp/two.txt\r\n".to_vec(),
+                1024,
+            )
+            .unwrap();
         assert_eq!(
             publisher.values.lock().unwrap().as_slice(),
             &[
@@ -211,7 +271,15 @@ mod tests {
                     "text/uri-list".into(),
                     b"file:///tmp/image.png\r\n".to_vec()
                 ),
-                ("text/plain".into(), b"file:///tmp/image.png".to_vec())
+                ("text/plain".into(), b"file:///tmp/image.png".to_vec()),
+                (
+                    "x-special/gnome-copied-files".into(),
+                    b"cut\nfile:///tmp/one.txt\r\nfile:///tmp/two.txt\r\n".to_vec()
+                ),
+                (
+                    "text/uri-list".into(),
+                    b"file:///tmp/one.txt\r\nfile:///tmp/two.txt\r\n".to_vec()
+                )
             ]
         );
     }
