@@ -18,6 +18,8 @@ use super::{ClipDaemon, emit_event};
 
 type Subscriptions = Arc<Mutex<HashMap<String, JoinHandle<()>>>>;
 
+const HISTORY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 #[derive(Clone, Copy)]
 struct RequestedStreams {
     history: bool,
@@ -104,11 +106,11 @@ impl HistoryState {
     }
 
     fn changed(&mut self, token: u64) -> bool {
+        // An initial reset closes the race between a frontend's first query and
+        // establishing this subscription's history baseline.
+        let previous = self.previous.replace(token);
         std::mem::replace(&mut self.unavailable, false)
-            || self
-                .previous
-                .replace(token)
-                .is_some_and(|previous| previous != token)
+            || previous.is_none_or(|previous| previous != token)
     }
 }
 
@@ -155,7 +157,7 @@ async fn poll_history(
     requested: RequestedStreams,
 ) {
     let mut state = HistoryState::default();
-    let mut timer = tokio::time::interval(Duration::from_millis(500));
+    let mut timer = tokio::time::interval(HISTORY_POLL_INTERVAL);
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         timer.tick().await;
@@ -255,9 +257,9 @@ mod tests {
     }
 
     #[test]
-    fn history_state_emits_changes_outages_and_recovery_once() {
+    fn history_state_emits_initial_changes_outages_and_recovery_once() {
         let mut state = HistoryState::default();
-        assert!(state.update(Ok(1)).is_none());
+        assert!(matches!(state.update(Ok(1)), Some(HistoryUpdate::Changed)));
         assert!(state.update(Ok(1)).is_none());
         assert!(matches!(state.update(Ok(2)), Some(HistoryUpdate::Changed)));
         assert!(matches!(
