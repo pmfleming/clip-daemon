@@ -297,22 +297,22 @@ fn mime_or_default(mime: &str) -> &str {
 }
 
 fn canonical_mime(mime: &str) -> &str {
+    const ALIASES: [(&str, &str); 6] = [
+        ("image/x-png", "image/png"),
+        ("image/jpg", "image/jpeg"),
+        ("image/pjpeg", "image/jpeg"),
+        (
+            "application/x-gnome-copied-files",
+            "x-special/gnome-copied-files",
+        ),
+        ("text/x-uri", "text/uri-list"),
+        ("text/x-uri-list", "text/uri-list"),
+    ];
     let essence = mime.split(';').next().unwrap_or(mime).trim();
-    if essence.eq_ignore_ascii_case("image/x-png") {
-        "image/png"
-    } else if essence.eq_ignore_ascii_case("image/jpg")
-        || essence.eq_ignore_ascii_case("image/pjpeg")
-    {
-        "image/jpeg"
-    } else if essence.eq_ignore_ascii_case("application/x-gnome-copied-files") {
-        "x-special/gnome-copied-files"
-    } else if essence.eq_ignore_ascii_case("text/x-uri")
-        || essence.eq_ignore_ascii_case("text/x-uri-list")
-    {
-        "text/uri-list"
-    } else {
-        essence
-    }
+    ALIASES
+        .iter()
+        .find_map(|(alias, canonical)| essence.eq_ignore_ascii_case(alias).then_some(*canonical))
+        .unwrap_or(essence)
 }
 
 pub(super) fn image_identity(mime: &str, bytes: &[u8]) -> String {

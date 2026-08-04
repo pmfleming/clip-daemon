@@ -1,6 +1,7 @@
 use std::{
     env,
     fs::{self, File, OpenOptions},
+    future::Future,
     io::{Read, Write},
     os::{
         fd::{AsFd, OwnedFd},
@@ -25,10 +26,12 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    backend::{BackendError, BackendErrorKind, BackendResult, ClipboardBackend, ScreenshotRegion},
+    backend::{
+        BackendError, BackendErrorKind, BackendResult, ClipboardBackend,
+        MAX_WAYLAND_SELECTION_BYTES, ScreenshotRegion,
+    },
     editor::{ImageEditorCommand, TextEditorCommand},
     model::{EntryKind, OperationResult},
-    selection::{SelectionService, effective_limit},
 };
 
 use super::{
@@ -54,6 +57,33 @@ pub(super) struct TextEditStage {
 }
 
 impl RingboardBackend {
+    fn track_image_file(
+        &self,
+        path: &Path,
+        created: bool,
+        source_id: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> BackendResult<()> {
+        if !created {
+            self.artifact_registry()?.activate_if_generated(path);
+            return Ok(());
+        }
+        self.artifact_registry()
+            .and_then(|mut registry| registry.register(path, source_id, mime, bytes))
+            .inspect_err(|_| {
+                let _ = fs::remove_file(path);
+            })
+    }
+
+    fn rollback_image_file(&self, path: &Path, created: bool) -> BackendResult<()> {
+        if created {
+            self.artifact_registry()?.forget(path);
+            let _ = fs::remove_file(path);
+        }
+        Ok(())
+    }
+
     pub(super) fn capture_region(
         &self,
         region: ScreenshotRegion,
@@ -62,13 +92,10 @@ impl RingboardBackend {
         let directory = runtime_directory("clip-daemon/screenshots")?;
         let path = unique_path(&directory, "png");
         drop(private_file(&path)?);
-        let result = capture_and_publish(region, &path, &self.selection, max_bytes);
+        let result = capture_and_publish(self, region, &path, max_bytes);
         let _ = fs::remove_file(path);
         if result.is_ok() {
-            self.artifacts
-                .lock()
-                .map_err(|_| operation_error("Generated-file registry is unavailable"))?
-                .clear_active_selection();
+            self.artifact_registry()?.clear_active_selection();
             self.clear_identity_state()?;
         }
         result
@@ -81,11 +108,8 @@ impl RingboardBackend {
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
         let (summary, bytes) = selected_bytes(self, opaque_id, expected_revision, max_bytes)?;
-        publish_entry(&self.selection, &summary, &bytes, max_bytes)?;
-        self.artifacts
-            .lock()
-            .map_err(|_| operation_error("Generated-file registry is unavailable"))?
-            .clear_active_selection();
+        publish_entry(self, &summary, &bytes, max_bytes)?;
+        self.artifact_registry()?.clear_active_selection();
         self.clear_identity_state()?;
         Ok(completed(
             "copy",
@@ -100,124 +124,92 @@ impl RingboardBackend {
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
         let (summary, bytes) = selected_image(self, opaque_id, expected_revision, max_bytes)?;
-        let content = ResolvedContent::resolve(&summary.mime, &bytes, effective_limit(max_bytes));
+        let content = resolved_content(&summary.mime, &bytes, max_bytes);
         let (path, created) = prepare_image_file(&content, &bytes)?;
-        if created {
-            if let Err(error) = self
-                .artifacts
-                .lock()
-                .map_err(|_| operation_error("Generated-file registry is unavailable"))?
-                .register(&path, &summary.id, content.mime(), &bytes)
-            {
-                let _ = fs::remove_file(&path);
-                return Err(error);
-            }
-        } else {
-            self.artifacts
-                .lock()
-                .map_err(|_| operation_error("Generated-file registry is unavailable"))?
-                .activate_if_generated(&path);
-        }
-        if let Err(error) = publish_image_uri(&self.selection, &path, max_bytes) {
-            if created {
-                self.artifacts
-                    .lock()
-                    .map_err(|_| operation_error("Generated-file registry is unavailable"))?
-                    .forget(&path);
-                let _ = fs::remove_file(&path);
-            }
+        self.track_image_file(&path, created, &summary.id, content.mime(), &bytes)?;
+        if let Err(error) = publish_image_uri(self, &path, max_bytes) {
+            self.rollback_image_file(&path, created)?;
             return Err(error);
         }
         self.clear_identity_state()?;
-        let message = if created {
-            "Image file copied"
-        } else {
-            "Image file link copied"
-        };
+        let message = ["Image file link copied", "Image file copied"][usize::from(created)];
         let mut result = OperationResult::completed("image-as-file", message);
         result.path = Some(path.to_string_lossy().into_owned());
         Ok(result)
+    }
+
+    fn launch_operation<F, Fut>(
+        &self,
+        action: &str,
+        message: &str,
+        start_error: &'static str,
+        files: Vec<PathBuf>,
+        run: F,
+    ) -> BackendResult<OperationResult>
+    where
+        F: FnOnce(String) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut operation = OperationResult::completed(action, message);
+        operation.status = "started".into();
+        let operation_id = operation.id.clone();
+        let cleanup_files = files.clone();
+        let operations = self.operations.clone();
+        let task_id = operation_id.clone();
+        let (start, ready) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            if ready.await.is_ok() {
+                run(task_id.clone()).await;
+            }
+            if let Ok(mut active) = operations.lock() {
+                active.remove(&task_id);
+            }
+        });
+        let mut active = self.operations.lock().map_err(|_| {
+            handle.abort();
+            remove_files(&cleanup_files);
+            operation_error("Clipboard operation state is unavailable")
+        })?;
+        active.insert(operation_id, OperationTask { handle, files });
+        drop(active);
+        start.send(()).map_err(|_| {
+            remove_files(&cleanup_files);
+            operation_error(start_error)
+        })?;
+        Ok(operation)
     }
 
     pub(super) fn launch_annotation(
         &self,
         staged: AnnotationStage,
     ) -> BackendResult<OperationResult> {
-        let mut operation = OperationResult::completed("annotate", "Image editor started");
-        operation.status = "started".into();
-        let operation_id = operation.id.clone();
-        let files = [staged.input.clone(), staged.output.clone()];
-        let cleanup_files = files.clone();
-        let operations = self.operations.clone();
         let backend = self.clone();
         let editor = self.editor.clone();
-        let task_id = operation_id.clone();
-        let (start, ready) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(async move {
-            if ready.await.is_ok() {
+        let files = vec![staged.input.clone(), staged.output.clone()];
+        self.launch_operation(
+            "annotate",
+            "Image editor started",
+            "Annotation task could not be started",
+            files,
+            move |task_id| async move {
                 run_annotation(backend, editor, staged, &task_id).await;
-            }
-            if let Ok(mut active) = operations.lock() {
-                active.remove(&task_id);
-            }
-        });
-        let mut active = match self.operations.lock() {
-            Ok(active) => active,
-            Err(_) => {
-                handle.abort();
-                remove_files(&cleanup_files);
-                return Err(operation_error("Clipboard operation state is unavailable"));
-            }
-        };
-        active.insert(
-            operation_id,
-            OperationTask {
-                handle,
-                files: files.to_vec(),
             },
-        );
-        drop(active);
-        if start.send(()).is_err() {
-            remove_files(&cleanup_files);
-            return Err(operation_error("Annotation task could not be started"));
-        }
-        Ok(operation)
+        )
     }
 
     pub(super) fn launch_text_edit(&self, staged: TextEditStage) -> BackendResult<OperationResult> {
-        let mut operation = OperationResult::completed("edit-external", "Text editor started");
-        operation.status = "started".into();
-        let operation_id = operation.id.clone();
-        let files = vec![staged.file.clone()];
-        let cleanup_files = files.clone();
-        let operations = self.operations.clone();
         let backend = self.clone();
         let editor = self.text_editor.clone();
-        let task_id = operation_id.clone();
-        let (start, ready) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(async move {
-            if ready.await.is_ok() {
+        let files = vec![staged.file.clone()];
+        self.launch_operation(
+            "edit-external",
+            "Text editor started",
+            "Text editor task could not be started",
+            files,
+            move |task_id| async move {
                 run_text_edit(backend, editor, staged, &task_id).await;
-            }
-            if let Ok(mut active) = operations.lock() {
-                active.remove(&task_id);
-            }
-        });
-        let mut active = match self.operations.lock() {
-            Ok(active) => active,
-            Err(_) => {
-                handle.abort();
-                remove_files(&cleanup_files);
-                return Err(operation_error("Clipboard operation state is unavailable"));
-            }
-        };
-        active.insert(operation_id, OperationTask { handle, files });
-        drop(active);
-        if start.send(()).is_err() {
-            remove_files(&cleanup_files);
-            return Err(operation_error("Text editor task could not be started"));
-        }
-        Ok(operation)
+            },
+        )
     }
 
     pub(super) fn stage_text_edit(
@@ -252,7 +244,7 @@ impl RingboardBackend {
         let limit = max_bytes.min(MAX_THUMBNAIL_BYTES);
         let (summary, bytes) = selected_image(self, opaque_id, expected_revision, limit)?;
         let revision = summary.revision;
-        let content = ResolvedContent::resolve(&summary.mime, &bytes, effective_limit(limit));
+        let content = resolved_content(&summary.mime, &bytes, limit);
         let (mime, image_bytes) = match content.image() {
             Some(ResolvedImage::Inline { mime, .. }) => ((*mime).to_owned(), bytes),
             Some(ResolvedImage::LocalFile(source)) => {
@@ -273,6 +265,19 @@ impl RingboardBackend {
         })
     }
 
+    fn replace_file_entry(
+        &self,
+        opaque_id: &str,
+        expected_revision: Option<u64>,
+        path: &Path,
+        mime: &str,
+    ) -> BackendResult<u64> {
+        let (entry, _, summary) = self.selected(opaque_id, expected_revision)?;
+        replace_from_file(entry.id(), target_ring(summary.favorite), path, mime)?;
+        self.clear_identity_state()?;
+        Ok(entry.id())
+    }
+
     pub(super) fn replace_entry(
         &self,
         opaque_id: &str,
@@ -285,16 +290,9 @@ impl RingboardBackend {
         private_file(&path)?
             .write_all(bytes)
             .map_err(operation_error)?;
-        let result = self
-            .selected(opaque_id, expected_revision)
-            .and_then(|(entry, _, summary)| {
-                replace_from_file(entry.id(), target_ring(summary.favorite), &path, mime)?;
-                Ok(entry.id())
-            });
+        let result = self.replace_file_entry(opaque_id, expected_revision, &path, mime);
         let _ = fs::remove_file(path);
-        let raw_id = result?;
-        self.clear_identity_state()?;
-        Ok(raw_id)
+        result
     }
 
     pub(super) fn remove_entry(
@@ -341,11 +339,7 @@ impl RingboardBackend {
         let runtime = runtime_directory("clip-daemon")?;
         fs::remove_dir_all(&runtime).map_err(operation_error)?;
         let references = self.generated_artifact_references()?;
-        let removed = self
-            .artifacts
-            .lock()
-            .map_err(|_| operation_error("Generated-file registry is unavailable"))?
-            .reconcile(&references)?;
+        let removed = self.artifact_registry()?.reconcile(&references)?;
         Ok(completed(
             "cleanup",
             &format!("Clipboard caches cleared; {removed} unreferenced generated files removed"),
@@ -364,19 +358,16 @@ impl RingboardBackend {
             remove_raw(&server, id)?;
         }
         self.cleanup_artifacts()?;
-        self.artifacts
-            .lock()
-            .map_err(|_| operation_error("Generated-file registry is unavailable"))?
-            .clear_all()?;
+        self.artifact_registry()?.clear_all()?;
         self.clear_identity_state()?;
         Ok(completed("wipe", "Clipboard history cleared"))
     }
 }
 
 fn capture_and_publish(
+    backend: &RingboardBackend,
     region: ScreenshotRegion,
     path: &Path,
-    selection: &SelectionService,
     max_bytes: u64,
 ) -> BackendResult<OperationResult> {
     let geometry = format!(
@@ -396,7 +387,9 @@ fn capture_and_publish(
             "Screenshot capture returned an invalid image",
         ));
     }
-    selection.publish_file("image/png", path, max_bytes.min(MAX_THUMBNAIL_BYTES))?;
+    backend
+        .selection
+        .publish_file("image/png", path, max_bytes.min(MAX_THUMBNAIL_BYTES))?;
     Ok(completed(
         "screenshot",
         "Screenshot published to the Wayland clipboard",
@@ -493,26 +486,17 @@ fn apply_annotation(
     if !valid_edited_image(output, max_bytes) {
         return Err(operation_error("Annotation returned an invalid image"));
     }
-    let (entry, _, summary) = backend.selected(opaque_id, Some(revision))?;
-    let raw_id = entry.id();
-    replace_from_file(raw_id, target_ring(summary.favorite), output, "image/png")?;
-    backend.clear_identity_state()?;
+    let raw_id = backend.replace_file_entry(opaque_id, Some(revision), output, "image/png")?;
     let source = backend.details_raw_sync(raw_id, super::MAX_DETAILS_BYTES)?;
     let bytes = fs::read(output).map_err(operation_error)?;
     backend
-        .artifacts
-        .lock()
-        .map_err(|_| operation_error("Generated-file registry is unavailable"))?
+        .artifact_registry()?
         .register_inline_echo(&source.entry.id, "image/png", &bytes)?;
     backend.clear_identity_state()?;
     backend
         .selection
         .publish_file("image/png", output, max_bytes)?;
-    backend
-        .artifacts
-        .lock()
-        .map_err(|_| operation_error("Generated-file registry is unavailable"))?
-        .clear_active_selection();
+    backend.artifact_registry()?.clear_active_selection();
     Ok(())
 }
 
@@ -574,21 +558,25 @@ fn selected_image(
         .ok_or_else(|| invalid_entry("Only image entries support this action"))
 }
 
+fn resolved_content(mime: &str, bytes: &[u8], max_bytes: u64) -> ResolvedContent {
+    ResolvedContent::resolve(mime, bytes, max_bytes.min(MAX_WAYLAND_SELECTION_BYTES))
+}
+
 fn publish_entry(
-    selection: &SelectionService,
+    backend: &RingboardBackend,
     summary: &crate::model::EntrySummary,
     bytes: &[u8],
     max_bytes: u64,
 ) -> BackendResult<()> {
-    let content = ResolvedContent::resolve(&summary.mime, bytes, effective_limit(max_bytes));
+    let content = resolved_content(&summary.mime, bytes, max_bytes);
     if summary.kind == EntryKind::Image && content.kind() != EntryKind::Image {
         return Err(invalid_entry(
             "Clipboard image file is missing, unsafe, invalid, or exceeds the size limit",
         ));
     }
     match content.default_publication() {
-        Publication::Bytes { mime } => selection.publish(mime, bytes.to_vec(), max_bytes),
-        Publication::File { mime, path } => selection.publish_file(mime, path, max_bytes),
+        Publication::Bytes { mime } => backend.selection.publish(mime, bytes.to_vec(), max_bytes),
+        Publication::File { mime, path } => backend.selection.publish_file(mime, path, max_bytes),
     }
 }
 
@@ -604,14 +592,12 @@ fn prepare_image_file(content: &ResolvedContent, bytes: &[u8]) -> BackendResult<
     }
 }
 
-fn publish_image_uri(
-    selection: &SelectionService,
-    path: &Path,
-    max_bytes: u64,
-) -> BackendResult<()> {
+fn publish_image_uri(backend: &RingboardBackend, path: &Path, max_bytes: u64) -> BackendResult<()> {
     let uri = Url::from_file_path(path)
         .map_err(|_| operation_error("Could not create image file URI"))?;
-    selection.publish_file_link(format!("{uri}\r\n").into_bytes(), max_bytes)
+    backend
+        .selection
+        .publish_file_link(format!("{uri}\r\n").into_bytes(), max_bytes)
 }
 
 fn read_entry(entry: Entry, reader: &mut EntryReader, max_bytes: u64) -> BackendResult<Vec<u8>> {
@@ -627,7 +613,7 @@ fn read_path(path: &Path, max_bytes: u64) -> BackendResult<Vec<u8>> {
 }
 
 fn read_source(source: impl Read, size: u64, max_bytes: u64) -> BackendResult<Vec<u8>> {
-    let limit = effective_limit(max_bytes);
+    let limit = max_bytes.min(MAX_WAYLAND_SELECTION_BYTES);
     if size > limit {
         return Err(selection_size_error(size, limit));
     }

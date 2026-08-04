@@ -1,6 +1,6 @@
 use std::{io::IsTerminal, sync::Arc};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncReadExt;
 use tracing_subscriber::EnvFilter;
@@ -78,41 +78,14 @@ async fn run(command: Command) -> Result<()> {
 async fn publish_stdin(mime: &str) -> Result<()> {
     let mut bytes = Vec::new();
     tokio::io::stdin()
-        .take(MAX_WAYLAND_SELECTION_BYTES.saturating_add(1))
+        .take(MAX_WAYLAND_SELECTION_BYTES + 1)
         .read_to_end(&mut bytes)
-        .await
-        .context("read clipboard content from stdin")?;
-    if bytes.len() as u64 > MAX_WAYLAND_SELECTION_BYTES {
-        anyhow::bail!(
-            "stdin exceeds the hard clipboard limit of {MAX_WAYLAND_SELECTION_BYTES} bytes"
-        );
-    }
-
-    let connection = zbus::Connection::session()
-        .await
-        .context("connect to session D-Bus")?;
-    let proxy = zbus::Proxy::new(
-        &connection,
-        daemon::BUS_NAME,
-        daemon::OBJECT_PATH,
-        daemon::INTERFACE,
-    )
-    .await
-    .context("connect to clip-daemon")?;
-    let response: String = proxy
-        .call("Publish", &(mime, bytes))
-        .await
-        .context("publish clipboard content")?;
-    let response: serde_json::Value =
-        serde_json::from_str(&response).context("decode clip-daemon response")?;
-    if response.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
-        return Ok(());
-    }
-    let message = response
-        .pointer("/error/message")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("clip-daemon rejected the clipboard content");
-    anyhow::bail!(message.to_owned())
+        .await?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_WAYLAND_SELECTION_BYTES,
+        "stdin exceeds the hard clipboard limit of {MAX_WAYLAND_SELECTION_BYTES} bytes"
+    );
+    client::publish(mime, bytes).await
 }
 
 async fn probe_ringboard() -> Result<()> {

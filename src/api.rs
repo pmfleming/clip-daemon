@@ -45,32 +45,16 @@ impl ApiService {
     pub async fn publish_selection(&self, mime: &str, bytes: Vec<u8>) -> Value {
         const METHOD: &str = "clipboard.selection.publish";
         tracing::debug!(method = METHOD, "clip-api request started");
-        let result = match self.settings.get().map_err(settings_error) {
-            Ok(settings) => {
-                self.actions
-                    .publish(mime, bytes, settings.max_entry_bytes)
-                    .await
-            }
+        let result = match self.max_entry_bytes() {
+            Ok(limit) => self.actions.publish(mime, bytes, limit).await,
             Err(error) => Err(error),
         };
-        match result {
-            Ok(data) => success(data),
-            Err(error) => {
-                tracing::warn!(method = METHOD, code = %error.code, "clip-api request failed");
-                error_response(error)
-            }
-        }
+        finish_request(METHOD, result)
     }
 
     pub async fn dispatch(&self, method: &str, params: Value) -> Value {
         tracing::debug!(%method, "clip-api request started");
-        match self.dispatch_method(method, params).await {
-            Ok(data) => success(data),
-            Err(error) => {
-                tracing::warn!(%method, code = %error.code, "clip-api request failed");
-                error_response(error)
-            }
-        }
+        finish_request(method, self.dispatch_method(method, params).await)
     }
 
     async fn dispatch_method(&self, method: &str, params: Value) -> Result<Value, ApiError> {
@@ -86,9 +70,8 @@ impl ApiService {
             "clipboard.entry.details" => self.actions.details(decode(params)?).await,
             "clipboard.entry.thumbnail" => self.actions.thumbnail(decode(params)?).await,
             value if value.starts_with("clipboard.entry.") => {
-                let max_entry_bytes = self.settings.get().map_err(settings_error)?.max_entry_bytes;
                 self.actions
-                    .dispatch_entry(value, params, max_entry_bytes)
+                    .dispatch_entry(value, params, self.max_entry_bytes()?)
                     .await
             }
             value if value.starts_with("clipboard.session.") => {
@@ -113,15 +96,13 @@ impl ApiService {
         match method {
             "clipboard.capture.setPaused" => self.set_paused(decode(params)?).await,
             "clipboard.capture.screenshot" => {
-                let max_entry_bytes = self.settings.get().map_err(settings_error)?.max_entry_bytes;
                 self.actions
-                    .capture_screenshot(decode(params)?, max_entry_bytes)
+                    .capture_screenshot(decode(params)?, self.max_entry_bytes()?)
                     .await
             }
             "clipboard.selection.publishFiles" => {
-                let max_entry_bytes = self.settings.get().map_err(settings_error)?.max_entry_bytes;
                 self.actions
-                    .publish_files(decode(params)?, max_entry_bytes)
+                    .publish_files(decode(params)?, self.max_entry_bytes()?)
                     .await
             }
             "clipboard.settings.get" => self.get_settings(),
@@ -144,6 +125,13 @@ impl ApiService {
         challenges.retain(|_, deadline| *deadline > Instant::now());
         challenges.insert(id.clone(), expires);
         Ok(json!({ "challenge": { "id": id, "confirmation": "WIPE", "expires_in_ms": 30000 } }))
+    }
+
+    fn max_entry_bytes(&self) -> Result<u64, ApiError> {
+        self.settings
+            .get()
+            .map(|settings| settings.max_entry_bytes)
+            .map_err(settings_error)
     }
 
     fn get_settings(&self) -> Result<Value, ApiError> {
@@ -203,6 +191,16 @@ struct PauseParams {
 
 fn settings_error(message: String) -> ApiError {
     ApiError::new("settings-error", message)
+}
+
+fn finish_request(method: &str, result: Result<Value, ApiError>) -> Value {
+    match result {
+        Ok(data) => success(data),
+        Err(error) => {
+            tracing::warn!(%method, code = %error.code, "clip-api request failed");
+            error_response(error)
+        }
+    }
 }
 
 pub fn success(data: Value) -> Value {

@@ -89,3 +89,23 @@ The 2026-07-25 follow-up added deterministic subscription state tests, isolated 
 | average locality | 99.83 | 99.83 |
 
 Coverage now reports 40.48% of lines, 42.51% of functions, and 40.19% of regions across 17 Rust files. All 30 discovered tests pass with no failed or unknown results, and escape-hatch count remains zero. The enabled partial-input and test-failure policies pass; the architecture map still reports the Ringboard module's aggregate 615.7 score above the informational 600 threshold.
+
+## Clipboard publication quality pass
+
+The pass after `6802929` consolidated API response/limit policy, reused the D-Bus client transport for stdin publication, split query projection from candidate collection, centralized editor-task startup and artifact locking, made MIME aliases data-driven, and reused file-backed replacement/content-resolution boundaries.
+
+| Signal | Before | After |
+|---|---:|---:|
+| maximum function hotspot | 81.65 | 44.35 |
+| maximum module hotspot | 65.23 | 45.56 |
+| aggregate function effort | 3595.30 | 3354.26 |
+| aggregate branch pressure | 633 | 597 |
+| functions scoring at least 35 | 19 | 13 |
+| functions scoring at least 50 | 6 | 0 |
+| minimum locality | 94.0 | 97.0 |
+| average locality | 99.51 | 99.66 |
+| minimum leverage | 47.0 | 50.0 |
+| clone records | 20 | 18 |
+| production Rust lines | 6,372 | 6,366 |
+
+Escape hatches remain at zero. Coverage reports 45.15% of lines, 44.16% of functions, and 44.05% of regions. All 38 discovered tests pass with no failed or unknown results.

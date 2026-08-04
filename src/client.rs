@@ -39,6 +39,27 @@ enum Request {
 
 type Output = Arc<Mutex<tokio::io::Stdout>>;
 
+pub async fn publish(mime: &str, bytes: Vec<u8>) -> Result<()> {
+    let connection = Some(
+        zbus::Connection::session()
+            .await
+            .context("connect to session D-Bus")?,
+    );
+    let response = transport_call(&connection, "Publish", &(mime, bytes))
+        .await
+        .context("publish clipboard content")?;
+    match response.get("ok").and_then(Value::as_bool) {
+        Some(true) => Ok(()),
+        _ => anyhow::bail!(
+            response
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("clip-daemon rejected the clipboard content")
+                .to_owned()
+        ),
+    }
+}
+
 pub async fn run() -> Result<()> {
     let connection = zbus::Connection::session().await.ok();
     let output = Arc::new(Mutex::new(tokio::io::stdout()));

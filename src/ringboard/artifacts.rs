@@ -200,29 +200,25 @@ impl ArtifactRegistry {
     }
 
     fn prune(&mut self, referenced: &HashSet<PathBuf>, force: bool) -> BackendResult<usize> {
-        let stale: Vec<_> = self
+        let now = unix_time();
+        let stale = self
             .records
-            .keys()
-            .filter(|path| {
-                let record = &self.records[*path];
+            .iter()
+            .filter(|(path, record)| {
                 !referenced.contains(*path)
                     && (force
                         || (self.active_selection.as_ref() != Some(*path)
-                            && unix_time().saturating_sub(record.created_at)
-                                >= PRUNE_GRACE_SECONDS))
+                            && now.saturating_sub(record.created_at) >= PRUNE_GRACE_SECONDS))
             })
-            .cloned()
-            .collect();
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
         let mut removed = 0;
         for path in stale {
-            if owned_path(self.root.as_deref(), &path) {
-                match fs::remove_file(&path) {
-                    Ok(()) => removed += 1,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(_) => continue,
-                }
-            }
+            let Some(file_removed) = remove_artifact(self.root.as_deref(), &path) else {
+                continue;
+            };
             self.records.remove(&path);
+            removed += usize::from(file_removed);
         }
         self.persist()?;
         Ok(removed)
@@ -258,6 +254,17 @@ impl ArtifactRegistry {
             let _ = fs::remove_file(temp);
         }
         result
+    }
+}
+
+fn remove_artifact(root: Option<&Path>, path: &Path) -> Option<bool> {
+    if !owned_path(root, path) {
+        return Some(false);
+    }
+    match fs::remove_file(path) {
+        Ok(()) => Some(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
     }
 }
 

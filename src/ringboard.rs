@@ -4,7 +4,7 @@ use std::{
     io::{Seek, SeekFrom},
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use tokio::task::{JoinError, JoinHandle, spawn_blocking};
@@ -101,6 +101,7 @@ struct QueryAccumulator<'a> {
     candidates: Vec<QueryCandidate>,
 }
 
+#[derive(Default)]
 struct QueryProjection {
     current: Option<EntrySummary>,
     entries: Vec<EntrySummary>,
@@ -109,6 +110,32 @@ struct QueryProjection {
     thumbnails: Vec<(String, u64)>,
     artifact_references: HashSet<PathBuf>,
     complete: bool,
+}
+
+impl QueryCandidate {
+    fn collapsed_source(&self, collapse_echoes: bool, ids: &HashSet<String>) -> Option<&str> {
+        collapse_echoes
+            .then_some(self.resolved.echo_source_id.as_deref())
+            .flatten()
+            .filter(|source| ids.contains(*source))
+    }
+}
+
+impl QueryProjection {
+    fn push(&mut self, candidate: QueryCandidate, current_id: Option<&str>) {
+        let mut summary = candidate.resolved.summary;
+        summary.current = current_id == Some(&summary.id);
+        let binding = IdentityBinding {
+            raw_id: candidate.raw_id,
+            revision: summary.revision,
+        };
+        self.bindings.insert(summary.id.clone(), binding);
+        self.thumbnails.push((summary.id.clone(), summary.revision));
+        if summary.current {
+            self.current = Some(summary.clone());
+        }
+        self.entries.push(summary);
+    }
 }
 
 impl QueryAccumulator<'_> {
@@ -128,69 +155,43 @@ impl QueryAccumulator<'_> {
     }
 
     fn finish(self) -> QueryProjection {
-        let ids: HashSet<_> = self
+        let ids = self
             .candidates
             .iter()
             .map(|candidate| candidate.resolved.summary.id.clone())
-            .collect();
-        let collapsed = |candidate: &QueryCandidate| {
-            self.collapse_echoes
-                && candidate
-                    .resolved
-                    .echo_source_id
-                    .as_ref()
-                    .is_some_and(|source| ids.contains(source))
-        };
+            .collect::<HashSet<_>>();
         let current_id = self
             .candidates
             .iter()
             .find(|candidate| self.current_id == Some(candidate.raw_id))
             .map(|candidate| {
-                if collapsed(candidate) {
-                    candidate.resolved.echo_source_id.clone().unwrap()
-                } else {
-                    candidate.resolved.summary.id.clone()
-                }
+                candidate
+                    .collapsed_source(self.collapse_echoes, &ids)
+                    .unwrap_or(&candidate.resolved.summary.id)
+                    .to_owned()
             });
         let mut projection = QueryProjection {
-            current: None,
-            entries: Vec::with_capacity(self.limit),
-            matched: 0,
-            bindings: HashMap::new(),
-            thumbnails: Vec::new(),
             artifact_references: self
                 .candidates
                 .iter()
                 .filter_map(|candidate| candidate.resolved.generated_path.clone())
                 .collect(),
             complete: self.complete,
+            ..QueryProjection::default()
         };
         for candidate in self.candidates {
-            if collapsed(&candidate) {
-                continue;
-            }
-            let mut summary = candidate.resolved.summary;
-            summary.current = current_id.as_ref() == Some(&summary.id);
-            projection.bindings.insert(
-                summary.id.clone(),
-                IdentityBinding {
-                    raw_id: candidate.raw_id,
-                    revision: summary.revision,
-                },
-            );
-            projection
-                .thumbnails
-                .push((summary.id.clone(), summary.revision));
-            if summary.current {
-                projection.current = Some(summary.clone());
-            }
-            if matches_query(&summary, self.needle) {
-                projection.matched += 1;
-                if projection.entries.len() < self.limit {
-                    projection.entries.push(summary);
-                }
+            if candidate
+                .collapsed_source(self.collapse_echoes, &ids)
+                .is_none()
+            {
+                projection.push(candidate, current_id.as_deref());
             }
         }
+        projection
+            .entries
+            .retain(|summary| matches_query(summary, self.needle));
+        projection.matched = projection.entries.len();
+        projection.entries.truncate(self.limit);
         projection
     }
 }
@@ -235,6 +236,10 @@ impl RingboardBackend {
         let reader = EntryReader::open(&mut directory)
             .map_err(|_| BackendError::unavailable("Ringboard entries are unavailable"))?;
         Ok((database, reader))
+    }
+
+    fn artifact_registry(&self) -> BackendResult<MutexGuard<'_, ArtifactRegistry>> {
+        self.artifacts.lock().map_err(|_| lock_error())
     }
 
     fn status_sync(&self) -> BackendStatus {
@@ -385,17 +390,30 @@ impl RingboardBackend {
         Ok(references)
     }
 
+    fn reconcile_projection(&self, projection: &QueryProjection) -> BackendResult<()> {
+        if !projection.complete {
+            return Ok(());
+        }
+        let result = self
+            .artifacts
+            .lock()
+            .map_err(|_| lock_error())?
+            .reconcile(&projection.artifact_references);
+        if let Err(error) = result {
+            tracing::warn!(code = %error.kind.code(), "Generated-file reconciliation failed");
+        }
+        Ok(())
+    }
+
     fn query_sync(&self, query: HistoryQuery) -> BackendResult<HistoryPage> {
         let (database, mut reader) = Self::open()?;
         let token = history_token(&database);
-        let main: Vec<_> = database.main().rev().collect();
-        let current_id = main.first().map(Entry::id);
+        let main = database.main().rev().collect::<Vec<_>>();
         let needle = query.query.trim().to_lowercase();
-        let limit = query.limit.clamp(1, MAX_QUERY_LIMIT);
         let mut results = QueryAccumulator {
             needle: &needle,
-            current_id,
-            limit,
+            current_id: main.first().map(Entry::id),
+            limit: query.limit.clamp(1, MAX_QUERY_LIMIT),
             collapse_echoes: query.collapse_self_echoes,
             complete: true,
             candidates: Vec::new(),
@@ -409,16 +427,7 @@ impl RingboardBackend {
         let mut projection = results.finish();
         *self.ids.lock().map_err(|_| lock_error())? = std::mem::take(&mut projection.bindings);
         prune_thumbnails(&projection.thumbnails);
-        if projection.complete {
-            let reconcile = self
-                .artifacts
-                .lock()
-                .map_err(|_| lock_error())?
-                .reconcile(&projection.artifact_references);
-            if let Err(error) = reconcile {
-                tracing::warn!(code = %error.kind.code(), "Generated-file reconciliation failed");
-            }
-        }
+        self.reconcile_projection(&projection)?;
         Ok(HistoryPage {
             revision: self.revision_for(token)?,
             generation: query.generation,
