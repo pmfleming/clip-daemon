@@ -545,7 +545,6 @@ fn validate_action(details: &EntryDetails, action: &str) -> Result<(), ApiError>
         "copy" | "delete" | "favorite" | "unfavorite" | "pin-current" | "cleanup" => true,
         "paste" => kind != EntryKind::Binary,
         "image-as-file" | "annotate" => kind == EntryKind::Image,
-        "edit-external" => kind == EntryKind::Text,
         "open-url" => kind == EntryKind::Link,
         "open-file" | "reveal-file" => !details.files.is_empty(),
         _ => false,

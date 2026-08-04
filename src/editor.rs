@@ -3,10 +3,8 @@ use std::{env, path::Path};
 use tokio::process::Command;
 
 const EDITOR_COMMAND_ENV: &str = "CLIP_DAEMON_IMAGE_EDITOR_COMMAND";
-const TEXT_EDITOR_COMMAND_ENV: &str = "CLIP_DAEMON_TEXT_EDITOR_COMMAND";
 const INPUT_PLACEHOLDER: &str = "{input}";
 const OUTPUT_PLACEHOLDER: &str = "{output}";
-const FILE_PLACEHOLDER: &str = "{file}";
 
 /// A shell-free image-editor adapter. The child must block until editing is
 /// complete and write a PNG to `{output}`. No output means cancellation.
@@ -75,93 +73,6 @@ impl ImageEditorCommand {
     }
 }
 
-/// A shell-free text-editor adapter. The child must block until editing is
-/// complete and modify `{file}` in place.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TextEditorCommand {
-    argv: Vec<String>,
-}
-
-impl TextEditorCommand {
-    pub fn configured() -> Self {
-        if let Some(value) = env::var_os(TEXT_EDITOR_COMMAND_ENV) {
-            match value
-                .into_string()
-                .map_err(|_| "value is not UTF-8".to_owned())
-                .and_then(|value| Self::from_json(&value))
-            {
-                Ok(command) => return command,
-                Err(error) => tracing::warn!(
-                    variable = TEXT_EDITOR_COMMAND_ENV,
-                    %error,
-                    "invalid text editor command; trying the desktop editor environment"
-                ),
-            }
-        }
-        for variable in ["VISUAL", "EDITOR"] {
-            let Some(value) = env::var_os(variable).and_then(|value| value.into_string().ok())
-            else {
-                continue;
-            };
-            let Some(mut argv) = shlex::split(&value) else {
-                tracing::warn!(%variable, "text editor environment contains invalid quoting");
-                continue;
-            };
-            argv.push(FILE_PLACEHOLDER.to_owned());
-            if let Ok(command) = Self::new(argv) {
-                return command;
-            }
-        }
-        Self::default()
-    }
-
-    pub fn from_json(value: &str) -> Result<Self, String> {
-        let argv: Vec<String> = serde_json::from_str(value)
-            .map_err(|_| "command must be a JSON array of strings".to_owned())?;
-        Self::new(argv)
-    }
-
-    fn new(argv: Vec<String>) -> Result<Self, String> {
-        if argv.first().is_none_or(String::is_empty) {
-            return Err("command must name an executable".into());
-        }
-        if !argv
-            .iter()
-            .skip(1)
-            .any(|argument| argument == FILE_PLACEHOLDER)
-        {
-            return Err(format!(
-                "command is missing the {FILE_PLACEHOLDER} argument"
-            ));
-        }
-        Ok(Self { argv })
-    }
-
-    pub fn command(&self, file: &Path) -> Command {
-        let mut command = Command::new(&self.argv[0]);
-        command.kill_on_drop(true);
-        for argument in &self.argv[1..] {
-            if argument == FILE_PLACEHOLDER {
-                command.arg(file);
-            } else {
-                command.arg(argument);
-            }
-        }
-        command
-    }
-}
-
-impl Default for TextEditorCommand {
-    fn default() -> Self {
-        Self {
-            argv: ["code", "--wait", FILE_PLACEHOLDER]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-        }
-    }
-}
-
 impl Default for ImageEditorCommand {
     fn default() -> Self {
         Self {
@@ -197,7 +108,7 @@ impl Default for ImageEditorCommand {
 mod tests {
     use std::path::Path;
 
-    use super::{ImageEditorCommand, TextEditorCommand};
+    use super::ImageEditorCommand;
 
     #[test]
     fn custom_editor_commands_are_shell_free_and_substitute_paths() {
@@ -222,19 +133,6 @@ mod tests {
         assert!(ImageEditorCommand::from_json(r#"["editor","{input}"]"#).is_err());
         assert!(ImageEditorCommand::from_json(r#"["editor","{output}"]"#).is_err());
         assert!(ImageEditorCommand::from_json(r#""editor --in {input}""#).is_err());
-    }
-
-    #[test]
-    fn text_editor_commands_are_shell_free_and_edit_in_place() {
-        let editor = TextEditorCommand::from_json(r#"["text-tool","--wait","{file}"]"#).unwrap();
-        let command = editor.command(Path::new("clipboard text.txt"));
-        let arguments: Vec<_> = command
-            .as_std()
-            .get_args()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(arguments, ["--wait", "clipboard text.txt"]);
-        assert!(TextEditorCommand::from_json(r#"["text-tool","--wait"]"#).is_err());
     }
 
     #[test]

@@ -131,7 +131,7 @@ async fn edit_and_type_action_policy_are_daemon_enforced() {
         .await;
     assert_eq!(malformed_url["error"]["code"], "invalid-entry");
 
-    let external_edit = api
+    let removed_external_edit = api
         .dispatch(
             "clipboard.entry.action",
             json!({
@@ -139,10 +139,7 @@ async fn edit_and_type_action_policy_are_daemon_enforced() {
             }),
         )
         .await;
-    assert_eq!(
-        external_edit["data"]["operation"]["action"],
-        "edit-external"
-    );
+    assert_eq!(removed_external_edit["error"]["code"], "validation-error");
 
     let missing_session = api
         .dispatch(
