@@ -535,6 +535,25 @@ impl RingboardBackend {
         Ok(())
     }
 
+    fn publish_sync(
+        &self,
+        mime: &str,
+        bytes: Vec<u8>,
+        max_bytes: u64,
+    ) -> BackendResult<OperationResult> {
+        if bytes.is_empty() {
+            return Err(BackendError::new(
+                BackendErrorKind::InvalidData,
+                "Published clipboard content must not be empty",
+            ));
+        }
+        self.selection.publish(mime, bytes, max_bytes)?;
+        Ok(OperationResult::completed(
+            "publish",
+            "Content published to the Wayland clipboard",
+        ))
+    }
+
     fn publish_files_sync(
         &self,
         file_selection: FileSelection,
@@ -633,6 +652,16 @@ impl ClipboardBackend for RingboardBackend {
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
         run_backend!(self, capture_region(region, max_bytes))
+    }
+
+    async fn publish(
+        &self,
+        mime: &str,
+        bytes: Vec<u8>,
+        max_bytes: u64,
+    ) -> BackendResult<OperationResult> {
+        let mime = mime.to_owned();
+        run_backend!(self, publish_sync(&mime, bytes, max_bytes))
     }
 
     async fn publish_files(

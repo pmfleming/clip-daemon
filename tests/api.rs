@@ -71,6 +71,11 @@ async fn validation_unknown_methods_and_wipe_challenges_are_stable() {
         .await;
     assert_eq!(published["data"]["operation"]["action"], "publish-files");
 
+    let published = api.publish_selection("image/png", vec![1, 2, 3, 4]).await;
+    assert_eq!(published["data"]["operation"]["action"], "publish");
+    let empty = api.publish_selection("image/png", vec![]).await;
+    assert_eq!(empty["error"]["code"], "validation-error");
+
     let challenge = api
         .dispatch("clipboard.history.wipe.prepare", json!({}))
         .await;

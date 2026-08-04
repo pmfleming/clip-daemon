@@ -162,6 +162,12 @@ pub trait ClipboardBackend: Send + Sync {
         region: ScreenshotRegion,
         max_bytes: u64,
     ) -> BackendResult<OperationResult>;
+    async fn publish(
+        &self,
+        mime: &str,
+        bytes: Vec<u8>,
+        max_bytes: u64,
+    ) -> BackendResult<OperationResult>;
     async fn publish_files(
         &self,
         selection: FileSelection,

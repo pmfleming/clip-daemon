@@ -190,6 +190,19 @@ impl ClipboardService {
         Ok(json!({ "operation": operation }))
     }
 
+    pub(crate) async fn publish(
+        &self,
+        mime: &str,
+        bytes: Vec<u8>,
+        max_entry_bytes: u64,
+    ) -> Result<Value, ApiError> {
+        if bytes.is_empty() {
+            return Err(ApiError::validation("clipboard content must not be empty"));
+        }
+        let operation = self.backend.publish(mime, bytes, max_entry_bytes).await?;
+        Ok(json!({ "operation": operation }))
+    }
+
     pub(crate) async fn publish_files(
         &self,
         params: PublishFilesParams,

@@ -159,6 +159,21 @@ impl ClipboardBackend for FakeBackend {
         completed("screenshot", "Fake screenshot copied")
     }
 
+    async fn publish(
+        &self,
+        mime: &str,
+        bytes: Vec<u8>,
+        _max_bytes: u64,
+    ) -> BackendResult<OperationResult> {
+        if mime.is_empty() || bytes.is_empty() {
+            return Err(BackendError::new(
+                crate::backend::BackendErrorKind::InvalidData,
+                "Published clipboard content must have a MIME type and non-empty bytes",
+            ));
+        }
+        completed("publish", "Fake clipboard content published")
+    }
+
     async fn publish_files(
         &self,
         selection: FileSelection,

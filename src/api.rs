@@ -42,6 +42,26 @@ impl ApiService {
         self.actions.cancel(operation_id).await
     }
 
+    pub async fn publish_selection(&self, mime: &str, bytes: Vec<u8>) -> Value {
+        const METHOD: &str = "clipboard.selection.publish";
+        tracing::debug!(method = METHOD, "clip-api request started");
+        let result = match self.settings.get().map_err(settings_error) {
+            Ok(settings) => {
+                self.actions
+                    .publish(mime, bytes, settings.max_entry_bytes)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(data) => success(data),
+            Err(error) => {
+                tracing::warn!(method = METHOD, code = %error.code, "clip-api request failed");
+                error_response(error)
+            }
+        }
+    }
+
     pub async fn dispatch(&self, method: &str, params: Value) -> Value {
         tracing::debug!(%method, "clip-api request started");
         match self.dispatch_method(method, params).await {

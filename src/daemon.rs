@@ -71,6 +71,11 @@ impl ClipDaemon {
         subscription::start(self, streams, owner, emitter).await
     }
 
+    /// Publish raw bytes while keeping Wayland selection ownership in the daemon.
+    async fn publish(&self, mime: &str, bytes: Vec<u8>) -> String {
+        self.api.publish_selection(mime, bytes).await.to_string()
+    }
+
     async fn cancel(&self, request_id: &str) -> String {
         if let Some(task) = self.subscriptions.lock().await.remove(request_id) {
             task.abort();

@@ -1,11 +1,12 @@
 use std::{io::IsTerminal, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use tokio::io::AsyncReadExt;
 use tracing_subscriber::EnvFilter;
 
 use clip_daemon::{
-    backend::{ClipboardBackend, HistoryQuery},
+    backend::{ClipboardBackend, HistoryQuery, MAX_WAYLAND_SELECTION_BYTES},
     client, daemon, protocol,
     ringboard::RingboardBackend,
 };
@@ -23,6 +24,12 @@ enum Command {
     Daemon,
     /// Bridge JSON Lines on stdin/stdout to the session service.
     Client,
+    /// Publish stdin to the clipboard through the running daemon.
+    Publish {
+        /// MIME type of the stdin content.
+        #[arg(long)]
+        mime: String,
+    },
     /// Check whether the pinned Ringboard database is readable.
     ProbeRingboard,
     /// Print stable protocol metadata and fixtures.
@@ -55,6 +62,7 @@ async fn run(command: Command) -> Result<()> {
     match command {
         Command::Daemon => daemon::run(Arc::new(RingboardBackend::default())).await,
         Command::Client => client::run().await,
+        Command::Publish { mime } => publish_stdin(&mime).await,
         Command::ProbeRingboard => probe_ringboard().await,
         Command::Debug { command } => {
             let value = match command {
@@ -65,6 +73,46 @@ async fn run(command: Command) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn publish_stdin(mime: &str) -> Result<()> {
+    let mut bytes = Vec::new();
+    tokio::io::stdin()
+        .take(MAX_WAYLAND_SELECTION_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await
+        .context("read clipboard content from stdin")?;
+    if bytes.len() as u64 > MAX_WAYLAND_SELECTION_BYTES {
+        anyhow::bail!(
+            "stdin exceeds the hard clipboard limit of {MAX_WAYLAND_SELECTION_BYTES} bytes"
+        );
+    }
+
+    let connection = zbus::Connection::session()
+        .await
+        .context("connect to session D-Bus")?;
+    let proxy = zbus::Proxy::new(
+        &connection,
+        daemon::BUS_NAME,
+        daemon::OBJECT_PATH,
+        daemon::INTERFACE,
+    )
+    .await
+    .context("connect to clip-daemon")?;
+    let response: String = proxy
+        .call("Publish", &(mime, bytes))
+        .await
+        .context("publish clipboard content")?;
+    let response: serde_json::Value =
+        serde_json::from_str(&response).context("decode clip-daemon response")?;
+    if response.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    let message = response
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("clip-daemon rejected the clipboard content");
+    anyhow::bail!(message.to_owned())
 }
 
 async fn probe_ringboard() -> Result<()> {
