@@ -91,7 +91,7 @@ impl ApiService {
                 let _ = self.lifecycle_events.send(LifecycleEvent {
                     stream: protocol::stream::OPERATION,
                     event: status.into(),
-                    data: data.clone(),
+                    data: json!({ "operation": operation }),
                 });
             }
         }
