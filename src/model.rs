@@ -84,10 +84,19 @@ pub struct OperationResult {
 
 impl OperationResult {
     pub fn completed(action: &str, message: &str) -> Self {
+        Self::with_id(
+            format!("operation-{}", uuid::Uuid::new_v4()),
+            action,
+            "completed",
+            message,
+        )
+    }
+
+    pub fn with_id(id: String, action: &str, status: &str, message: &str) -> Self {
         Self {
-            id: format!("operation-{}", uuid::Uuid::new_v4()),
+            id,
             action: action.into(),
-            status: "completed".into(),
+            status: status.into(),
             message: message.into(),
             path: None,
         }

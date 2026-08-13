@@ -7,7 +7,10 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use tokio::task::{JoinError, JoinHandle, spawn_blocking};
+use tokio::{
+    sync::broadcast,
+    task::{JoinError, JoinHandle, spawn_blocking},
+};
 
 use async_trait::async_trait;
 use clipboard_history_client_sdk::{DatabaseReader, Entry, EntryReader, LoadedEntry};
@@ -202,6 +205,7 @@ pub struct RingboardBackend {
     revision: Arc<Mutex<RevisionState>>,
     summaries: Arc<Mutex<SummaryCache>>,
     operations: Arc<Mutex<HashMap<String, OperationTask>>>,
+    operation_events: broadcast::Sender<OperationResult>,
     artifacts: Arc<Mutex<ArtifactRegistry>>,
     editor: ImageEditorCommand,
     selection: SelectionService,
@@ -209,11 +213,13 @@ pub struct RingboardBackend {
 
 impl Default for RingboardBackend {
     fn default() -> Self {
+        let (operation_events, _) = broadcast::channel(64);
         Self {
             ids: Arc::new(Mutex::new(HashMap::new())),
             revision: Arc::new(Mutex::new(RevisionState::default())),
             summaries: Arc::new(Mutex::new(SummaryCache::default())),
             operations: Arc::new(Mutex::new(HashMap::new())),
+            operation_events,
             artifacts: Arc::new(Mutex::new(ArtifactRegistry::default())),
             editor: ImageEditorCommand::configured(),
             selection: SelectionService::default(),
@@ -612,6 +618,10 @@ impl RingboardBackend {
 
 #[async_trait]
 impl ClipboardBackend for RingboardBackend {
+    fn operation_events(&self) -> broadcast::Receiver<OperationResult> {
+        self.operation_events.subscribe()
+    }
+
     async fn status(&self) -> BackendStatus {
         let backend = self.clone();
         spawn_blocking(move || backend.status_sync())
@@ -724,11 +734,20 @@ impl ClipboardBackend for RingboardBackend {
         let was_running = !operation.handle.is_finished();
         operation.handle.abort();
         let _ = operation.handle.await;
+        let operation_id = operation_id.to_owned();
         run_blocking(move || {
             mutation::remove_files(&operation.files);
             Ok(())
         })
         .await?;
+        if was_running {
+            let _ = self.operation_events.send(OperationResult::with_id(
+                operation_id,
+                "annotate",
+                "cancelled",
+                "Image edit cancelled",
+            ));
+        }
         Ok(was_running)
     }
 }

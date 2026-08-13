@@ -1,6 +1,7 @@
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use tokio::sync::broadcast;
 
 use crate::{
     backend::{
@@ -13,15 +14,27 @@ use crate::{
     },
 };
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct FakeBackend {
     entries: Arc<RwLock<Vec<EntryDetails>>>,
+    operation_events: broadcast::Sender<OperationResult>,
+}
+
+impl Default for FakeBackend {
+    fn default() -> Self {
+        let (operation_events, _) = broadcast::channel(16);
+        Self {
+            entries: Arc::new(RwLock::new(Vec::new())),
+            operation_events,
+        }
+    }
 }
 
 impl FakeBackend {
     pub fn with_entries(entries: Vec<EntryDetails>) -> Self {
         Self {
             entries: Arc::new(RwLock::new(entries)),
+            ..Self::default()
         }
     }
 
@@ -84,6 +97,10 @@ impl FakeBackend {
 
 #[async_trait]
 impl ClipboardBackend for FakeBackend {
+    fn operation_events(&self) -> broadcast::Receiver<OperationResult> {
+        self.operation_events.subscribe()
+    }
+
     async fn status(&self) -> BackendStatus {
         BackendStatus {
             available: true,

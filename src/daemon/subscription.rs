@@ -24,6 +24,7 @@ const HISTORY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 struct RequestedStreams {
     history: bool,
     current: bool,
+    operation: bool,
 }
 
 struct SubscriptionTask {
@@ -61,6 +62,7 @@ impl RequestedStreams {
         Some(Self {
             history: wants(protocol::stream::HISTORY),
             current: wants(protocol::stream::CURRENT),
+            operation: wants(protocol::stream::OPERATION),
         })
     }
 
@@ -75,19 +77,26 @@ impl SubscriptionTask {
         for stream in &self.streams {
             emit_event(&self.destination, stream, "subscribed", &self.id, None).await;
         }
-        if self.requested.watches_clipboard() {
-            tokio::select! {
-                () = poll_history(
-                    self.destination,
-                    self.api_service,
-                    self.event_revision,
-                    self.id.clone(),
-                    self.requested,
-                ) => {}
-                () = wait_for_owner_loss(connection, self.owner) => {}
-            }
-        } else {
-            wait_for_owner_loss(connection, self.owner).await;
+        let history = self.requested.watches_clipboard().then(|| {
+            poll_history(
+                self.destination.clone(),
+                Arc::clone(&self.api_service),
+                Arc::clone(&self.event_revision),
+                self.id.clone(),
+                self.requested,
+            )
+        });
+        let operations = self.requested.operation.then(|| {
+            poll_operations(
+                self.destination.clone(),
+                self.api_service.operation_events(),
+                self.id.clone(),
+            )
+        });
+        tokio::select! {
+            () = async { if let Some(task) = history { task.await } } => {}
+            () = async { if let Some(task) = operations { task.await } } => {}
+            () = wait_for_owner_loss(connection, self.owner) => {}
         }
         self.subscriptions.lock().await.remove(&self.id);
         tracing::debug!(subscription_id = %self.id, "clipboard subscription ended");
@@ -170,6 +179,32 @@ async fn poll_history(
                 update,
             )
             .await;
+        }
+    }
+}
+
+async fn poll_operations(
+    emitter: SignalEmitter<'static>,
+    mut events: tokio::sync::broadcast::Receiver<crate::model::OperationResult>,
+    subscription_id: String,
+) {
+    loop {
+        match events.recv().await {
+            Ok(operation) => {
+                let event = operation.status.clone();
+                emit_event(
+                    &emitter,
+                    protocol::stream::OPERATION,
+                    &event,
+                    &subscription_id,
+                    Some(json!({ "data": { "operation": operation } })),
+                )
+                .await;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(%subscription_id, skipped, "clipboard operation events lagged");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
     }
 }

@@ -234,6 +234,10 @@ impl ClipboardService {
         Ok(json!({ "operation": operation }))
     }
 
+    pub(crate) fn operation_events(&self) -> tokio::sync::broadcast::Receiver<OperationResult> {
+        self.backend.operation_events()
+    }
+
     pub(crate) async fn change_token(&self) -> Result<u64, ApiError> {
         Ok(self.backend.change_token().await?)
     }

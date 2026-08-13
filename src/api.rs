@@ -38,6 +38,12 @@ impl ApiService {
             .map_err(|error| json!({ "error": { "code": error.code, "message": error.message } }))
     }
 
+    pub fn operation_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::model::OperationResult> {
+        self.actions.operation_events()
+    }
+
     pub async fn cancel_operation(&self, operation_id: &str) -> bool {
         self.actions.cancel(operation_id).await
     }

@@ -140,19 +140,35 @@ impl RingboardBackend {
     ) -> BackendResult<OperationResult>
     where
         F: FnOnce(String) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        Fut: Future<Output = BackendResult<String>> + Send + 'static,
     {
         let mut operation = OperationResult::completed(action, message);
         operation.status = "started".into();
         let operation_id = operation.id.clone();
         let cleanup_files = files.clone();
         let operations = self.operations.clone();
+        let events = self.operation_events.clone();
         let task_id = operation_id.clone();
+        let task_action = action.to_owned();
         let (start, ready) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
-            if ready.await.is_ok() {
-                run(task_id.clone()).await;
-            }
+            let completed = if ready.await.is_ok() {
+                run(task_id.clone()).await
+            } else {
+                Err(operation_error("Clipboard operation could not start"))
+            };
+            let event = match completed {
+                Ok(message) => {
+                    OperationResult::with_id(task_id.clone(), &task_action, "completed", &message)
+                }
+                Err(error) => OperationResult::with_id(
+                    task_id.clone(),
+                    &task_action,
+                    "failed",
+                    &error.to_string(),
+                ),
+            };
+            let _ = events.send(event);
             if let Ok(mut active) = operations.lock() {
                 active.remove(&task_id);
             }
@@ -168,6 +184,7 @@ impl RingboardBackend {
             remove_files(&cleanup_files);
             operation_error(start_error)
         })?;
+        let _ = self.operation_events.send(operation.clone());
         Ok(operation)
     }
 
@@ -183,9 +200,7 @@ impl RingboardBackend {
             "Image editor started",
             "Annotation task could not be started",
             files,
-            move |task_id| async move {
-                run_annotation(backend, editor, staged, &task_id).await;
-            },
+            move |_task_id| async move { run_annotation(backend, editor, staged).await },
         )
     }
 
@@ -354,8 +369,7 @@ async fn run_annotation(
     backend: RingboardBackend,
     editor: ImageEditorCommand,
     staged: AnnotationStage,
-    operation_id: &str,
-) {
+) -> BackendResult<String> {
     let AnnotationStage {
         input,
         output,
@@ -365,29 +379,36 @@ async fn run_annotation(
     } = staged;
     // Give the picker time to hide so the editor becomes focused when it maps.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    if run_editor(&editor, &input, &output).await && output.is_file() {
-        let edited = output.clone();
-        let result = run_blocking(move || {
-            apply_annotation(&backend, &opaque_id, revision, &edited, max_bytes)
-        })
-        .await;
-        if let Err(error) = result {
-            tracing::warn!(%operation_id, code = %error.kind.code(), "annotation result could not be restored");
+    let result = match run_editor(&editor, &input, &output).await {
+        Ok(()) if output.is_file() => {
+            let edited = output.clone();
+            run_blocking(move || {
+                apply_annotation(&backend, &opaque_id, revision, &edited, max_bytes)
+            })
+            .await
+            .map(|()| "Image edit completed".to_owned())
         }
-    }
-    let _ = run_blocking(move || {
+        Ok(()) => Err(operation_error("Image edit was cancelled")),
+        Err(error) => Err(error),
+    };
+    let cleanup = run_blocking(move || {
         remove_files(&[input, output]);
         Ok(())
     })
     .await;
+    result.and(cleanup.map(|()| "Image edit completed".to_owned()))
 }
 
-async fn run_editor(editor: &ImageEditorCommand, input: &Path, output: &Path) -> bool {
-    editor
+async fn run_editor(editor: &ImageEditorCommand, input: &Path, output: &Path) -> BackendResult<()> {
+    let status = editor
         .command(input, output)
         .status()
         .await
-        .is_ok_and(|status| status.success())
+        .map_err(operation_error)?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| operation_error("Image editor exited unsuccessfully"))
 }
 
 fn apply_annotation(

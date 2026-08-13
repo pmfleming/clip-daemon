@@ -1,6 +1,7 @@
 use std::{error::Error, fmt, path::PathBuf};
 
 use async_trait::async_trait;
+use tokio::sync::broadcast;
 
 use crate::model::{BackendStatus, EntryDetails, EntryThumbnail, HistoryPage, OperationResult};
 
@@ -144,6 +145,7 @@ impl BackendMutation {
 
 #[async_trait]
 pub trait ClipboardBackend: Send + Sync {
+    fn operation_events(&self) -> broadcast::Receiver<OperationResult>;
     async fn status(&self) -> BackendStatus;
     async fn change_token(&self) -> BackendResult<u64>;
     async fn query(&self, query: HistoryQuery) -> BackendResult<HistoryPage>;
