@@ -104,13 +104,23 @@ impl SubscriptionTask {
             )
         });
         tokio::select! {
-            () = async { if let Some(task) = history { task.await } } => {}
-            () = async { if let Some(task) = operations { task.await } } => {}
-            () = async { if let Some(task) = lifecycle { task.await } } => {}
+            () = await_optional(history) => {}
+            () = await_optional(operations) => {}
+            () = await_optional(lifecycle) => {}
             () = wait_for_owner_loss(connection, self.owner) => {}
         }
         self.subscriptions.lock().await.remove(&self.id);
         tracing::debug!(subscription_id = %self.id, "clipboard subscription ended");
+    }
+}
+
+async fn await_optional<F>(task: Option<F>)
+where
+    F: std::future::Future<Output = ()>,
+{
+    match task {
+        Some(task) => task.await,
+        None => std::future::pending().await,
     }
 }
 
