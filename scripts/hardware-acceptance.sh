@@ -56,7 +56,7 @@ show() {
 
 case "$mode" in
   check)
-    "$(dirname "$0")/qualify-ringboard.sh"
+    bash "$(dirname "$0")/qualify-ringboard.sh"
     echo
     show
     ;;
