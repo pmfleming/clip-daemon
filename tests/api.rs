@@ -32,6 +32,43 @@ fn entry(id: &str, kind: EntryKind, text: Option<&str>) -> EntryDetails {
 }
 
 #[tokio::test]
+async fn history_pagination_is_stable() {
+    let api = ApiService::new(Arc::new(FakeBackend::with_entries(vec![
+        entry("one", EntryKind::Text, Some("one")),
+        entry("two", EntryKind::Text, Some("two")),
+        entry("three", EntryKind::Text, Some("three")),
+    ])));
+    let first = api
+        .dispatch(
+            "clipboard.history.query",
+            json!({"query":"", "generation":9, "offset":0, "limit":2}),
+        )
+        .await;
+    assert_eq!(
+        first["data"]["history"]["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(first["data"]["history"]["next_offset"], 2);
+    let second = api
+        .dispatch(
+            "clipboard.history.query",
+            json!({"query":"", "generation":9, "offset":2, "limit":2}),
+        )
+        .await;
+    assert_eq!(
+        second["data"]["history"]["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(second["data"]["history"]["next_offset"].is_null());
+}
+
+#[tokio::test]
 async fn validation_unknown_methods_and_wipe_challenges_are_stable() {
     let api = ApiService::new(Arc::new(FakeBackend::default()));
     for (method, params, code) in [

@@ -320,6 +320,32 @@ mod tests {
         assert_eq!(page.next_offset, None);
         assert_eq!(page.entries[0].id, "other");
         assert_eq!(page.current.unwrap().id, "current");
+
+        let first = backend
+            .query(HistoryQuery {
+                query: String::new(),
+                generation: 8,
+                offset: 0,
+                limit: 1,
+                collapse_self_echoes: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.entries[0].id, "current");
+        assert_eq!(first.next_offset, Some(1));
+        let second = backend
+            .query(HistoryQuery {
+                query: String::new(),
+                generation: 8,
+                offset: 1,
+                limit: 1,
+                collapse_self_echoes: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(second.entries[0].id, "other");
+        assert_eq!(second.next_offset, None);
+
         assert_eq!(
             backend.details("other", 10).await.unwrap().text.as_deref(),
             Some("beta")

@@ -671,7 +671,9 @@ fn operation_error(error: impl std::fmt::Display) -> BackendError {
 mod tests {
     use std::fs;
 
-    use super::{remove_files, valid_edited_image};
+    use crate::editor::ImageEditorCommand;
+
+    use super::{remove_files, run_editor, valid_edited_image};
 
     #[test]
     fn operation_cleanup_only_removes_its_own_files() {
@@ -688,6 +690,27 @@ mod tests {
         assert!(!first.exists());
         assert!(!second.exists());
         assert!(unrelated.exists());
+    }
+
+    #[tokio::test]
+    async fn editor_exit_status_and_output_are_observable() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let input = directory.path().join("input.png");
+        let output = directory.path().join("output.png");
+        fs::write(&input, b"input").expect("write input");
+        let success = ImageEditorCommand::from_json(
+            r#"["sh","-c","cp \"$1\" \"$2\"","editor","{input}","{output}"]"#,
+        )
+        .expect("success editor");
+        run_editor(&success, &input, &output)
+            .await
+            .expect("editor succeeds");
+        assert_eq!(fs::read(&output).unwrap(), b"input");
+
+        let failure =
+            ImageEditorCommand::from_json(r#"["sh","-c","exit 9","editor","{input}","{output}"]"#)
+                .expect("failure editor");
+        assert!(run_editor(&failure, &input, &output).await.is_err());
     }
 
     #[test]
