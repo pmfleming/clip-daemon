@@ -25,6 +25,7 @@ struct RequestedStreams {
     history: bool,
     current: bool,
     operation: bool,
+    lifecycle: bool,
 }
 
 struct SubscriptionTask {
@@ -63,6 +64,7 @@ impl RequestedStreams {
             history: wants(protocol::stream::HISTORY),
             current: wants(protocol::stream::CURRENT),
             operation: wants(protocol::stream::OPERATION),
+            lifecycle: wants(protocol::stream::CAPTURE) || wants(protocol::stream::SESSION),
         })
     }
 
@@ -93,9 +95,18 @@ impl SubscriptionTask {
                 self.id.clone(),
             )
         });
+        let lifecycle = self.requested.lifecycle.then(|| {
+            poll_lifecycle(
+                self.destination.clone(),
+                self.api_service.lifecycle_events(),
+                self.id.clone(),
+                self.streams.clone(),
+            )
+        });
         tokio::select! {
             () = async { if let Some(task) = history { task.await } } => {}
             () = async { if let Some(task) = operations { task.await } } => {}
+            () = async { if let Some(task) = lifecycle { task.await } } => {}
             () = wait_for_owner_loss(connection, self.owner) => {}
         }
         self.subscriptions.lock().await.remove(&self.id);
@@ -203,6 +214,33 @@ async fn poll_operations(
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(%subscription_id, skipped, "clipboard operation events lagged");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+async fn poll_lifecycle(
+    emitter: SignalEmitter<'static>,
+    mut events: tokio::sync::broadcast::Receiver<api::LifecycleEvent>,
+    subscription_id: String,
+    streams: Vec<String>,
+) {
+    loop {
+        match events.recv().await {
+            Ok(update) if streams.iter().any(|stream| stream == update.stream) => {
+                emit_event(
+                    &emitter,
+                    update.stream,
+                    &update.event,
+                    &subscription_id,
+                    Some(json!({ "data": update.data })),
+                )
+                .await;
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(%subscription_id, skipped, "clipboard lifecycle events lagged");
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }

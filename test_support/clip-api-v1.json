@@ -187,18 +187,16 @@
       {
         "events": [
           "subscribed",
-          "changed",
-          "unavailable"
+          "changed"
         ],
         "name": "clipboard.capture.changed"
       },
       {
         "events": [
+          "subscribed",
           "paste-prepared",
           "completed",
-          "fallback",
-          "target-unavailable",
-          "expired"
+          "fallback"
         ],
         "name": "clipboard.session"
       }

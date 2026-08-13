@@ -5,7 +5,7 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
 use crate::{
@@ -16,18 +16,28 @@ use crate::{
 
 pub const PROTOCOL: &str = protocol::NAME;
 pub const VERSION: u8 = protocol::VERSION;
+#[derive(Clone, Debug)]
+pub(crate) struct LifecycleEvent {
+    pub stream: &'static str,
+    pub event: String,
+    pub data: Value,
+}
+
 pub struct ApiService {
     wipe_challenges: Mutex<HashMap<String, Instant>>,
     settings: SettingsManager,
     actions: ClipboardService,
+    lifecycle_events: broadcast::Sender<LifecycleEvent>,
 }
 
 impl ApiService {
     pub fn new(backend: actions::Backend) -> Self {
+        let (lifecycle_events, _) = broadcast::channel(64);
         Self {
             wipe_challenges: Mutex::new(HashMap::new()),
             settings: SettingsManager::default(),
             actions: ClipboardService::new(backend),
+            lifecycle_events,
         }
     }
 
@@ -42,6 +52,10 @@ impl ApiService {
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::model::OperationResult> {
         self.actions.operation_events()
+    }
+
+    pub(crate) fn lifecycle_events(&self) -> broadcast::Receiver<LifecycleEvent> {
+        self.lifecycle_events.subscribe()
     }
 
     pub async fn cancel_operation(&self, operation_id: &str) -> bool {
@@ -60,7 +74,54 @@ impl ApiService {
 
     pub async fn dispatch(&self, method: &str, params: Value) -> Value {
         tracing::debug!(%method, "clip-api request started");
-        finish_request(method, self.dispatch_method(method, params).await)
+        let result = self.dispatch_method(method, params).await;
+        if let Ok(data) = &result {
+            self.publish_lifecycle(method, data);
+        }
+        finish_request(method, result)
+    }
+
+    fn publish_lifecycle(&self, method: &str, data: &Value) {
+        let event = match method {
+            "clipboard.capture.setPaused" | "clipboard.capture.screenshot" => {
+                Some(LifecycleEvent {
+                    stream: protocol::stream::CAPTURE,
+                    event: "changed".into(),
+                    data: data.clone(),
+                })
+            }
+            "clipboard.session.begin" => Some(LifecycleEvent {
+                stream: protocol::stream::SESSION,
+                event: if data["session"]["target_available"].as_bool() == Some(true) {
+                    "completed".into()
+                } else {
+                    "fallback".into()
+                },
+                data: data.clone(),
+            }),
+            "clipboard.session.hidden" | "clipboard.session.end" => Some(LifecycleEvent {
+                stream: protocol::stream::SESSION,
+                event: "completed".into(),
+                data: data.clone(),
+            }),
+            "clipboard.entry.action"
+                if data["operation"]["action"] == "paste"
+                    || data["operation"]["action"] == "image-as-file" =>
+            {
+                Some(LifecycleEvent {
+                    stream: protocol::stream::SESSION,
+                    event: data["operation"]["status"]
+                        .as_str()
+                        .unwrap_or("completed")
+                        .into(),
+                    data: data.clone(),
+                })
+            }
+            _ => None,
+        };
+        if let Some(event) = event {
+            let _ = self.lifecycle_events.send(event);
+        }
     }
 
     async fn dispatch_method(&self, method: &str, params: Value) -> Result<Value, ApiError> {
