@@ -69,6 +69,9 @@ impl ApiService {
             Ok(limit) => self.actions.publish(mime, bytes, limit).await,
             Err(error) => Err(error),
         };
+        if let Ok(data) = &result {
+            self.publish_lifecycle(METHOD, data);
+        }
         finish_request(METHOD, result)
     }
 
@@ -82,6 +85,16 @@ impl ApiService {
     }
 
     fn publish_lifecycle(&self, method: &str, data: &Value) {
+        if let Some(operation) = data.get("operation") {
+            let status = operation["status"].as_str().unwrap_or("completed");
+            if status != "started" {
+                let _ = self.lifecycle_events.send(LifecycleEvent {
+                    stream: protocol::stream::OPERATION,
+                    event: status.into(),
+                    data: data.clone(),
+                });
+            }
+        }
         let event = match method {
             "clipboard.capture.setPaused" | "clipboard.capture.screenshot" => {
                 Some(LifecycleEvent {

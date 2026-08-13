@@ -65,7 +65,9 @@ impl RequestedStreams {
             history: wants(protocol::stream::HISTORY),
             current: wants(protocol::stream::CURRENT),
             operation: wants(protocol::stream::OPERATION),
-            lifecycle: wants(protocol::stream::CAPTURE) || wants(protocol::stream::SESSION),
+            lifecycle: wants(protocol::stream::OPERATION)
+                || wants(protocol::stream::CAPTURE)
+                || wants(protocol::stream::SESSION),
         })
     }
 
