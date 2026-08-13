@@ -1,6 +1,6 @@
 # Ringboard qualification results
 
-Status: protocol probe rerun 2026-07-25; content/action hardware matrix pending
+Status: protocol probe rerun 2026-07-25; content/action hardware matrix tracked by `just hardware-acceptance`
 
 | Gate | Result | Notes |
 |---|---|---|
@@ -15,5 +15,7 @@ Status: protocol probe rerun 2026-07-25; content/action hardware matrix pending
 | Clipboard survives source exit | pending | Do not remove `wl-clip-persist` yet |
 
 The 2026-07-25 probe also confirmed `/run/user/1000` and a readable clipboard-history database. It was intentionally read-only, so MIME/action, sensitive-data, focus, size-limit, and source-exit gates remain pending a hardware run.
+
+Record each hardware result with `scripts/hardware-acceptance.sh record CHECK pass|fail|blocked "notes"`. Results are kept privately under `$XDG_STATE_HOME/clip-daemon/hardware-acceptance.tsv`; no clipboard content is recorded. The acceptance command combines these records with the protocol probe so pending gates remain explicit.
 
 No production watcher, paste owner, or `Super+V` binding has been changed.

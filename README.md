@@ -9,6 +9,7 @@ direnv allow
 # or
 nix develop
 just check
+just hardware-acceptance
 ```
 
 The flake provides Rust/Cargo tooling and the pinned Nixpkgs Ringboard package. The SDK is pinned to 0.16.2 to match the reviewed Ringboard protocol.

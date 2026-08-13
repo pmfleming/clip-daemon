@@ -22,5 +22,8 @@ contract:
 probe:
     cargo run -- probe-ringboard
 
+hardware-acceptance:
+    ./scripts/hardware-acceptance.sh check
+
 nix-check:
     nix flake check --show-trace
