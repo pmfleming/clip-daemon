@@ -32,7 +32,7 @@ struct SubscriptionTask {
     destination: SignalEmitter<'static>,
     api_service: Arc<ApiService>,
     subscriptions: Subscriptions,
-    event_revision: Arc<AtomicU64>,
+    history_events: tokio::sync::broadcast::Sender<HistoryUpdate>,
     id: String,
     streams: Vec<String>,
     owner: UniqueName<'static>,
@@ -45,8 +45,9 @@ struct HistoryState {
     unavailable: bool,
 }
 
-enum HistoryUpdate {
-    Changed,
+#[derive(Clone)]
+pub(super) enum HistoryUpdate {
+    Changed(Value),
     Unavailable(Value),
 }
 
@@ -80,10 +81,9 @@ impl SubscriptionTask {
             emit_event(&self.destination, stream, "subscribed", &self.id, None).await;
         }
         let history = self.requested.watches_clipboard().then(|| {
-            poll_history(
+            receive_history(
                 self.destination.clone(),
-                Arc::clone(&self.api_service),
-                Arc::clone(&self.event_revision),
+                self.history_events.subscribe(),
                 self.id.clone(),
                 self.requested,
             )
@@ -117,7 +117,9 @@ impl SubscriptionTask {
 impl HistoryState {
     fn update(&mut self, result: Result<u64, Value>) -> Option<HistoryUpdate> {
         match result {
-            Ok(token) => self.changed(token).then_some(HistoryUpdate::Changed),
+            Ok(token) => self
+                .changed(token)
+                .then_some(HistoryUpdate::Changed(Value::Null)),
             Err(error) if !std::mem::replace(&mut self.unavailable, true) => {
                 Some(HistoryUpdate::Unavailable(error))
             }
@@ -155,7 +157,7 @@ pub(super) async fn start(
             destination,
             api_service: Arc::clone(&daemon.api),
             subscriptions: Arc::clone(&daemon.subscriptions),
-            event_revision: Arc::clone(&daemon.event_revision),
+            history_events: daemon.history_events.clone(),
             id: id.clone(),
             streams: streams.clone(),
             owner,
@@ -169,27 +171,45 @@ pub(super) async fn start(
     api::success(json!({ "subscription": { "id": id, "streams": streams } })).to_string()
 }
 
-async fn poll_history(
-    emitter: SignalEmitter<'static>,
+pub(super) async fn observe_history(
     api_service: Arc<ApiService>,
     event_revision: Arc<AtomicU64>,
-    subscription_id: String,
-    requested: RequestedStreams,
+    events: tokio::sync::broadcast::Sender<HistoryUpdate>,
 ) {
     let mut state = HistoryState::default();
     let mut timer = tokio::time::interval(HISTORY_POLL_INTERVAL);
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         timer.tick().await;
-        if let Some(update) = state.update(api_service.change_token().await) {
-            emit_update(
-                &emitter,
-                &event_revision,
-                &subscription_id,
-                requested,
-                update,
-            )
-            .await;
+        if events.receiver_count() == 0 {
+            state = HistoryState::default();
+            continue;
+        }
+        if let Some(mut update) = state.update(api_service.change_token().await) {
+            if matches!(update, HistoryUpdate::Changed(_)) {
+                let revision = event_revision.fetch_add(1, Ordering::Relaxed) + 1;
+                update = HistoryUpdate::Changed(
+                    json!({ "data": { "revision": revision, "change": "reset" } }),
+                );
+            }
+            let _ = events.send(update);
+        }
+    }
+}
+
+async fn receive_history(
+    emitter: SignalEmitter<'static>,
+    mut events: tokio::sync::broadcast::Receiver<HistoryUpdate>,
+    subscription_id: String,
+    requested: RequestedStreams,
+) {
+    loop {
+        match events.recv().await {
+            Ok(update) => emit_update(&emitter, &subscription_id, requested, update).await,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(%subscription_id, skipped, "clipboard history events lagged");
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
     }
 }
@@ -249,19 +269,12 @@ async fn poll_lifecycle(
 
 async fn emit_update(
     emitter: &SignalEmitter<'_>,
-    event_revision: &AtomicU64,
     subscription_id: &str,
     requested: RequestedStreams,
     update: HistoryUpdate,
 ) {
     let (events, data) = match update {
-        HistoryUpdate::Changed => {
-            let revision = event_revision.fetch_add(1, Ordering::Relaxed) + 1;
-            (
-                ("reset", "changed"),
-                json!({ "data": { "revision": revision, "change": "reset" } }),
-            )
-        }
+        HistoryUpdate::Changed(data) => (("reset", "changed"), data),
         HistoryUpdate::Unavailable(error) => (("unavailable", "unavailable"), error),
     };
     emit_requested(emitter, subscription_id, requested, events, data).await;
@@ -332,14 +345,23 @@ mod tests {
     #[test]
     fn history_state_emits_initial_changes_outages_and_recovery_once() {
         let mut state = HistoryState::default();
-        assert!(matches!(state.update(Ok(1)), Some(HistoryUpdate::Changed)));
+        assert!(matches!(
+            state.update(Ok(1)),
+            Some(HistoryUpdate::Changed(_))
+        ));
         assert!(state.update(Ok(1)).is_none());
-        assert!(matches!(state.update(Ok(2)), Some(HistoryUpdate::Changed)));
+        assert!(matches!(
+            state.update(Ok(2)),
+            Some(HistoryUpdate::Changed(_))
+        ));
         assert!(matches!(
             state.update(Err(json!({ "error": "offline" }))),
             Some(HistoryUpdate::Unavailable(_))
         ));
         assert!(state.update(Err(json!({ "error": "offline" }))).is_none());
-        assert!(matches!(state.update(Ok(2)), Some(HistoryUpdate::Changed)));
+        assert!(matches!(
+            state.update(Ok(2)),
+            Some(HistoryUpdate::Changed(_))
+        ));
     }
 }

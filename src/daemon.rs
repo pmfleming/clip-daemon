@@ -32,7 +32,7 @@ pub const INTERFACE: &str = "org.laufan.ClipDaemon1";
 pub struct ClipDaemon {
     api: Arc<ApiService>,
     sequence: AtomicU64,
-    event_revision: Arc<AtomicU64>,
+    history_events: tokio::sync::broadcast::Sender<subscription::HistoryUpdate>,
     subscriptions: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
 }
 
@@ -124,10 +124,18 @@ async fn emit_event(
 }
 
 pub async fn run(backend: Arc<dyn ClipboardBackend>) -> Result<()> {
+    let api = Arc::new(ApiService::new(backend));
+    let event_revision = Arc::new(AtomicU64::new(0));
+    let (history_events, _) = tokio::sync::broadcast::channel(32);
+    tokio::spawn(subscription::observe_history(
+        Arc::clone(&api),
+        Arc::clone(&event_revision),
+        history_events.clone(),
+    ));
     let daemon = ClipDaemon {
-        api: Arc::new(ApiService::new(backend)),
+        api,
         sequence: AtomicU64::new(1),
-        event_revision: Arc::new(AtomicU64::new(0)),
+        history_events,
         subscriptions: Arc::new(Mutex::new(HashMap::new())),
     };
     let _connection = connection::Builder::session()
