@@ -399,19 +399,31 @@ async fn run_annotation(
     result.and(cleanup.map(|()| "Image edit completed".to_owned()))
 }
 
+struct EditorProcessGroup(Option<rustix::process::Pid>);
+
+impl Drop for EditorProcessGroup {
+    fn drop(&mut self) {
+        if let Some(process_group) = self.0 {
+            let _ =
+                rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
+        }
+    }
+}
+
 async fn run_editor(editor: &ImageEditorCommand, input: &Path, output: &Path) -> BackendResult<()> {
     let mut child = editor
         .command(input, output)
         .spawn()
         .map_err(operation_error)?;
-    let process_group = child
-        .id()
-        .and_then(|id| rustix::process::Pid::from_raw(id as i32));
-    let status = child.wait().await.map_err(operation_error);
-    if let Some(process_group) = process_group {
-        let _ = rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
-    }
-    status?
+    let _process_group = EditorProcessGroup(
+        child
+            .id()
+            .and_then(|id| rustix::process::Pid::from_raw(id as i32)),
+    );
+    child
+        .wait()
+        .await
+        .map_err(operation_error)?
         .success()
         .then_some(())
         .ok_or_else(|| operation_error("Image editor exited unsuccessfully"))
