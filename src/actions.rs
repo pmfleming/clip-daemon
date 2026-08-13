@@ -125,6 +125,7 @@ impl ClipboardService {
             .query(HistoryQuery {
                 query: params.query,
                 generation: params.generation,
+                offset: params.offset,
                 limit: params.limit,
                 collapse_self_echoes,
             })
@@ -419,6 +420,8 @@ pub(crate) struct QueryParams {
     query: String,
     #[serde(default)]
     generation: u64,
+    #[serde(default)]
+    offset: usize,
     #[serde(default = "default_query_limit")]
     limit: usize,
 }

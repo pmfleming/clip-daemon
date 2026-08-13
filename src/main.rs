@@ -99,6 +99,7 @@ async fn probe_ringboard() -> Result<()> {
         .query(HistoryQuery {
             query: String::new(),
             generation: 0,
+            offset: 0,
             limit: 10,
             collapse_self_echoes: true,
         })

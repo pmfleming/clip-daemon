@@ -98,6 +98,7 @@ struct QueryCandidate {
 struct QueryAccumulator<'a> {
     needle: &'a str,
     current_id: Option<u64>,
+    offset: usize,
     limit: usize,
     collapse_echoes: bool,
     complete: bool,
@@ -194,7 +195,12 @@ impl QueryAccumulator<'_> {
             .entries
             .retain(|summary| matches_query(summary, self.needle));
         projection.matched = projection.entries.len();
-        projection.entries.truncate(self.limit);
+        projection.entries = projection
+            .entries
+            .into_iter()
+            .skip(self.offset)
+            .take(self.limit)
+            .collect();
         projection
     }
 }
@@ -417,6 +423,7 @@ impl RingboardBackend {
         let mut results = QueryAccumulator {
             needle: &needle,
             current_id: main.first().map(Entry::id),
+            offset: query.offset,
             limit: query.limit.clamp(1, MAX_QUERY_LIMIT),
             collapse_echoes: query.collapse_self_echoes,
             complete: true,
@@ -432,11 +439,14 @@ impl RingboardBackend {
         *self.ids.lock().map_err(|_| lock_error())? = std::mem::take(&mut projection.bindings);
         prune_thumbnails(&projection.thumbnails);
         self.reconcile_projection(&projection)?;
+        let consumed = query.offset.saturating_add(projection.entries.len());
+        let has_more = projection.matched > consumed;
         Ok(HistoryPage {
             revision: self.revision_for(token)?,
             generation: query.generation,
             current: projection.current,
-            has_more: projection.matched > projection.entries.len(),
+            has_more,
+            next_offset: has_more.then_some(consumed),
             entries: projection.entries,
         })
     }
@@ -926,6 +936,7 @@ mod tests {
         let projection = QueryAccumulator {
             needle: "",
             current_id: Some(2),
+            offset: 0,
             limit: 10,
             collapse_echoes: true,
             complete: true,

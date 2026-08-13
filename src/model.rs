@@ -32,6 +32,7 @@ pub struct HistoryPage {
     pub current: Option<EntrySummary>,
     pub entries: Vec<EntrySummary>,
     pub has_more: bool,
+    pub next_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

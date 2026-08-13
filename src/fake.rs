@@ -125,13 +125,21 @@ impl ClipboardBackend for FakeBackend {
             .map(|item| item.entry.clone())
             .filter(|item| needle.is_empty() || item.preview.to_lowercase().contains(&needle))
             .collect();
-        let has_more = matches.len() > query.limit;
+        let matched = matches.len();
+        let page: Vec<_> = matches
+            .into_iter()
+            .skip(query.offset)
+            .take(query.limit)
+            .collect();
+        let consumed = query.offset.saturating_add(page.len());
+        let has_more = matched > consumed;
         Ok(HistoryPage {
             revision: 1,
             generation: query.generation,
             current,
-            entries: matches.into_iter().take(query.limit).collect(),
+            entries: page,
             has_more,
+            next_offset: has_more.then_some(consumed),
         })
     }
 
@@ -302,12 +310,14 @@ mod tests {
             .query(HistoryQuery {
                 query: "bet".into(),
                 generation: 7,
+                offset: 0,
                 limit: 10,
                 collapse_self_echoes: true,
             })
             .await
             .unwrap();
         assert_eq!(page.generation, 7);
+        assert_eq!(page.next_offset, None);
         assert_eq!(page.entries[0].id, "other");
         assert_eq!(page.current.unwrap().id, "current");
         assert_eq!(

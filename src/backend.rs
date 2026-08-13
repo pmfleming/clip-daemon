@@ -12,6 +12,7 @@ pub const MAX_WAYLAND_SELECTION_BYTES: u64 = 64 * 1024 * 1024;
 pub struct HistoryQuery {
     pub query: String,
     pub generation: u64,
+    pub offset: usize,
     pub limit: usize,
     pub collapse_self_echoes: bool,
 }
