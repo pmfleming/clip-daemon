@@ -400,12 +400,18 @@ async fn run_annotation(
 }
 
 async fn run_editor(editor: &ImageEditorCommand, input: &Path, output: &Path) -> BackendResult<()> {
-    let status = editor
+    let mut child = editor
         .command(input, output)
-        .status()
-        .await
+        .spawn()
         .map_err(operation_error)?;
-    status
+    let process_group = child
+        .id()
+        .and_then(|id| rustix::process::Pid::from_raw(id as i32));
+    let status = child.wait().await.map_err(operation_error);
+    if let Some(process_group) = process_group {
+        let _ = rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
+    }
+    status?
         .success()
         .then_some(())
         .ok_or_else(|| operation_error("Image editor exited unsuccessfully"))

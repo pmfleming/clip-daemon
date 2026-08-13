@@ -56,6 +56,7 @@ impl ImageEditorCommand {
     pub fn command(&self, input: &Path, output: &Path) -> Command {
         let mut command = Command::new(&self.argv[0]);
         command.kill_on_drop(true);
+        command.process_group(0);
         for argument in &self.argv[1..] {
             match argument.as_str() {
                 INPUT_PLACEHOLDER => {

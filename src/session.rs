@@ -8,6 +8,7 @@ use tokio::{process::Command, sync::Mutex, time::sleep};
 use uuid::Uuid;
 
 const SESSION_TTL: Duration = Duration::from_secs(300);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const SESSION_TTL_MS: u64 = 300_000;
 
 #[derive(Debug, Serialize)]
@@ -120,11 +121,15 @@ fn view(id: String, target_available: bool, state: &'static str) -> SessionView 
 }
 
 async fn active_target() -> Option<Target> {
-    let output = Command::new("hyprctl")
-        .args(["-j", "activewindow"])
-        .output()
-        .await
-        .ok()?;
+    let output = tokio::time::timeout(
+        COMMAND_TIMEOUT,
+        Command::new("hyprctl")
+            .args(["-j", "activewindow"])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -139,20 +144,23 @@ fn valid_window_address(address: &str) -> bool {
     }) && address != "0x0"
 }
 
+async fn command_output(command: &mut Command) -> std::io::Result<std::process::Output> {
+    tokio::time::timeout(COMMAND_TIMEOUT, command.output())
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "command timed out"))?
+}
+
 async fn hyprland_dispatch(lua: &str, legacy_dispatcher: &str, legacy_argument: &str) -> bool {
-    if dispatch_succeeded(
-        Command::new("hyprctl")
-            .args(["dispatch", lua])
-            .output()
-            .await,
-    ) {
+    if dispatch_succeeded(command_output(Command::new("hyprctl").args(["dispatch", lua])).await) {
         return true;
     }
     dispatch_succeeded(
-        Command::new("hyprctl")
-            .args(["dispatch", legacy_dispatcher, legacy_argument])
-            .output()
-            .await,
+        command_output(Command::new("hyprctl").args([
+            "dispatch",
+            legacy_dispatcher,
+            legacy_argument,
+        ]))
+        .await,
     )
 }
 
@@ -177,15 +185,18 @@ async fn paste_after_hidden(target: Target) {
         "hl.dsp.send_shortcut({{ mods = '{modifiers}', key = 'V', window = '{selector}' }})"
     );
     if !hyprland_dispatch(&lua_shortcut, "sendshortcut", &legacy_shortcut).await {
-        let _ = Command::new("notify-send")
-            .args([
-                "-a",
-                "Clipboard",
-                "Copied; paste manually",
-                "The original target is unavailable.",
-            ])
-            .status()
-            .await;
+        let _ = tokio::time::timeout(
+            COMMAND_TIMEOUT,
+            Command::new("notify-send")
+                .args([
+                    "-a",
+                    "Clipboard",
+                    "Copied; paste manually",
+                    "The original target is unavailable.",
+                ])
+                .status(),
+        )
+        .await;
     }
 }
 
