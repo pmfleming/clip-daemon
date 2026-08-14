@@ -433,9 +433,7 @@ mod tests {
         let content = vec![0x5a; 24_000];
         file.write_all(&content).expect("write fixture");
         file.seek(SeekFrom::Start(0)).expect("rewind fixture");
-
         let bytes = read_bounded(&mut file, 10_000).expect("bounded read");
-
         assert_eq!(bytes, &content[..10_000]);
     }
 
@@ -455,12 +453,8 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].display_name, "one.txt");
         assert_eq!(files[0].operation, "cut");
-        assert_eq!(
-            file_preview("file:///tmp/file%20with%20spaces.txt", "copy")
-                .expect("encoded local file URI")
-                .display_name,
-            "file with spaces.txt"
-        );
+        let encoded = file_preview("file:///tmp/file%20with%20spaces.txt", "copy").unwrap();
+        assert_eq!(encoded.display_name, "file with spaces.txt");
         assert_eq!(file_preview("not a uri", "copy"), None);
     }
 
@@ -471,39 +465,26 @@ mod tests {
         image::RgbaImage::new(7, 5)
             .save(&path)
             .expect("write image fixture");
-        let uri = url::Url::from_file_path(&path)
-            .expect("file URL")
-            .to_string();
+        let uri = url::Url::from_file_path(&path).unwrap().to_string();
         let inspect =
             |mime, value: &str| ResolvedContent::resolve(mime, value.as_bytes(), 1024 * 1024);
         let uri_list = format!("{uri}\r\n");
         let content = inspect("text/uri-list", &uri_list);
         let source = content.local_image().expect("local image source");
-
         assert_eq!(source.path, path);
         assert_eq!(source.mime, "image/png");
         assert_eq!((source.dimensions.width, source.dimensions.height), (7, 5));
         assert_eq!(content.kind(), crate::model::EntryKind::Image);
-        assert_eq!(
-            inspect("text/plain", &format!("{uri}\n")).kind(),
-            crate::model::EntryKind::Image
-        );
-        assert!(
-            inspect("text/uri-list", &format!("{uri}\r\n{uri}\r\n"))
-                .local_image()
-                .is_none()
-        );
+        let plain = inspect("text/plain", &format!("{uri}\n"));
+        assert_eq!(plain.kind(), crate::model::EntryKind::Image);
+        let multiple = inspect("text/uri-list", &format!("{uri}\r\n{uri}\r\n"));
+        assert!(multiple.local_image().is_none());
 
         let symlink_path = directory.path().join("screenshot-link.png");
         symlink(&path, &symlink_path).expect("image symlink");
-        let symlink_uri = url::Url::from_file_path(symlink_path)
-            .expect("symlink URL")
-            .to_string();
-        assert!(
-            inspect("text/uri-list", &format!("{symlink_uri}\r\n"))
-                .local_image()
-                .is_none()
-        );
+        let symlink_uri = url::Url::from_file_path(symlink_path).unwrap().to_string();
+        let symlink = inspect("text/uri-list", &format!("{symlink_uri}\r\n"));
+        assert!(symlink.local_image().is_none());
     }
 
     #[test]
@@ -522,9 +503,7 @@ mod tests {
         for path in [&current, &stale_revision, &removed_entry] {
             File::create(path).expect("thumbnail fixture");
         }
-
         prune_thumbnail_directory(directory.path(), &[("entry-current".into(), 7)]);
-
         assert!(current.exists());
         assert!(!stale_revision.exists());
         assert!(!removed_entry.exists());

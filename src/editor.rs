@@ -111,18 +111,22 @@ mod tests {
 
     use super::ImageEditorCommand;
 
+    fn arguments(command: &tokio::process::Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect()
+    }
+
     #[test]
     fn custom_editor_commands_are_shell_free_and_substitute_paths() {
         let editor = ImageEditorCommand::from_json(
             r#"["image-tool","edit","{input}","--return","{output}"]"#,
         )
         .unwrap();
-        let command = editor.command(Path::new("input image.png"), Path::new("edited image.png"));
-        let arguments: Vec<_> = command
-            .as_std()
-            .get_args()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect();
+        let arguments =
+            arguments(&editor.command(Path::new("input image.png"), Path::new("edited image.png")));
         assert_eq!(
             arguments,
             ["edit", "input image.png", "--return", "edited image.png"]
@@ -138,13 +142,10 @@ mod tests {
 
     #[test]
     fn default_adapter_returns_satty_save_and_copy_through_the_output() {
-        let command = ImageEditorCommand::default()
-            .command(Path::new("input image.png"), Path::new("edited image.png"));
-        let arguments: Vec<_> = command
-            .as_std()
-            .get_args()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect();
+        let arguments = arguments(
+            &ImageEditorCommand::default()
+                .command(Path::new("input image.png"), Path::new("edited image.png")),
+        );
         for pair in [
             ["--filename", "input image.png"],
             ["--output-filename", "edited image.png"],

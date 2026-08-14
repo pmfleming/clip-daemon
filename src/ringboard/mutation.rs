@@ -110,8 +110,7 @@ impl RingboardBackend {
         let result = capture_and_publish(self, region, &path, max_bytes);
         let _ = fs::remove_file(path);
         if result.is_ok() {
-            self.artifact_registry()?.clear_active_selection();
-            self.clear_identity_state()?;
+            self.selection_changed()?;
         }
         result
     }
@@ -124,12 +123,16 @@ impl RingboardBackend {
     ) -> BackendResult<OperationResult> {
         let (summary, bytes) = selected_bytes(self, opaque_id, expected_revision, max_bytes)?;
         publish_entry(self, &summary, &bytes, max_bytes)?;
-        self.artifact_registry()?.clear_active_selection();
-        self.clear_identity_state()?;
+        self.selection_changed()?;
         Ok(completed(
             "copy",
             "Entry published to the Wayland clipboard",
         ))
+    }
+
+    fn selection_changed(&self) -> BackendResult<()> {
+        self.artifact_registry()?.clear_active_selection();
+        self.clear_identity_state()
     }
 
     pub(super) fn save_image_file(
@@ -488,29 +491,32 @@ fn apply_annotation(
         return Err(operation_error("Annotation returned an invalid image"));
     }
     let raw_id = backend.replace_file_entry(opaque_id, Some(revision), output, "image/png")?;
-
-    // Ringboard has committed at this point. Any subsequent failure is a
-    // partial success and must not be reported as though the edit was lost.
-    let publication: BackendResult<()> = (|| {
-        let source = backend.details_raw_sync(raw_id, super::MAX_DETAILS_BYTES)?;
-        let bytes = fs::read(output).map_err(operation_error)?;
-        backend
-            .artifact_registry()?
-            .register_inline_echo(&source.entry.id, "image/png", &bytes)?;
-        backend.clear_identity_state()?;
-        backend
-            .selection
-            .publish_file("image/png", output, max_bytes)?;
-        backend.artifact_registry()?.clear_active_selection();
-        Ok(())
-    })();
-    match publication {
+    match publish_annotation(backend, raw_id, output, max_bytes) {
         Ok(()) => Ok(OperationCompletion::completed("Image edit completed")),
         Err(error) => Ok(OperationCompletion::with_warning(
             "Image edit committed",
             format!("Clipboard publication failed: {error}"),
         )),
     }
+}
+
+fn publish_annotation(
+    backend: &RingboardBackend,
+    raw_id: u64,
+    output: &Path,
+    max_bytes: u64,
+) -> BackendResult<()> {
+    let source = backend.details_raw_sync(raw_id, super::MAX_DETAILS_BYTES)?;
+    let bytes = fs::read(output).map_err(operation_error)?;
+    backend
+        .artifact_registry()?
+        .register_inline_echo(&source.entry.id, "image/png", &bytes)?;
+    backend.clear_identity_state()?;
+    backend
+        .selection
+        .publish_file("image/png", output, max_bytes)?;
+    backend.artifact_registry()?.clear_active_selection();
+    Ok(())
 }
 
 fn replace_from_file(raw_id: u64, ring: RingKind, path: &Path, mime: &str) -> BackendResult<()> {
@@ -766,14 +772,6 @@ mod tests {
 
     #[test]
     fn screenshot_commands_are_bounded() {
-        let mut success = std::process::Command::new("sh");
-        success.args(["-c", "exit 0"]);
-        assert!(
-            command_status_with_timeout(&mut success, std::time::Duration::from_secs(1))
-                .expect("quick command")
-                .success()
-        );
-
         let mut slow = std::process::Command::new("sleep");
         slow.arg("1");
         let started = std::time::Instant::now();

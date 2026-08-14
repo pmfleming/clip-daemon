@@ -24,12 +24,7 @@ pub struct WaylandSelectionPublisher;
 
 impl SelectionPublisher for WaylandSelectionPublisher {
     fn publish(&self, mime: &str, bytes: Vec<u8>) -> BackendResult<()> {
-        let mut options = Options::new();
-        options
-            .clipboard(ClipboardType::Regular)
-            .seat(Seat::All)
-            .omit_additional_text_mime_types(true);
-        options
+        clipboard_options(true)
             .copy(
                 Source::Bytes(bytes.into_boxed_slice()),
                 MimeType::Specific(mime.to_owned()),
@@ -39,9 +34,7 @@ impl SelectionPublisher for WaylandSelectionPublisher {
 
     fn publish_file_link(&self, uri: Vec<u8>) -> BackendResult<()> {
         let text = uri.strip_suffix(b"\r\n").unwrap_or(&uri).to_vec();
-        let mut options = Options::new();
-        options.clipboard(ClipboardType::Regular).seat(Seat::All);
-        options
+        clipboard_options(false)
             .copy_multi(vec![
                 MimeSource {
                     source: Source::Bytes(uri.into_boxed_slice()),
@@ -56,12 +49,7 @@ impl SelectionPublisher for WaylandSelectionPublisher {
     }
 
     fn publish_files(&self, gnome_payload: Vec<u8>, uri_list: Vec<u8>) -> BackendResult<()> {
-        let mut options = Options::new();
-        options
-            .clipboard(ClipboardType::Regular)
-            .seat(Seat::All)
-            .omit_additional_text_mime_types(true);
-        options
+        clipboard_options(true)
             .copy_multi(vec![
                 MimeSource {
                     source: Source::Bytes(gnome_payload.into_boxed_slice()),
@@ -74,6 +62,15 @@ impl SelectionPublisher for WaylandSelectionPublisher {
             ])
             .map_err(|error| selection_error(error.to_string()))
     }
+}
+
+fn clipboard_options(omit_text_aliases: bool) -> Options {
+    let mut options = Options::new();
+    options
+        .clipboard(ClipboardType::Regular)
+        .seat(Seat::All)
+        .omit_additional_text_mime_types(omit_text_aliases);
+    options
 }
 
 #[derive(Clone)]
@@ -263,41 +260,39 @@ mod tests {
                 1024,
             )
             .unwrap();
+        let values = publisher.values.lock().unwrap();
+        let mimes = values
+            .iter()
+            .map(|value| value.0.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
         assert_eq!(
-            publisher.values.lock().unwrap().as_slice(),
-            &[
-                ("image/png".into(), vec![1, 2, 3]),
-                (
-                    "text/uri-list".into(),
-                    b"file:///tmp/image.png\r\n".to_vec()
-                ),
-                ("text/plain".into(), b"file:///tmp/image.png".to_vec()),
-                (
-                    "x-special/gnome-copied-files".into(),
-                    b"cut\nfile:///tmp/one.txt\r\nfile:///tmp/two.txt\r\n".to_vec()
-                ),
-                (
-                    "text/uri-list".into(),
-                    b"file:///tmp/one.txt\r\nfile:///tmp/two.txt\r\n".to_vec()
-                )
-            ]
+            mimes,
+            "image/png,text/uri-list,text/plain,x-special/gnome-copied-files,text/uri-list"
+        );
+        assert_eq!(values[0].1, vec![1, 2, 3]);
+        assert_eq!(values[1].1, b"file:///tmp/image.png\r\n");
+        assert_eq!(values[2].1, b"file:///tmp/image.png");
+        assert_eq!(
+            values[3].1,
+            b"cut\nfile:///tmp/one.txt\r\nfile:///tmp/two.txt\r\n"
+        );
+        assert_eq!(
+            values[4].1,
+            b"file:///tmp/one.txt\r\nfile:///tmp/two.txt\r\n"
         );
     }
 
     #[test]
     fn mime_and_size_policy_rejects_unsafe_offers() {
         let service = SelectionService::with_publisher(Arc::new(RecordingPublisher::default()));
-        assert!(service.publish("not-a-mime", vec![], 1024).is_err());
-        assert!(
-            service
-                .publish("text/plain\nimage/png", vec![], 1024)
-                .is_err()
-        );
-        assert!(
-            service
-                .publish("text/uri-list", vec![0; 1025], 1024)
-                .is_err()
-        );
+        for (mime, bytes) in [
+            ("not-a-mime", vec![]),
+            ("text/plain\nimage/png", vec![]),
+            ("text/uri-list", vec![0; 1025]),
+        ] {
+            assert!(service.publish(mime, bytes, 1024).is_err());
+        }
         assert_eq!(effective_limit(u64::MAX), MAX_WAYLAND_SELECTION_BYTES);
     }
 }

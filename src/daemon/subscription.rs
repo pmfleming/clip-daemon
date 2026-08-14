@@ -9,7 +9,11 @@ use std::{
 
 use futures::StreamExt;
 use serde_json::{Value, json};
-use tokio::{sync::Mutex, task::JoinHandle, time::MissedTickBehavior};
+use tokio::{
+    sync::{Mutex, broadcast::error::RecvError},
+    task::JoinHandle,
+    time::MissedTickBehavior,
+};
 use zbus::{names::UniqueName, object_server::SignalEmitter};
 
 use crate::{api, api::ApiService, protocol};
@@ -37,6 +41,12 @@ struct SubscriptionTask {
     streams: Vec<String>,
     owner: UniqueName<'static>,
     requested: RequestedStreams,
+}
+
+struct LifecycleSubscription {
+    destination: SignalEmitter<'static>,
+    id: String,
+    streams: Vec<String>,
 }
 
 #[derive(Default)]
@@ -98,12 +108,12 @@ impl SubscriptionTask {
             )
         });
         let lifecycle = self.requested.lifecycle.then(|| {
-            poll_lifecycle(
-                self.destination.clone(),
-                self.api_service.lifecycle_events(),
-                self.id.clone(),
-                self.streams.clone(),
-            )
+            LifecycleSubscription {
+                destination: self.destination.clone(),
+                id: self.id.clone(),
+                streams: self.streams.clone(),
+            }
+            .run(self.api_service.lifecycle_events())
         });
         tokio::select! {
             () = await_optional(history) => {}
@@ -193,20 +203,31 @@ pub(super) async fn observe_history(
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         timer.tick().await;
-        if events.receiver_count() == 0 {
-            state = HistoryState::default();
-            continue;
-        }
-        if let Some(mut update) = state.update(api_service.change_token().await) {
-            if matches!(update, HistoryUpdate::Changed(_)) {
-                let revision = event_revision.fetch_add(1, Ordering::Relaxed) + 1;
-                update = HistoryUpdate::Changed(
-                    json!({ "data": { "revision": revision, "change": "reset" } }),
-                );
-            }
-            let _ = events.send(update);
-        }
+        observe_history_tick(&api_service, &event_revision, &events, &mut state).await;
     }
+}
+
+async fn observe_history_tick(
+    api_service: &ApiService,
+    event_revision: &AtomicU64,
+    events: &tokio::sync::broadcast::Sender<HistoryUpdate>,
+    state: &mut HistoryState,
+) {
+    if events.receiver_count() == 0 {
+        *state = HistoryState::default();
+        return;
+    }
+    let Some(update) = state.update(api_service.change_token().await) else {
+        return;
+    };
+    let update = match update {
+        HistoryUpdate::Changed(_) => {
+            let revision = event_revision.fetch_add(1, Ordering::Relaxed) + 1;
+            HistoryUpdate::Changed(json!({ "data": { "revision": revision, "change": "reset" } }))
+        }
+        unavailable => unavailable,
+    };
+    let _ = events.send(update);
 }
 
 async fn receive_history(
@@ -218,7 +239,7 @@ async fn receive_history(
     loop {
         match events.recv().await {
             Ok(update) => emit_update(&emitter, &subscription_id, requested, update).await,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+            Err(RecvError::Lagged(skipped)) => {
                 tracing::warn!(%subscription_id, skipped, "clipboard history events lagged");
                 emit_update(
                     &emitter,
@@ -230,7 +251,7 @@ async fn receive_history(
                 )
                 .await;
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            Err(RecvError::Closed) => return,
         }
     }
 }
@@ -253,71 +274,76 @@ async fn poll_operations(
                 )
                 .await;
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+            Err(RecvError::Lagged(skipped)) => {
                 tracing::warn!(%subscription_id, skipped, "clipboard operation events lagged");
                 emit_event(
                     &emitter,
                     protocol::stream::OPERATION,
                     "failed",
                     &subscription_id,
-                    Some(json!({
-                        "data": { "resync_required": true, "reason": "lagged", "skipped": skipped }
-                    })),
+                    Some(lag_data(skipped)),
                 )
                 .await;
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            Err(RecvError::Closed) => return,
         }
     }
 }
 
-async fn poll_lifecycle(
-    emitter: SignalEmitter<'static>,
-    mut events: tokio::sync::broadcast::Receiver<api::LifecycleEvent>,
-    subscription_id: String,
-    streams: Vec<String>,
-) {
-    loop {
-        match events.recv().await {
-            Ok(update) if streams.iter().any(|stream| stream == update.stream) => {
-                emit_event(
-                    &emitter,
-                    update.stream,
-                    &update.event,
-                    &subscription_id,
-                    Some(json!({ "data": update.data })),
-                )
-                .await;
+impl LifecycleSubscription {
+    async fn run(self, mut events: tokio::sync::broadcast::Receiver<api::LifecycleEvent>) {
+        loop {
+            match events.recv().await {
+                Ok(update) => self.emit(update).await,
+                Err(RecvError::Lagged(skipped)) => self.emit_lag(skipped).await,
+                Err(RecvError::Closed) => return,
             }
-            Ok(_) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!(%subscription_id, skipped, "clipboard lifecycle events lagged");
-                for stream in &streams {
-                    let event = match stream.as_str() {
-                        protocol::stream::OPERATION => "failed",
-                        protocol::stream::CAPTURE => "changed",
-                        protocol::stream::SESSION => "fallback",
-                        _ => continue,
-                    };
-                    emit_event(
-                        &emitter,
-                        stream,
-                        event,
-                        &subscription_id,
-                        Some(json!({
-                            "data": {
-                                "resync_required": true,
-                                "reason": "lagged",
-                                "skipped": skipped
-                            }
-                        })),
-                    )
-                    .await;
-                }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
     }
+
+    async fn emit(&self, update: api::LifecycleEvent) {
+        if !self.streams.iter().any(|stream| stream == update.stream) {
+            return;
+        }
+        emit_event(
+            &self.destination,
+            update.stream,
+            &update.event,
+            &self.id,
+            Some(json!({ "data": update.data })),
+        )
+        .await;
+    }
+
+    async fn emit_lag(&self, skipped: u64) {
+        tracing::warn!(subscription_id = %self.id, skipped, "clipboard lifecycle events lagged");
+        for (stream, event) in self.streams.iter().filter_map(|stream| lag_event(stream)) {
+            emit_event(
+                &self.destination,
+                stream,
+                event,
+                &self.id,
+                Some(lag_data(skipped)),
+            )
+            .await;
+        }
+    }
+}
+
+fn lag_event(stream: &str) -> Option<(&str, &'static str)> {
+    let event = match stream {
+        protocol::stream::OPERATION => "failed",
+        protocol::stream::CAPTURE => "changed",
+        protocol::stream::SESSION => "fallback",
+        _ => return None,
+    };
+    Some((stream, event))
+}
+
+fn lag_data(skipped: u64) -> Value {
+    json!({
+        "data": { "resync_required": true, "reason": "lagged", "skipped": skipped }
+    })
 }
 
 async fn emit_update(

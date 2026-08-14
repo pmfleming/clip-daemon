@@ -581,8 +581,7 @@ impl RingboardBackend {
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
         if bytes.is_empty() {
-            return Err(BackendError::new(
-                BackendErrorKind::InvalidData,
+            return Err(invalid_data(
                 "Published clipboard content must not be empty",
             ));
         }
@@ -600,36 +599,19 @@ impl RingboardBackend {
     ) -> BackendResult<OperationResult> {
         let file_count = file_selection.paths.len();
         if !(1..=MAX_FILES).contains(&file_count) {
-            return Err(BackendError::new(
-                BackendErrorKind::InvalidData,
+            return Err(invalid_data(
                 "File selection must contain between 1 and 100 paths",
             ));
         }
 
-        let mut uri_list = Vec::new();
-        for path in &file_selection.paths {
-            if !path.is_absolute() {
-                return Err(BackendError::new(
-                    BackendErrorKind::InvalidData,
-                    "File selection paths must be absolute",
-                ));
-            }
-            let uri = Url::from_file_path(path).map_err(|_| {
-                BackendError::new(
-                    BackendErrorKind::InvalidData,
-                    "File selection path is invalid",
-                )
-            })?;
-            uri_list.extend_from_slice(uri.as_str().as_bytes());
-            uri_list.extend_from_slice(b"\r\n");
-        }
+        let uri_list = encode_file_uris(&file_selection.paths)?;
         self.selection
             .publish_files(file_selection.operation.as_str(), uri_list, max_bytes)?;
         Ok(OperationResult::completed(
             "publish-files",
             &format!(
-                "Mirrored {file_count} file{} to the clipboard",
-                if file_count == 1 { "" } else { "s" }
+                "Mirrored {file_count} {} to the clipboard",
+                file_label(file_count)
             ),
         ))
     }
@@ -866,6 +848,27 @@ fn history_token_from_parts(
     u64::from_le_bytes(token)
 }
 
+fn encode_file_uris(paths: &[PathBuf]) -> BackendResult<Vec<u8>> {
+    paths.iter().try_fold(Vec::new(), |mut bytes, path| {
+        if !path.is_absolute() {
+            return Err(invalid_data("File selection paths must be absolute"));
+        }
+        let uri = Url::from_file_path(path)
+            .map_err(|_| invalid_data("File selection path is invalid"))?;
+        bytes.extend_from_slice(uri.as_str().as_bytes());
+        bytes.extend_from_slice(b"\r\n");
+        Ok(bytes)
+    })
+}
+
+fn file_label(count: usize) -> &'static str {
+    if count == 1 { "file" } else { "files" }
+}
+
+fn invalid_data(message: &'static str) -> BackendError {
+    BackendError::new(BackendErrorKind::InvalidData, message)
+}
+
 fn matches_query(summary: &EntrySummary, needle: &str) -> bool {
     needle.is_empty()
         || summary.preview.to_lowercase().contains(needle)
@@ -909,6 +912,26 @@ mod tests {
     };
     use crate::model::{EntryKind, EntrySummary};
 
+    fn candidate(raw_id: u64, id: &str, generated: bool) -> QueryCandidate {
+        QueryCandidate {
+            raw_id,
+            resolved: ResolvedEntry {
+                summary: EntrySummary {
+                    id: id.into(),
+                    revision: 1,
+                    kind: EntryKind::Image,
+                    mime: "image/png".into(),
+                    byte_size: 10,
+                    favorite: false,
+                    current: false,
+                    preview: "image".into(),
+                },
+                generated_path: generated.then(|| "/generated/image.png".into()),
+                echo_source_id: generated.then(|| "source".into()),
+            },
+        }
+    }
+
     #[test]
     fn summary_cache_is_retained_until_the_history_token_changes() {
         let mut cache = SummaryCache::default();
@@ -923,34 +946,7 @@ mod tests {
 
     #[test]
     fn equivalent_generated_echoes_can_be_collapsed_into_the_source() {
-        let summary = |id: &str| EntrySummary {
-            id: id.into(),
-            revision: 1,
-            kind: EntryKind::Image,
-            mime: "image/png".into(),
-            byte_size: 10,
-            favorite: false,
-            current: false,
-            preview: "image".into(),
-        };
-        let candidates = vec![
-            QueryCandidate {
-                raw_id: 2,
-                resolved: ResolvedEntry {
-                    summary: summary("echo"),
-                    generated_path: Some("/generated/image.png".into()),
-                    echo_source_id: Some("source".into()),
-                },
-            },
-            QueryCandidate {
-                raw_id: 1,
-                resolved: ResolvedEntry {
-                    summary: summary("source"),
-                    generated_path: None,
-                    echo_source_id: None,
-                },
-            },
-        ];
+        let candidates = vec![candidate(2, "echo", true), candidate(1, "source", false)];
         let projection = QueryAccumulator {
             needle: "",
             current_id: Some(2),

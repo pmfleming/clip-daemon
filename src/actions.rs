@@ -277,8 +277,7 @@ impl ClipboardService {
         if matches!(params.action.as_str(), "paste" | "image-as-file") {
             return self.paste(params, max_entry_bytes).await;
         }
-        let mutation = BackendMutation::for_action(&params.action, max_entry_bytes)
-            .ok_or_else(|| ApiError::validation("unsupported entry action"))?;
+        let mutation = required_mutation(&params.action, max_entry_bytes)?;
         let mut operation = self
             .backend
             .mutate(&params.entry_id, Some(params.revision), mutation)
@@ -297,33 +296,13 @@ impl ClipboardService {
             .validate_paste(session_id)
             .await
             .map_err(stale_target)?;
-        let image_as_file = params.action == "image-as-file";
-        let mutation = if image_as_file {
-            BackendMutation::ImageAsFile {
-                max_bytes: max_entry_bytes,
-            }
-        } else {
-            BackendMutation::Restore {
-                max_bytes: max_entry_bytes,
-            }
-        };
+        let mutation = required_mutation(&params.action, max_entry_bytes)?;
         let mut operation = self
             .backend
             .mutate(&params.entry_id, Some(params.revision), mutation)
             .await?;
-        // Never arm a compositor shortcut until the requested selection is
-        // definitely owned. If the session vanished while publishing, retain
-        // the successful copy and degrade to manual paste.
         let has_target = has_target && self.sessions.arm_paste(session_id).await;
-        let feedback = match (has_target, image_as_file) {
-            (true, true) => (
-                "paste-prepared",
-                "Image file link prepared; hide the picker",
-            ),
-            (true, false) => ("paste-prepared", "Paste prepared; hide the picker"),
-            (false, true) => ("completed", "Image file link copied; paste manually"),
-            (false, false) => ("completed", "Copied; paste manually"),
-        };
+        let feedback = paste_feedback(has_target, &params.action);
         operation.status = feedback.0.into();
         operation.message = feedback.1.into();
         operation.action = params.action;
@@ -506,20 +485,14 @@ fn open_url(value: &str) -> Result<OperationResult, ApiError> {
 }
 
 fn open_file(file: &FilePreview) -> Result<OperationResult, ApiError> {
-    let path = local_path(file)?;
-    if !path.exists() {
-        return Err(BackendError::not_found("Clipboard file no longer exists").into());
-    }
+    let path = existing_local_path(file)?;
     let path = path.to_string_lossy();
     spawn("xdg-open", &[path.as_ref()])?;
     Ok(OperationResult::completed("open-file", "File opened"))
 }
 
 async fn reveal_file(file: &FilePreview) -> Result<OperationResult, ApiError> {
-    let path = local_path(file)?;
-    if !path.exists() {
-        return Err(BackendError::not_found("Clipboard file no longer exists").into());
-    }
+    let path = existing_local_path(file)?;
     let uri = Url::from_file_path(&path)
         .map_err(|_| invalid("Clipboard entry is not a local file"))?
         .to_string();
@@ -541,11 +514,14 @@ async fn reveal_file(file: &FilePreview) -> Result<OperationResult, ApiError> {
     Ok(OperationResult::completed("reveal-file", "File revealed"))
 }
 
-fn local_path(file: &FilePreview) -> Result<PathBuf, ApiError> {
-    Url::parse(&file.uri)
+fn existing_local_path(file: &FilePreview) -> Result<PathBuf, ApiError> {
+    let path = Url::parse(&file.uri)
         .ok()
         .and_then(|url| url.to_file_path().ok())
-        .ok_or_else(|| invalid("Clipboard entry is not a local file").into())
+        .ok_or_else(|| ApiError::from(invalid("Clipboard entry is not a local file")))?;
+    path.exists()
+        .then_some(path)
+        .ok_or_else(|| BackendError::not_found("Clipboard file no longer exists").into())
 }
 
 fn spawn(program: &str, arguments: &[&str]) -> Result<(), ApiError> {
@@ -558,6 +534,23 @@ fn spawn(program: &str, arguments: &[&str]) -> Result<(), ApiError> {
 
 fn launch_error(message: &'static str) -> ApiError {
     BackendError::new(BackendErrorKind::OperationFailed, message).into()
+}
+
+fn required_mutation(action: &str, max_bytes: u64) -> Result<BackendMutation, ApiError> {
+    BackendMutation::for_action(action, max_bytes)
+        .ok_or_else(|| ApiError::validation("unsupported entry action"))
+}
+
+fn paste_feedback(has_target: bool, action: &str) -> (&'static str, &'static str) {
+    match (has_target, action == "image-as-file") {
+        (true, true) => (
+            "paste-prepared",
+            "Image file link prepared; hide the picker",
+        ),
+        (true, false) => ("paste-prepared", "Paste prepared; hide the picker"),
+        (false, true) => ("completed", "Image file link copied; paste manually"),
+        (false, false) => ("completed", "Copied; paste manually"),
+    }
 }
 
 fn validate_action(details: &EntryDetails, action: &str) -> Result<(), ApiError> {

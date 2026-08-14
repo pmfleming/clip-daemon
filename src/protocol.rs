@@ -39,13 +39,12 @@ pub const STREAMS: &[&str] = &[
     stream::SESSION,
 ];
 
-pub fn registry() -> Value {
-    contract_fixture()["registry"].take()
+pub fn registry() -> serde_json::Result<Value> {
+    Ok(contract_fixture()?["registry"].take())
 }
 
-pub fn contract_fixture() -> Value {
+pub fn contract_fixture() -> serde_json::Result<Value> {
     serde_json::from_str(include_str!("../test_support/clip-api-v1.json"))
-        .expect("checked-in clip-api fixture must be valid JSON")
 }
 
 #[cfg(test)]
@@ -58,7 +57,7 @@ mod tests {
     fn names_are_unique_and_fixture_matches_registry() {
         assert_unique(METHODS);
         assert_unique(STREAMS);
-        let fixture = contract_fixture();
+        let fixture = contract_fixture().expect("valid contract fixture");
         assert_eq!(fixture["version"], VERSION);
         assert_eq!(fixture_names(&fixture, "methods"), METHODS);
         assert_eq!(fixture_names(&fixture, "streams"), STREAMS);

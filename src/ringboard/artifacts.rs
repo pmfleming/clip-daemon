@@ -46,6 +46,12 @@ struct Manifest {
     inline_echoes: Vec<InlineEchoRecord>,
 }
 
+#[derive(Serialize)]
+struct ManifestView<'a> {
+    records: Vec<&'a ArtifactRecord>,
+    inline_echoes: Vec<&'a InlineEchoRecord>,
+}
+
 /// Tracks only files created by clip-daemon. Cleanup never infers ownership
 /// from a directory listing or removes an unregistered path.
 pub(super) struct ArtifactRegistry {
@@ -228,33 +234,38 @@ impl ArtifactRegistry {
         let Some(path) = &self.manifest_path else {
             return Ok(());
         };
-        let parent = path
-            .parent()
-            .ok_or_else(|| artifact_error("Generated-file registry path is invalid"))?;
-        fs::create_dir_all(parent).map_err(artifact_error)?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(artifact_error)?;
-        let temp = parent.join(format!(".generated-files-{}.tmp", Uuid::new_v4()));
-        let result = (|| {
-            let manifest = Manifest {
-                records: self.records.values().cloned().collect(),
-                inline_echoes: self.inline_echoes.values().cloned().collect(),
-            };
-            let bytes = serde_json::to_vec_pretty(&manifest).map_err(artifact_error)?;
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(&temp)
-                .map_err(artifact_error)?;
-            file.write_all(&bytes).map_err(artifact_error)?;
-            file.sync_all().map_err(artifact_error)?;
-            fs::rename(&temp, path).map_err(artifact_error)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temp);
-        }
-        result
+        persist_manifest(
+            path,
+            &ManifestView {
+                records: self.records.values().collect(),
+                inline_echoes: self.inline_echoes.values().collect(),
+            },
+        )
     }
+}
+
+fn persist_manifest(path: &Path, manifest: &impl Serialize) -> BackendResult<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| artifact_error("Generated-file registry path is invalid"))?;
+    fs::create_dir_all(parent).map_err(artifact_error)?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(artifact_error)?;
+    let temp = parent.join(format!(".generated-files-{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let bytes = serde_json::to_vec_pretty(manifest).map_err(artifact_error)?;
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)
+            .map_err(artifact_error)?;
+        file.write_all(&bytes).map_err(artifact_error)?;
+        file.sync_all().map_err(artifact_error)?;
+        fs::rename(&temp, path).map_err(artifact_error)
+    })();
+    result.inspect_err(|_| {
+        let _ = fs::remove_file(temp);
+    })
 }
 
 fn remove_artifact(root: Option<&Path>, path: &Path) -> Option<bool> {
@@ -341,33 +352,25 @@ mod tests {
             .register_inline_echo("replacement", "image/png", b"edited-image")
             .unwrap();
 
-        assert_eq!(
-            registry.match_inline_echo("image/png", b"edited-image", "captured-echo"),
-            Some("replacement".into())
-        );
-        assert_eq!(
-            registry.match_inline_echo("image/png", b"edited-image", "replacement"),
-            None
-        );
+        let echo = |registry: &ArtifactRegistry, entry| {
+            registry.match_inline_echo("image/png", b"edited-image", entry)
+        };
+        assert_eq!(echo(&registry, "captured-echo"), Some("replacement".into()));
+        assert_eq!(echo(&registry, "replacement"), None);
 
         let restored = ArtifactRegistry::load(None, Some(manifest));
-        assert_eq!(
-            restored.match_inline_echo("image/png", b"edited-image", "captured-echo"),
-            Some("replacement".into())
-        );
+        assert_eq!(echo(&restored, "captured-echo"), Some("replacement".into()));
 
         let large = vec![7; super::super::INSPECTION_LIMIT + 10];
         registry
             .register_inline_echo("large-replacement", "image/png", &large)
             .unwrap();
-        assert_eq!(
-            registry.match_inline_echo(
-                "image/png",
-                &large[..super::super::INSPECTION_LIMIT],
-                "large-echo"
-            ),
-            Some("large-replacement".into())
+        let matched = registry.match_inline_echo(
+            "image/png",
+            &large[..super::super::INSPECTION_LIMIT],
+            "large-echo",
         );
+        assert_eq!(matched, Some("large-replacement".into()));
     }
 
     #[test]

@@ -85,54 +85,10 @@ impl ApiService {
     }
 
     fn publish_lifecycle(&self, method: &str, data: &Value) {
-        if let Some(operation) = data.get("operation") {
-            let status = operation["status"].as_str().unwrap_or("completed");
-            if status != "started" {
-                let _ = self.lifecycle_events.send(LifecycleEvent {
-                    stream: protocol::stream::OPERATION,
-                    event: status.into(),
-                    data: json!({ "operation": operation }),
-                });
-            }
-        }
-        let event = match method {
-            "clipboard.capture.setPaused" | "clipboard.capture.screenshot" => {
-                Some(LifecycleEvent {
-                    stream: protocol::stream::CAPTURE,
-                    event: "changed".into(),
-                    data: data.clone(),
-                })
-            }
-            "clipboard.session.begin" => Some(LifecycleEvent {
-                stream: protocol::stream::SESSION,
-                event: if data["session"]["target_available"].as_bool() == Some(true) {
-                    "completed".into()
-                } else {
-                    "fallback".into()
-                },
-                data: data.clone(),
-            }),
-            "clipboard.session.hidden" | "clipboard.session.end" => Some(LifecycleEvent {
-                stream: protocol::stream::SESSION,
-                event: "completed".into(),
-                data: data.clone(),
-            }),
-            "clipboard.entry.action"
-                if data["operation"]["action"] == "paste"
-                    || data["operation"]["action"] == "image-as-file" =>
-            {
-                Some(LifecycleEvent {
-                    stream: protocol::stream::SESSION,
-                    event: data["operation"]["status"]
-                        .as_str()
-                        .unwrap_or("completed")
-                        .into(),
-                    data: data.clone(),
-                })
-            }
-            _ => None,
-        };
-        if let Some(event) = event {
+        for event in [operation_event(data), policy_event(method, data)]
+            .into_iter()
+            .flatten()
+        {
             let _ = self.lifecycle_events.send(event);
         }
     }
@@ -187,14 +143,7 @@ impl ApiService {
             }
             "clipboard.settings.get" => self.get_settings(),
             "clipboard.settings.update" => self.update_settings(decode(params)?).await,
-            _ if protocol::METHODS.contains(&method) => Err(ApiError::new(
-                "not-implemented",
-                format!("{method} is reserved by clip-api v1 but is not implemented yet"),
-            )),
-            _ => Err(ApiError::new(
-                "unsupported-method",
-                format!("Unsupported clip-api method: {method}"),
-            )),
+            _ => Err(unknown_method(method)),
         }
     }
 
@@ -267,6 +216,67 @@ struct PauseParams {
     paused: bool,
     #[serde(default)]
     private_mode: bool,
+}
+
+fn operation_event(data: &Value) -> Option<LifecycleEvent> {
+    let operation = data.get("operation")?;
+    let status = operation["status"].as_str().unwrap_or("completed");
+    (status != "started").then(|| LifecycleEvent {
+        stream: protocol::stream::OPERATION,
+        event: status.into(),
+        data: json!({ "operation": operation }),
+    })
+}
+
+fn policy_event(method: &str, data: &Value) -> Option<LifecycleEvent> {
+    let (stream, event) = match method {
+        "clipboard.capture.setPaused" | "clipboard.capture.screenshot" => {
+            (protocol::stream::CAPTURE, "changed")
+        }
+        "clipboard.session.begin" => (
+            protocol::stream::SESSION,
+            if data["session"]["target_available"].as_bool() == Some(true) {
+                "completed"
+            } else {
+                "fallback"
+            },
+        ),
+        "clipboard.session.hidden" | "clipboard.session.end" => {
+            (protocol::stream::SESSION, "completed")
+        }
+        "clipboard.entry.action"
+            if matches!(
+                data["operation"]["action"].as_str(),
+                Some("paste" | "image-as-file")
+            ) =>
+        {
+            (
+                protocol::stream::SESSION,
+                data["operation"]["status"].as_str().unwrap_or("completed"),
+            )
+        }
+        _ => return None,
+    };
+    Some(LifecycleEvent {
+        stream,
+        event: event.into(),
+        data: data.clone(),
+    })
+}
+
+fn unknown_method(method: &str) -> ApiError {
+    let (code, message) = if protocol::METHODS.contains(&method) {
+        (
+            "not-implemented",
+            format!("{method} is reserved by clip-api v1 but is not implemented yet"),
+        )
+    } else {
+        (
+            "unsupported-method",
+            format!("Unsupported clip-api method: {method}"),
+        )
+    };
+    ApiError::new(code, message)
 }
 
 fn settings_error(message: String) -> ApiError {

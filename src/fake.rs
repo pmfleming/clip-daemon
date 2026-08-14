@@ -306,49 +306,32 @@ mod tests {
         }
     }
 
+    fn query(query: &str, generation: u64, offset: usize, limit: usize) -> HistoryQuery {
+        HistoryQuery {
+            query: query.into(),
+            generation,
+            offset,
+            limit,
+            collapse_self_echoes: true,
+        }
+    }
+
     #[tokio::test]
     async fn query_details_and_change_tokens_are_deterministic() {
         let backend = FakeBackend::with_entries(vec![
             detail("current", "alpha", 2),
             detail("other", "beta", 3),
         ]);
-        let page = backend
-            .query(HistoryQuery {
-                query: "bet".into(),
-                generation: 7,
-                offset: 0,
-                limit: 10,
-                collapse_self_echoes: true,
-            })
-            .await
-            .unwrap();
+        let page = backend.query(query("bet", 7, 0, 10)).await.unwrap();
         assert_eq!(page.generation, 7);
         assert_eq!(page.next_offset, None);
         assert_eq!(page.entries[0].id, "other");
         assert_eq!(page.current.unwrap().id, "current");
 
-        let first = backend
-            .query(HistoryQuery {
-                query: String::new(),
-                generation: 8,
-                offset: 0,
-                limit: 1,
-                collapse_self_echoes: true,
-            })
-            .await
-            .unwrap();
+        let first = backend.query(query("", 8, 0, 1)).await.unwrap();
         assert_eq!(first.entries[0].id, "current");
         assert_eq!(first.next_offset, Some(1));
-        let second = backend
-            .query(HistoryQuery {
-                query: String::new(),
-                generation: 8,
-                offset: 1,
-                limit: 1,
-                collapse_self_echoes: true,
-            })
-            .await
-            .unwrap();
+        let second = backend.query(query("", 8, 1, 1)).await.unwrap();
         assert_eq!(second.entries[0].id, "other");
         assert_eq!(second.next_offset, None);
 

@@ -115,3 +115,24 @@ Escape hatches remain at zero. Coverage reports 45.15% of lines, 44.16% of funct
 The 2026-08-15 review added post-publication paste arming, explicit partial edit-publication results, bounded screenshot execution, lossless JSONL EOF handling, and subscription lag recovery. Regression coverage now includes the JSONL executable boundary and the affected URL, screenshot, paste-session, and publication contracts.
 
 Coverage reports 49.22% of lines, 47.98% of functions, and 47.66% of regions across 19 Rust files. The JSONL client increased from 0% to 56.38% line coverage, session policy reached 58.57%, and Ringboard mutation coverage increased to 18.01%. All 43 tests pass. RustSec reports no known vulnerabilities; the pinned Ringboard SDK still transitively uses the unmaintained `paste` crate through `stable-type`.
+
+## Cognitive and architecture pass
+
+The follow-up refactored lifecycle/subscription dispatch, JSONL request processing, paste feedback, annotation publication, file URI encoding, settings restarts, selection options, and artifact persistence into smaller policy boundaries. Repeated test fixtures and publication assertions were consolidated without reducing coverage.
+
+| Signal | Before | After |
+|---|---:|---:|
+| maximum function hotspot | 73.92 | 40.21 |
+| maximum module hotspot | 70.93 | 42.88 |
+| aggregate function effort | 3616.54 | 3491.91 |
+| aggregate branch pressure | 633 | 623 |
+| functions scoring at least 35 | 20 | 12 |
+| minimum locality | 97.0 | 100.0 |
+| average locality | 99.66 | 100.0 |
+| minimum leverage | 50.0 | 53.0 |
+| average leverage | 66.85 | 67.20 |
+| clone records | 19 | 14 |
+| measured Rust SLOC | 6,174 | 6,163 |
+| physical Rust source lines | 6,817 | 6,815 |
+
+Escape hatches remain at zero. Production reliability findings fell from one checked-fixture panic path to zero, direct `.clone()` calls fell from 75 to 72, and `.cloned()` calls fell from three to one. All 43 tests pass; coverage reports 48.69% of lines, 47.80% of functions, and 47.76% of regions, with 51.02% changed-line coverage.

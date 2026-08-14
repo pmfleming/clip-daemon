@@ -73,29 +73,38 @@ pub async fn run() -> Result<()> {
 async fn request_loop(connection: Option<zbus::Connection>, output: Output) -> Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut calls = JoinSet::new();
-    let mut shutdown_id = None;
-    while let Some(line) = lines.next_line().await.context("read client request")? {
-        reap_finished_calls(&mut calls)?;
-        let Some(request) = decode_request(&line, &output).await? else {
-            continue;
+    let shutdown_id = loop {
+        let Some(line) = lines.next_line().await.context("read client request")? else {
+            break None;
         };
-        if let Some(id) = handle_request(request, &connection, &output, &mut calls).await? {
-            shutdown_id = Some(id);
-            break;
+        if let Some(id) = process_line(&line, &connection, &output, &mut calls).await? {
+            break Some(id);
         }
-    }
-    // EOF and explicit shutdown are graceful: every accepted call receives a
-    // response before stdout is closed. This also makes one-shot pipelines
-    // reliable instead of racing detached tasks against runtime shutdown.
+    };
     drain_calls(&mut calls).await?;
-    if let Some(id) = shutdown_id {
-        emit(
-            &output,
-            &json!({"kind":"response","id":id,"ok":true,"response":{"shutdown":true}}),
-        )
-        .await?;
+    match shutdown_id {
+        Some(id) => {
+            emit(
+                &output,
+                &json!({"kind":"response","id":id,"ok":true,"response":{"shutdown":true}}),
+            )
+            .await
+        }
+        None => Ok(()),
     }
-    Ok(())
+}
+
+async fn process_line(
+    line: &str,
+    connection: &Option<zbus::Connection>,
+    output: &Output,
+    calls: &mut JoinSet<Result<()>>,
+) -> Result<Option<String>> {
+    reap_finished_calls(calls)?;
+    match decode_request(line, output).await? {
+        Some(request) => handle_request(request, connection, output, calls).await,
+        None => Ok(None),
+    }
 }
 
 async fn decode_request(line: &str, output: &Output) -> Result<Option<Request>> {

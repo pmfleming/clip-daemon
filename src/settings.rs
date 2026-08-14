@@ -119,14 +119,14 @@ impl SettingsManager {
         if updated == current {
             return Ok(current);
         }
-        let restart_required = updated.max_entries != current.max_entries
-            || updated.max_favorites != current.max_favorites
-            || updated.max_entry_bytes != current.max_entry_bytes;
+        let restart_required = retention_changed(&current, &updated);
         let updated = self
             .save(updated, persist_config_pair, SETTINGS_SAVED)
             .await?;
-        if restart_required && let Err(error) = restart_capture(&updated).await {
-            return Err(format!("{SETTINGS_SAVED}, but {error}"));
+        if restart_required {
+            restart_capture(&updated)
+                .await
+                .map_err(|error| format!("{SETTINGS_SAVED}, but {error}"))?;
         }
         Ok(updated)
     }
@@ -171,9 +171,9 @@ impl SettingsManager {
         updated.private_mode = private_mode;
         let updated = self.save(updated, persist, CAPTURE_SAVED).await?;
         let action = if paused { "stop" } else { "start" };
-        if let Err(error) = control_units(action, &["ringboard-wayland.service"]).await {
-            return Err(format!("{CAPTURE_SAVED}, but {error}"));
-        }
+        control_units(action, &["ringboard-wayland.service"])
+            .await
+            .map_err(|error| format!("{CAPTURE_SAVED}, but {error}"))?;
         Ok(updated)
     }
 }
@@ -188,6 +188,12 @@ fn validated_update<T: Copy + PartialOrd>(
         Some(_) => Err("Clipboard setting is outside the supported range".into()),
         None => Ok(current),
     }
+}
+
+fn retention_changed(current: &ClipboardSettings, updated: &ClipboardSettings) -> bool {
+    updated.max_entries != current.max_entries
+        || updated.max_favorites != current.max_favorites
+        || updated.max_entry_bytes != current.max_entry_bytes
 }
 
 async fn restart_capture(settings: &ClipboardSettings) -> Result<(), String> {
