@@ -9,7 +9,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Command as StdCommand,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use clipboard_history_client_sdk::{
@@ -40,12 +40,35 @@ use super::{
     invalid_entry, run_blocking,
 };
 
+const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub(super) struct AnnotationStage {
     input: PathBuf,
     output: PathBuf,
     opaque_id: String,
     revision: u64,
     max_bytes: u64,
+}
+
+struct OperationCompletion {
+    message: String,
+    warning: Option<String>,
+}
+
+impl OperationCompletion {
+    fn completed(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            warning: None,
+        }
+    }
+
+    fn with_warning(message: impl Into<String>, warning: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            warning: Some(warning.into()),
+        }
+    }
 }
 
 impl RingboardBackend {
@@ -140,7 +163,7 @@ impl RingboardBackend {
     ) -> BackendResult<OperationResult>
     where
         F: FnOnce(String) -> Fut + Send + 'static,
-        Fut: Future<Output = BackendResult<String>> + Send + 'static,
+        Fut: Future<Output = BackendResult<OperationCompletion>> + Send + 'static,
     {
         let mut operation = OperationResult::completed(action, message);
         operation.status = "started".into();
@@ -158,8 +181,15 @@ impl RingboardBackend {
                 Err(operation_error("Clipboard operation could not start"))
             };
             let event = match completed {
-                Ok(message) => {
-                    OperationResult::with_id(task_id.clone(), &task_action, "completed", &message)
+                Ok(completion) => {
+                    let mut operation = OperationResult::with_id(
+                        task_id.clone(),
+                        &task_action,
+                        "completed",
+                        &completion.message,
+                    );
+                    operation.warning = completion.warning;
+                    operation
                 }
                 Err(error) => OperationResult::with_id(
                     task_id.clone(),
@@ -343,11 +373,9 @@ fn capture_and_publish(
         "{},{} {}x{}",
         region.x, region.y, region.width, region.height
     );
-    let status = StdCommand::new("grim")
-        .args(["-g", &geometry])
-        .arg(path)
-        .status()
-        .map_err(|_| operation_error("Could not start screenshot capture"))?;
+    let mut command = StdCommand::new("grim");
+    command.args(["-g", &geometry]).arg(path);
+    let status = command_status_with_timeout(&mut command, SCREENSHOT_TIMEOUT)?;
     if !status.success() {
         return Err(operation_error("Screenshot capture failed"));
     }
@@ -369,7 +397,7 @@ async fn run_annotation(
     backend: RingboardBackend,
     editor: ImageEditorCommand,
     staged: AnnotationStage,
-) -> BackendResult<String> {
+) -> BackendResult<OperationCompletion> {
     let AnnotationStage {
         input,
         output,
@@ -386,7 +414,6 @@ async fn run_annotation(
                 apply_annotation(&backend, &opaque_id, revision, &edited, max_bytes)
             })
             .await
-            .map(|()| "Image edit completed".to_owned())
         }
         Ok(()) => Err(operation_error("Image edit was cancelled")),
         Err(error) => Err(error),
@@ -396,7 +423,7 @@ async fn run_annotation(
         Ok(())
     })
     .await;
-    result.and(cleanup.map(|()| "Image edit completed".to_owned()))
+    result.and_then(|outcome| cleanup.map(|()| outcome))
 }
 
 struct EditorProcessGroup(Option<rustix::process::Pid>);
@@ -407,6 +434,27 @@ impl Drop for EditorProcessGroup {
             let _ =
                 rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
         }
+    }
+}
+
+fn command_status_with_timeout(
+    command: &mut StdCommand,
+    timeout: Duration,
+) -> BackendResult<std::process::ExitStatus> {
+    let mut child = command
+        .spawn()
+        .map_err(|_| operation_error("Could not start screenshot capture"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().map_err(operation_error)? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(operation_error("Screenshot capture timed out"));
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -435,22 +483,34 @@ fn apply_annotation(
     revision: u64,
     output: &Path,
     max_bytes: u64,
-) -> BackendResult<()> {
+) -> BackendResult<OperationCompletion> {
     if !valid_edited_image(output, max_bytes) {
         return Err(operation_error("Annotation returned an invalid image"));
     }
     let raw_id = backend.replace_file_entry(opaque_id, Some(revision), output, "image/png")?;
-    let source = backend.details_raw_sync(raw_id, super::MAX_DETAILS_BYTES)?;
-    let bytes = fs::read(output).map_err(operation_error)?;
-    backend
-        .artifact_registry()?
-        .register_inline_echo(&source.entry.id, "image/png", &bytes)?;
-    backend.clear_identity_state()?;
-    backend
-        .selection
-        .publish_file("image/png", output, max_bytes)?;
-    backend.artifact_registry()?.clear_active_selection();
-    Ok(())
+
+    // Ringboard has committed at this point. Any subsequent failure is a
+    // partial success and must not be reported as though the edit was lost.
+    let publication: BackendResult<()> = (|| {
+        let source = backend.details_raw_sync(raw_id, super::MAX_DETAILS_BYTES)?;
+        let bytes = fs::read(output).map_err(operation_error)?;
+        backend
+            .artifact_registry()?
+            .register_inline_echo(&source.entry.id, "image/png", &bytes)?;
+        backend.clear_identity_state()?;
+        backend
+            .selection
+            .publish_file("image/png", output, max_bytes)?;
+        backend.artifact_registry()?.clear_active_selection();
+        Ok(())
+    })();
+    match publication {
+        Ok(()) => Ok(OperationCompletion::completed("Image edit completed")),
+        Err(error) => Ok(OperationCompletion::with_warning(
+            "Image edit committed",
+            format!("Clipboard publication failed: {error}"),
+        )),
+    }
 }
 
 fn replace_from_file(raw_id: u64, ring: RingKind, path: &Path, mime: &str) -> BackendResult<()> {
@@ -685,7 +745,7 @@ mod tests {
 
     use crate::editor::ImageEditorCommand;
 
-    use super::{remove_files, run_editor, valid_edited_image};
+    use super::{command_status_with_timeout, remove_files, run_editor, valid_edited_image};
 
     #[test]
     fn operation_cleanup_only_removes_its_own_files() {
@@ -702,6 +762,25 @@ mod tests {
         assert!(!first.exists());
         assert!(!second.exists());
         assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn screenshot_commands_are_bounded() {
+        let mut success = std::process::Command::new("sh");
+        success.args(["-c", "exit 0"]);
+        assert!(
+            command_status_with_timeout(&mut success, std::time::Duration::from_secs(1))
+                .expect("quick command")
+                .success()
+        );
+
+        let mut slow = std::process::Command::new("sleep");
+        slow.arg("1");
+        let started = std::time::Instant::now();
+        assert!(
+            command_status_with_timeout(&mut slow, std::time::Duration::from_millis(40)).is_err()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 
     #[tokio::test]

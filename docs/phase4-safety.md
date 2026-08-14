@@ -5,7 +5,7 @@
 - Entry IDs are bound to the observed Ringboard history generation and content fingerprint.
   Backend mutations revalidate the expected revision immediately before acting, including
   delayed annotation results.
-- Paste sessions expire after five minutes, retain compositor targets only in daemon memory, and never expose raw addresses or titles.
+- Paste sessions expire after five minutes, retain compositor targets only in daemon memory, and never expose raw addresses or titles. Automatic paste is armed only after the requested Wayland selection publication succeeds; publication failure leaves the session copy-only instead of pasting stale clipboard content.
 - Wayland selection publication validates exact MIME values and applies the configured entry limit plus a 64 MiB hard ceiling before retaining bytes in the daemon-owned publisher.
 - Delete and favorite changes use Ringboard's server protocol rather than writing database files.
 - Wipe requires a one-use, 30-second challenge and clears regular history, favorites, thumbnails, temporary transfers, and pending annotation tasks.
@@ -14,6 +14,7 @@
   atomic renames, roll back partial commits, skip no-op restarts, and report restart errors
   explicitly after a successful commit. Size limits are validated and persisted.
 - Annotation output is accepted only when it is a decodable image no larger than 32 MiB.
+  Screenshot requests additionally cap total area at 32 megapixels and terminate `grim` after 15 seconds.
   Image inspection and thumbnail decoding cap dimensions at 16,384 pixels per edge and decoded
   allocation at 128 MiB. A file-backed image is dereferenced only when its file-list or plain-text
   URI names exactly one local, non-symlink regular file that passes size, format, and dimension

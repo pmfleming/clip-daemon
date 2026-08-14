@@ -68,6 +68,13 @@ pub struct EntryThumbnail {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacementResult {
+    pub entry: EntryDetails,
+    pub selection_published: bool,
+    pub publication_message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendStatus {
     pub available: bool,
     pub engine: String,
@@ -81,6 +88,8 @@ pub struct OperationResult {
     pub status: String,
     pub message: String,
     pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 impl OperationResult {
@@ -100,6 +109,7 @@ impl OperationResult {
             status: status.into(),
             message: message.into(),
             path: None,
+            warning: None,
         }
     }
 }

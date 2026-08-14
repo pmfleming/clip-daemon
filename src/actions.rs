@@ -169,13 +169,7 @@ impl ClipboardService {
         params: ScreenshotParams,
         max_entry_bytes: u64,
     ) -> Result<Value, ApiError> {
-        if !(1..=MAX_SCREENSHOT_EDGE).contains(&params.width)
-            || !(1..=MAX_SCREENSHOT_EDGE).contains(&params.height)
-        {
-            return Err(ApiError::validation(
-                "screenshot width and height must be between 1 and 32768",
-            ));
-        }
+        validate_screenshot_dimensions(params.width, params.height)?;
         let operation = self
             .backend
             .capture_screenshot(
@@ -300,7 +294,7 @@ impl ClipboardService {
             .ok_or_else(|| ApiError::validation("session_id is required for paste"))?;
         let has_target = self
             .sessions
-            .prepare_paste(session_id)
+            .validate_paste(session_id)
             .await
             .map_err(stale_target)?;
         let image_as_file = params.action == "image-as-file";
@@ -317,6 +311,10 @@ impl ClipboardService {
             .backend
             .mutate(&params.entry_id, Some(params.revision), mutation)
             .await?;
+        // Never arm a compositor shortcut until the requested selection is
+        // definitely owned. If the session vanished while publishing, retain
+        // the successful copy and degrade to manual paste.
+        let has_target = has_target && self.sessions.arm_paste(session_id).await;
         let feedback = match (has_target, image_as_file) {
             (true, true) => (
                 "paste-prepared",
@@ -368,7 +366,7 @@ impl ClipboardService {
         }
         let current_revision = self.backend.revision(&lease.entry_id).await?;
         validate_revision(Some(lease.revision), current_revision)?;
-        let entry = self
+        let replacement = self
             .backend
             .replace(
                 &lease.entry_id,
@@ -377,7 +375,13 @@ impl ClipboardService {
                 params.value.as_bytes(),
             )
             .await?;
-        Ok(json!({ "entry": entry }))
+        Ok(json!({
+            "entry": replacement.entry,
+            "publication": {
+                "published": replacement.selection_published,
+                "message": replacement.publication_message
+            }
+        }))
     }
 
     async fn cancel_edit(&self, params: EditCancelParams) -> Result<Value, ApiError> {
@@ -474,12 +478,22 @@ fn editable_value(details: &EntryDetails) -> Result<&str, ApiError> {
 
 async fn launch_action(params: &ActionParams, details: &EntryDetails) -> Result<Value, ApiError> {
     let operation = match params.action.as_str() {
-        "open-url" => open_url(details.text.as_deref().unwrap_or_default())?,
+        "open-url" => open_url(complete_text(details)?)?,
         "open-file" => open_file(selected_file(details, params.file_index)?)?,
         "reveal-file" => reveal_file(selected_file(details, params.file_index)?).await?,
         _ => return Err(ApiError::validation("unsupported launch action")),
     };
     Ok(json!({ "operation": operation }))
+}
+
+fn complete_text(details: &EntryDetails) -> Result<&str, ApiError> {
+    if details.preview_truncated {
+        return Err(invalid("Clipboard text is too large to launch safely").into());
+    }
+    details
+        .text
+        .as_deref()
+        .ok_or_else(|| invalid("Clipboard entry is not valid UTF-8 text").into())
 }
 
 fn open_url(value: &str) -> Result<OperationResult, ApiError> {
@@ -597,8 +611,63 @@ fn invalid(message: &'static str) -> BackendError {
     BackendError::new(BackendErrorKind::InvalidData, message)
 }
 
-const MAX_SCREENSHOT_EDGE: u32 = 32_768;
+const MAX_SCREENSHOT_EDGE: u32 = 16_384;
+const MAX_SCREENSHOT_PIXELS: u64 = 32 * 1024 * 1024;
+
+fn validate_screenshot_dimensions(width: u32, height: u32) -> Result<(), ApiError> {
+    let dimensions_valid =
+        (1..=MAX_SCREENSHOT_EDGE).contains(&width) && (1..=MAX_SCREENSHOT_EDGE).contains(&height);
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if !dimensions_valid || pixels > MAX_SCREENSHOT_PIXELS {
+        return Err(ApiError::validation(
+            "screenshot dimensions exceed the 16384-pixel edge or 32-megapixel limit",
+        ));
+    }
+    Ok(())
+}
 
 const fn default_query_limit() -> usize {
     100
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{complete_text, validate_screenshot_dimensions};
+    use crate::model::{EntryDetails, EntryKind, EntrySummary};
+
+    fn text_details(truncated: bool) -> EntryDetails {
+        EntryDetails {
+            entry: EntrySummary {
+                id: "entry".into(),
+                revision: 1,
+                kind: EntryKind::Link,
+                mime: "text/plain".into(),
+                byte_size: 1,
+                favorite: false,
+                current: false,
+                preview: "https://example.test".into(),
+            },
+            text: Some("https://example.test".into()),
+            files: Vec::new(),
+            image: None,
+            preview_truncated: truncated,
+        }
+    }
+
+    #[test]
+    fn launch_text_must_be_complete() {
+        assert_eq!(
+            complete_text(&text_details(false)).expect("complete text"),
+            "https://example.test"
+        );
+        assert!(complete_text(&text_details(true)).is_err());
+    }
+
+    #[test]
+    fn screenshots_have_edge_and_allocation_limits() {
+        assert!(validate_screenshot_dimensions(1920, 1080).is_ok());
+        assert!(validate_screenshot_dimensions(0, 1080).is_err());
+        assert!(validate_screenshot_dimensions(16_385, 1).is_err());
+        assert!(validate_screenshot_dimensions(16_384, 16_384).is_err());
+    }
 }

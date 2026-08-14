@@ -149,6 +149,7 @@ async fn edit_and_type_action_policy_are_daemon_enforced() {
         )
         .await;
     assert_eq!(committed["data"]["entry"]["text"], "new");
+    assert_eq!(committed["data"]["publication"]["published"], true);
     let unsafe_paste = api
         .dispatch(
             "clipboard.entry.action",

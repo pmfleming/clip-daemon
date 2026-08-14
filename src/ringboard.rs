@@ -27,6 +27,7 @@ use crate::{
     editor::ImageEditorCommand,
     model::{
         BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
+        ReplacementResult,
     },
     selection::SelectionService,
 };
@@ -528,15 +529,32 @@ impl RingboardBackend {
         expected_revision: u64,
         mime: &str,
         bytes: &[u8],
-    ) -> BackendResult<EntryDetails> {
+    ) -> BackendResult<ReplacementResult> {
         let raw_id = self.replace_entry(opaque_id, Some(expected_revision), mime, bytes)?;
         let details = self.details_raw_sync(raw_id, MAX_DETAILS_BYTES)?;
-        self.restore_entry(
+        let publication = self.restore_entry(
             &details.entry.id,
             Some(details.entry.revision),
             MAX_DETAILS_BYTES as u64,
-        )?;
-        Ok(details)
+        );
+        let (selection_published, publication_message) = match publication {
+            Ok(_) => (true, "Replacement published to the clipboard".to_owned()),
+            Err(error) => {
+                // The Ringboard replacement has already committed. Report the
+                // publication failure as partial success rather than claiming
+                // that the edit itself failed.
+                let _ = self.clear_identity_state();
+                (
+                    false,
+                    format!("Replacement committed, but clipboard publication failed: {error}"),
+                )
+            }
+        };
+        Ok(ReplacementResult {
+            entry: details,
+            selection_published,
+            publication_message,
+        })
     }
 
     fn revision_for(&self, token: u64) -> BackendResult<u64> {
@@ -722,7 +740,7 @@ impl ClipboardBackend for RingboardBackend {
         expected_revision: u64,
         mime: &str,
         bytes: &[u8],
-    ) -> BackendResult<EntryDetails> {
+    ) -> BackendResult<ReplacementResult> {
         let opaque_id = opaque_id.to_owned();
         let mime = mime.to_owned();
         let bytes = bytes.to_vec();

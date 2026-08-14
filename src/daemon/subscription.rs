@@ -220,6 +220,15 @@ async fn receive_history(
             Ok(update) => emit_update(&emitter, &subscription_id, requested, update).await,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(%subscription_id, skipped, "clipboard history events lagged");
+                emit_update(
+                    &emitter,
+                    &subscription_id,
+                    requested,
+                    HistoryUpdate::Changed(json!({
+                        "data": { "change": "reset", "reason": "lagged", "skipped": skipped }
+                    })),
+                )
+                .await;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
@@ -246,6 +255,16 @@ async fn poll_operations(
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(%subscription_id, skipped, "clipboard operation events lagged");
+                emit_event(
+                    &emitter,
+                    protocol::stream::OPERATION,
+                    "failed",
+                    &subscription_id,
+                    Some(json!({
+                        "data": { "resync_required": true, "reason": "lagged", "skipped": skipped }
+                    })),
+                )
+                .await;
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
@@ -273,6 +292,28 @@ async fn poll_lifecycle(
             Ok(_) => {}
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(%subscription_id, skipped, "clipboard lifecycle events lagged");
+                for stream in &streams {
+                    let event = match stream.as_str() {
+                        protocol::stream::OPERATION => "failed",
+                        protocol::stream::CAPTURE => "changed",
+                        protocol::stream::SESSION => "fallback",
+                        _ => continue,
+                    };
+                    emit_event(
+                        &emitter,
+                        stream,
+                        event,
+                        &subscription_id,
+                        Some(json!({
+                            "data": {
+                                "resync_required": true,
+                                "reason": "lagged",
+                                "skipped": skipped
+                            }
+                        })),
+                    )
+                    .await;
+                }
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }

@@ -3,7 +3,9 @@ use std::{error::Error, fmt, path::PathBuf};
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
-use crate::model::{BackendStatus, EntryDetails, EntryThumbnail, HistoryPage, OperationResult};
+use crate::model::{
+    BackendStatus, EntryDetails, EntryThumbnail, HistoryPage, OperationResult, ReplacementResult,
+};
 
 pub const MAX_QUERY_LIMIT: usize = 200;
 pub const MAX_WAYLAND_SELECTION_BYTES: u64 = 64 * 1024 * 1024;
@@ -186,6 +188,6 @@ pub trait ClipboardBackend: Send + Sync {
         expected_revision: u64,
         mime: &str,
         bytes: &[u8],
-    ) -> BackendResult<EntryDetails>;
+    ) -> BackendResult<ReplacementResult>;
     async fn cancel_operation(&self, operation_id: &str) -> BackendResult<bool>;
 }

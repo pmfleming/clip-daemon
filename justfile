@@ -14,6 +14,9 @@ lint:
 test:
     cargo test
 
+audit:
+    cargo audit
+
 check: fmt-check lint test
 
 contract:

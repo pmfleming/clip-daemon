@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::Mutex,
+    task::JoinSet,
 };
 
 use crate::{
@@ -71,13 +72,28 @@ pub async fn run() -> Result<()> {
 
 async fn request_loop(connection: Option<zbus::Connection>, output: Output) -> Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut calls = JoinSet::new();
+    let mut shutdown_id = None;
     while let Some(line) = lines.next_line().await.context("read client request")? {
+        reap_finished_calls(&mut calls)?;
         let Some(request) = decode_request(&line, &output).await? else {
             continue;
         };
-        if !handle_request(request, &connection, &output).await? {
+        if let Some(id) = handle_request(request, &connection, &output, &mut calls).await? {
+            shutdown_id = Some(id);
             break;
         }
+    }
+    // EOF and explicit shutdown are graceful: every accepted call receives a
+    // response before stdout is closed. This also makes one-shot pipelines
+    // reliable instead of racing detached tasks against runtime shutdown.
+    drain_calls(&mut calls).await?;
+    if let Some(id) = shutdown_id {
+        emit(
+            &output,
+            &json!({"kind":"response","id":id,"ok":true,"response":{"shutdown":true}}),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -103,10 +119,11 @@ async fn handle_request(
     request: Request,
     connection: &Option<zbus::Connection>,
     output: &Output,
-) -> Result<bool> {
+    calls: &mut JoinSet<Result<()>>,
+) -> Result<Option<String>> {
     match request {
         Request::Call { id, method, params } => {
-            tokio::spawn(run_call(
+            calls.spawn(run_call(
                 connection.clone(),
                 Arc::clone(output),
                 id,
@@ -122,16 +139,9 @@ async fn handle_request(
             let response = transport_call(connection, "Cancel", &(request_id.as_str(),)).await;
             emit_transport(output, &id, response).await?;
         }
-        Request::Shutdown { id } => {
-            emit(
-                output,
-                &json!({"kind":"response","id":id,"ok":true,"response":{"shutdown":true}}),
-            )
-            .await?;
-            return Ok(false);
-        }
+        Request::Shutdown { id } => return Ok(Some(id)),
     }
-    Ok(true)
+    Ok(None)
 }
 
 async fn run_call(
@@ -140,7 +150,7 @@ async fn run_call(
     id: String,
     method: String,
     params: Value,
-) {
+) -> Result<()> {
     let response = call(&connection, &method, params)
         .await
         .unwrap_or_else(|_| {
@@ -149,11 +159,25 @@ async fn run_call(
                 "clip-daemon session service is unavailable".into(),
             )
         });
-    let _ = emit(
+    emit(
         &output,
         &json!({"kind":"response","id":id,"ok":true,"response":response}),
     )
-    .await;
+    .await
+}
+
+fn reap_finished_calls(calls: &mut JoinSet<Result<()>>) -> Result<()> {
+    while let Some(result) = calls.try_join_next() {
+        result.context("client call task failed")??;
+    }
+    Ok(())
+}
+
+async fn drain_calls(calls: &mut JoinSet<Result<()>>) -> Result<()> {
+    while let Some(result) = calls.join_next().await {
+        result.context("client call task failed")??;
+    }
+    Ok(())
 }
 
 async fn proxy(connection: &Option<zbus::Connection>) -> Result<zbus::Proxy<'_>> {

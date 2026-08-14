@@ -6,7 +6,7 @@ Status: protocol probe rerun 2026-07-25; content/action hardware matrix tracked 
 |---|---|---|
 | Required Wayland protocols | pass | Rerun on 2026-07-25: Hyprland `wayland-1` exposes `ext_data_control_manager_v1`, `zwp_virtual_keyboard_manager_v1`, and foreign-toplevel; `ringboard-server` and `ringboard-wayland` 0.16.2 are present |
 | Read-only SDK snapshot/query | pass | Rerun on 2026-07-25: database opened and a bounded 10-entry query completed with additional history reported while Ringboard services were active |
-| Text MIME capture/read | partial pass | A `text/plain` `wl-copy` selection was captured and visible to the SDK query; restoration/paste is not implemented yet |
+| Text MIME capture/read | partial pass | A `text/plain` `wl-copy` selection was captured and visible to the SDK query; restoration/paste is implemented but still awaits a recorded hardware round trip |
 | Image/file MIME round trip | pending | |
 | File MIME priority | pending | |
 | Layer-shell focus and auto-paste targets | pending | |

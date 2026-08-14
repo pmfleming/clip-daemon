@@ -11,6 +11,7 @@ use crate::{
     classification::{bounded_preview, classify},
     model::{
         BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
+        ReplacementResult,
     },
 };
 
@@ -242,9 +243,9 @@ impl ClipboardBackend for FakeBackend {
         expected_revision: u64,
         mime: &str,
         bytes: &[u8],
-    ) -> BackendResult<EntryDetails> {
+    ) -> BackendResult<ReplacementResult> {
         self.validate_revision(opaque_id, Some(expected_revision))?;
-        self.mutate_entry(opaque_id, |details| {
+        let entry = self.mutate_entry(opaque_id, |details| {
             details.entry.revision = details.entry.revision.saturating_add(1);
             details.entry.kind = classify(mime, bytes);
             details.entry.mime = mime.into();
@@ -252,6 +253,11 @@ impl ClipboardBackend for FakeBackend {
             details.entry.preview = bounded_preview(bytes, bytes.len());
             details.text = std::str::from_utf8(bytes).ok().map(str::to_owned);
             details.clone()
+        })?;
+        Ok(ReplacementResult {
+            entry,
+            selection_published: true,
+            publication_message: "Replacement published to the clipboard".into(),
         })
     }
 

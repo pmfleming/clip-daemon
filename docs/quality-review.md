@@ -109,3 +109,9 @@ The pass after `6802929` consolidated API response/limit policy, reused the D-Bu
 | production Rust lines | 6,372 | 6,366 |
 
 Escape hatches remain at zero. Coverage reports 45.15% of lines, 44.16% of functions, and 44.05% of regions. All 38 discovered tests pass with no failed or unknown results.
+
+## Failure-path remediation follow-up
+
+The 2026-08-15 review added post-publication paste arming, explicit partial edit-publication results, bounded screenshot execution, lossless JSONL EOF handling, and subscription lag recovery. Regression coverage now includes the JSONL executable boundary and the affected URL, screenshot, paste-session, and publication contracts.
+
+Coverage reports 49.22% of lines, 47.98% of functions, and 47.66% of regions across 19 Rust files. The JSONL client increased from 0% to 56.38% line coverage, session policy reached 58.57%, and Ringboard mutation coverage increased to 18.01%. All 43 tests pass. RustSec reports no known vulnerabilities; the pinned Ringboard SDK still transitively uses the unmaintained `paste` crate through `stable-type`.

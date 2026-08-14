@@ -56,17 +56,32 @@ impl SessionManager {
         view(id, target_available, "active")
     }
 
-    pub async fn prepare_paste(&self, id: &str) -> Result<bool, &'static str> {
+    pub async fn validate_paste(&self, id: &str) -> Result<bool, &'static str> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
-            .get_mut(id)
+            .get(id)
             .ok_or("Paste session is unknown or expired")?;
         if session.expires <= Instant::now() {
             sessions.remove(id);
             return Err("Paste session expired");
         }
-        session.paste_pending = true;
         Ok(session.target.is_some())
+    }
+
+    /// Arm automatic paste only after the requested clipboard publication has
+    /// succeeded. A session that disappears in the meantime degrades safely to
+    /// copy-only behavior.
+    pub async fn arm_paste(&self, id: &str) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        let Some(session) = sessions.get_mut(id) else {
+            return false;
+        };
+        if session.expires <= Instant::now() {
+            sessions.remove(id);
+            return false;
+        }
+        session.paste_pending = session.target.is_some();
+        session.paste_pending
     }
 
     pub async fn hidden(&self, id: &str) -> Result<SessionView, &'static str> {
@@ -238,8 +253,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_sessions_never_prepare_a_paste() {
-        let result = SessionManager::default().prepare_paste("missing").await;
-        assert!(result.is_err());
+    async fn paste_is_armed_only_after_publication() {
+        let manager = SessionManager::default();
+        assert!(manager.validate_paste("missing").await.is_err());
+        assert!(!manager.arm_paste("missing").await);
+
+        let id = "targeted".to_owned();
+        manager.sessions.lock().await.insert(
+            id.clone(),
+            super::Session {
+                target: Some(super::Target {
+                    address: "0x123".into(),
+                    class: "firefox".into(),
+                }),
+                expires: std::time::Instant::now() + std::time::Duration::from_secs(30),
+                paste_pending: false,
+            },
+        );
+        assert!(manager.validate_paste(&id).await.expect("valid target"));
+        assert!(!manager.sessions.lock().await[&id].paste_pending);
+        assert!(manager.arm_paste(&id).await);
+        assert!(manager.sessions.lock().await[&id].paste_pending);
     }
 }
