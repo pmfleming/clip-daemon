@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     env,
     fs::{self, File, OpenOptions},
     future::Future,
@@ -9,6 +10,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Command as StdCommand,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -22,6 +24,7 @@ use clipboard_history_client_sdk::{
 };
 use image::ImageReader;
 use rustix::net::SocketAddrUnix;
+use tokio::sync::{broadcast, oneshot};
 use url::Url;
 use uuid::Uuid;
 
@@ -68,6 +71,38 @@ impl OperationCompletion {
             message: message.into(),
             warning: Some(warning.into()),
         }
+    }
+
+    fn event(self, id: String, action: &str) -> OperationResult {
+        let mut event = OperationResult::with_id(id, action, "completed", &self.message);
+        event.warning = self.warning;
+        event
+    }
+}
+
+async fn complete_operation<F, Fut>(
+    id: String,
+    action: String,
+    ready: oneshot::Receiver<()>,
+    operations: Arc<Mutex<HashMap<String, OperationTask>>>,
+    events: broadcast::Sender<OperationResult>,
+    run: F,
+) where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = BackendResult<OperationCompletion>>,
+{
+    let result = if ready.await.is_ok() {
+        run(id.clone()).await
+    } else {
+        Err(operation_error("Clipboard operation could not start"))
+    };
+    let event = match result {
+        Ok(completion) => completion.event(id.clone(), &action),
+        Err(error) => OperationResult::with_id(id.clone(), &action, "failed", &error.to_string()),
+    };
+    let _ = events.send(event);
+    if let Ok(mut active) = operations.lock() {
+        active.remove(&id);
     }
 }
 
@@ -171,52 +206,26 @@ impl RingboardBackend {
         let mut operation = OperationResult::completed(action, message);
         operation.status = "started".into();
         let operation_id = operation.id.clone();
-        let cleanup_files = files.clone();
-        let operations = self.operations.clone();
-        let events = self.operation_events.clone();
-        let task_id = operation_id.clone();
-        let task_action = action.to_owned();
-        let (start, ready) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(async move {
-            let completed = if ready.await.is_ok() {
-                run(task_id.clone()).await
-            } else {
-                Err(operation_error("Clipboard operation could not start"))
-            };
-            let event = match completed {
-                Ok(completion) => {
-                    let mut operation = OperationResult::with_id(
-                        task_id.clone(),
-                        &task_action,
-                        "completed",
-                        &completion.message,
-                    );
-                    operation.warning = completion.warning;
-                    operation
-                }
-                Err(error) => OperationResult::with_id(
-                    task_id.clone(),
-                    &task_action,
-                    "failed",
-                    &error.to_string(),
-                ),
-            };
-            let _ = events.send(event);
-            if let Ok(mut active) = operations.lock() {
-                active.remove(&task_id);
+        let (start, ready) = oneshot::channel();
+        let handle = tokio::spawn(complete_operation(
+            operation_id.clone(),
+            action.to_owned(),
+            ready,
+            Arc::clone(&self.operations),
+            self.operation_events.clone(),
+            run,
+        ));
+        let mut active = match self.operations.lock() {
+            Ok(active) => active,
+            Err(_) => {
+                handle.abort();
+                remove_files(&files);
+                return Err(operation_error("Clipboard operation state is unavailable"));
             }
-        });
-        let mut active = self.operations.lock().map_err(|_| {
-            handle.abort();
-            remove_files(&cleanup_files);
-            operation_error("Clipboard operation state is unavailable")
-        })?;
+        };
         active.insert(operation_id, OperationTask { handle, files });
         drop(active);
-        start.send(()).map_err(|_| {
-            remove_files(&cleanup_files);
-            operation_error(start_error)
-        })?;
+        start.send(()).map_err(|_| operation_error(start_error))?;
         let _ = self.operation_events.send(operation.clone());
         Ok(operation)
     }
@@ -410,23 +419,16 @@ async fn run_annotation(
     } = staged;
     // Give the picker time to hide so the editor becomes focused when it maps.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let result = match run_editor(&editor, &input, &output).await {
+    match run_editor(&editor, &input, &output).await {
         Ok(()) if output.is_file() => {
-            let edited = output.clone();
             run_blocking(move || {
-                apply_annotation(&backend, &opaque_id, revision, &edited, max_bytes)
+                apply_annotation(&backend, &opaque_id, revision, &output, max_bytes)
             })
             .await
         }
         Ok(()) => Err(operation_error("Image edit was cancelled")),
         Err(error) => Err(error),
-    };
-    let cleanup = run_blocking(move || {
-        remove_files(&[input, output]);
-        Ok(())
-    })
-    .await;
-    result.and_then(|outcome| cleanup.map(|()| outcome))
+    }
 }
 
 struct EditorProcessGroup(Option<rustix::process::Pid>);

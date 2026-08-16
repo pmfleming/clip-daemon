@@ -261,16 +261,11 @@ const RINGBOARD: &str = "Ringboard settings";
 
 fn persist_config_pair(path: Option<&Path>, value: &ClipboardSettings) -> Result<(), String> {
     let (ringboard_path, ringboard_bytes) = encoded_ringboard_config(value)?;
-    let mut writes = vec![stage_config(
-        &ringboard_path,
-        &ringboard_bytes,
-        false,
-        RINGBOARD,
-    )?];
+    let mut writes = vec![stage_config(&ringboard_path, &ringboard_bytes, RINGBOARD)?];
     if let Some(path) = path {
         let bytes = serde_json::to_vec_pretty(value)
             .map_err(|_| "Clipboard settings could not be encoded")?;
-        writes.push(stage_config(path, &bytes, true, CLIPBOARD)?);
+        writes.push(stage_config(path, &bytes, CLIPBOARD)?);
     }
     commit_all(writes)
 }
@@ -281,7 +276,7 @@ fn persist(path: Option<&Path>, value: &ClipboardSettings) -> Result<(), String>
     };
     let bytes =
         serde_json::to_vec_pretty(value).map_err(|_| "Clipboard settings could not be encoded")?;
-    commit_all(vec![stage_config(path, &bytes, true, CLIPBOARD)?])
+    commit_all(vec![stage_config(path, &bytes, CLIPBOARD)?])
 }
 
 struct StagedWrite {
@@ -291,16 +286,11 @@ struct StagedWrite {
     label: &'static str,
 }
 
-fn stage_config(
-    path: &Path,
-    bytes: &[u8],
-    private_parent: bool,
-    label: &'static str,
-) -> Result<StagedWrite, String> {
+fn stage_config(path: &Path, bytes: &[u8], label: &'static str) -> Result<StagedWrite, String> {
     Ok(StagedWrite {
         path: path.to_owned(),
         previous: read_existing(path)?,
-        temp: stage_write(path, bytes, private_parent, label)?,
+        temp: stage_write(path, bytes, label)?,
         label,
     })
 }
@@ -329,30 +319,18 @@ impl Drop for StagedWrite {
     }
 }
 
-fn atomic_write(
-    path: &Path,
-    bytes: &[u8],
-    private_parent: bool,
-    label: &str,
-) -> Result<(), String> {
-    let temp = stage_write(path, bytes, private_parent, label)?;
+fn atomic_write(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
+    let temp = stage_write(path, bytes, label)?;
     commit_staged(path, &temp, label)
 }
 
-fn stage_write(
-    path: &Path,
-    bytes: &[u8],
-    private_parent: bool,
-    label: &str,
-) -> Result<PathBuf, String> {
+fn stage_write(path: &Path, bytes: &[u8], label: &str) -> Result<PathBuf, String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("{label} path is invalid"))?;
     fs::create_dir_all(parent).map_err(|_| format!("{label} directory is unavailable"))?;
-    if private_parent {
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .map_err(|_| format!("{label} directory permissions could not be set"))?;
-    }
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+        .map_err(|_| format!("{label} directory permissions could not be set"))?;
     let temp = parent.join(format!(".{}.tmp", Uuid::new_v4()));
     let mut file = OpenOptions::new()
         .create_new(true)
@@ -360,7 +338,11 @@ fn stage_write(
         .mode(0o600)
         .open(&temp)
         .map_err(|_| format!("{label} temporary file could not be created"))?;
-    if file.write_all(bytes).is_err() || file.sync_all().is_err() {
+    if file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .is_err()
+    {
         let _ = fs::remove_file(&temp);
         return Err(format!("{label} could not be written"));
     }
@@ -389,7 +371,7 @@ fn read_existing(path: &Path) -> Result<Option<Vec<u8>>, String> {
 
 fn restore_previous(path: &Path, bytes: Option<&[u8]>) -> Result<(), String> {
     match bytes {
-        Some(bytes) => atomic_write(path, bytes, false, "Ringboard settings rollback"),
+        Some(bytes) => atomic_write(path, bytes, "Ringboard settings rollback"),
         None => {
             match fs::remove_file(path) {
                 Ok(()) => {}
@@ -457,8 +439,8 @@ mod tests {
     fn atomic_write_replaces_the_complete_file() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("state/settings.json");
-        atomic_write(&path, b"old", true, "test settings").unwrap();
-        atomic_write(&path, b"new-value", true, "test settings").unwrap();
+        atomic_write(&path, b"old", "test settings").unwrap();
+        atomic_write(&path, b"new-value", "test settings").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"new-value");
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
     }

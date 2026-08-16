@@ -9,7 +9,7 @@ use std::{
 
 use tokio::{
     sync::broadcast,
-    task::{JoinError, JoinHandle, spawn_blocking},
+    task::{JoinHandle, spawn_blocking},
 };
 
 use async_trait::async_trait;
@@ -89,6 +89,12 @@ impl SummaryCache {
 struct OperationTask {
     handle: JoinHandle<()>,
     files: Vec<PathBuf>,
+}
+
+impl Drop for OperationTask {
+    fn drop(&mut self) {
+        mutation::remove_files(&self.files);
+    }
 }
 
 struct QueryCandidate {
@@ -738,18 +744,14 @@ impl ClipboardBackend for RingboardBackend {
             .lock()
             .map_err(|_| lock_error())?
             .remove(operation_id);
-        let Some(operation) = operation else {
+        let Some(mut operation) = operation else {
             return Ok(false);
         };
         let was_running = !operation.handle.is_finished();
         operation.handle.abort();
-        let _ = operation.handle.await;
+        let _ = (&mut operation.handle).await;
         let operation_id = operation_id.to_owned();
-        run_blocking(move || {
-            mutation::remove_files(&operation.files);
-            Ok(())
-        })
-        .await?;
+        drop(operation);
         if was_running {
             let _ = self.operation_events.send(OperationResult::with_id(
                 operation_id,
@@ -792,14 +794,9 @@ async fn run_blocking<T>(
 where
     T: Send + 'static,
 {
-    spawn_blocking(work).await.map_err(blocking_task_error)?
-}
-
-fn blocking_task_error(_: JoinError) -> BackendError {
-    BackendError::new(
-        BackendErrorKind::OperationFailed,
-        "Clipboard backend task failed",
-    )
+    spawn_blocking(work)
+        .await
+        .map_err(|_| operation_failed("Clipboard backend task failed"))?
 }
 
 fn stored_mime_type(loaded: &LoadedEntry<'_, File>) -> BackendResult<String> {
@@ -876,10 +873,11 @@ fn matches_query(summary: &EntrySummary, needle: &str) -> bool {
 }
 
 fn lock_error() -> BackendError {
-    BackendError::new(
-        BackendErrorKind::OperationFailed,
-        "Clipboard backend state is unavailable",
-    )
+    operation_failed("Clipboard backend state is unavailable")
+}
+
+fn operation_failed(message: &'static str) -> BackendError {
+    BackendError::new(BackendErrorKind::OperationFailed, message)
 }
 
 fn entry_fingerprint(raw_id: u64, size: u64, mime: &str, bytes: &[u8]) -> [u8; 32] {

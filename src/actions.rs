@@ -23,6 +23,7 @@ use crate::{
 const MAX_EDIT_BYTES: usize = 256 * 1024;
 const MAX_PUBLISHED_FILES: usize = 100;
 pub type Backend = Arc<dyn ClipboardBackend>;
+pub(crate) type OperationEvents = tokio::sync::broadcast::Receiver<OperationResult>;
 
 #[derive(Debug)]
 pub(crate) struct ApiError {
@@ -229,7 +230,7 @@ impl ClipboardService {
         Ok(json!({ "operation": operation }))
     }
 
-    pub(crate) fn operation_events(&self) -> tokio::sync::broadcast::Receiver<OperationResult> {
+    pub(crate) fn operation_events(&self) -> OperationEvents {
         self.backend.operation_events()
     }
 

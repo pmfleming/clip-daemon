@@ -48,9 +48,7 @@ impl ApiService {
             .map_err(|error| json!({ "error": { "code": error.code, "message": error.message } }))
     }
 
-    pub fn operation_events(
-        &self,
-    ) -> tokio::sync::broadcast::Receiver<crate::model::OperationResult> {
+    pub(crate) fn operation_events(&self) -> actions::OperationEvents {
         self.actions.operation_events()
     }
 
@@ -130,19 +128,28 @@ impl ApiService {
 
     async fn dispatch_policy(&self, method: &str, params: Value) -> Result<Value, ApiError> {
         match method {
+            "clipboard.capture.setPaused" | "clipboard.capture.screenshot" => {
+                self.dispatch_capture(method, params).await
+            }
+            "clipboard.settings.get" => self.get_settings(),
+            "clipboard.settings.update" => self.update_settings(decode(params)?).await,
+            "clipboard.selection.publishFiles" => {
+                self.actions
+                    .publish_files(decode(params)?, self.max_entry_bytes()?)
+                    .await
+            }
+            _ => Err(unknown_method(method)),
+        }
+    }
+
+    async fn dispatch_capture(&self, method: &str, params: Value) -> Result<Value, ApiError> {
+        match method {
             "clipboard.capture.setPaused" => self.set_paused(decode(params)?).await,
             "clipboard.capture.screenshot" => {
                 self.actions
                     .capture_screenshot(decode(params)?, self.max_entry_bytes()?)
                     .await
             }
-            "clipboard.selection.publishFiles" => {
-                self.actions
-                    .publish_files(decode(params)?, self.max_entry_bytes()?)
-                    .await
-            }
-            "clipboard.settings.get" => self.get_settings(),
-            "clipboard.settings.update" => self.update_settings(decode(params)?).await,
             _ => Err(unknown_method(method)),
         }
     }
