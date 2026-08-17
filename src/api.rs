@@ -23,6 +23,31 @@ pub(crate) struct LifecycleEvent {
     pub data: Value,
 }
 
+#[derive(Clone, Copy)]
+enum MethodRoute {
+    HistoryQuery,
+    EntryDetails,
+    EntryThumbnail,
+    Entry,
+    Session,
+    Wipe,
+    Policy,
+}
+
+impl MethodRoute {
+    fn for_method(method: &str) -> Self {
+        match method {
+            "clipboard.history.query" => Self::HistoryQuery,
+            "clipboard.entry.details" => Self::EntryDetails,
+            "clipboard.entry.thumbnail" => Self::EntryThumbnail,
+            value if value.starts_with("clipboard.entry.") => Self::Entry,
+            value if value.starts_with("clipboard.session.") => Self::Session,
+            value if value.starts_with("clipboard.history.wipe.") => Self::Wipe,
+            _ => Self::Policy,
+        }
+    }
+}
+
 pub struct ApiService {
     wipe_challenges: Mutex<HashMap<String, Instant>>,
     settings: SettingsManager,
@@ -92,30 +117,28 @@ impl ApiService {
     }
 
     async fn dispatch_method(&self, method: &str, params: Value) -> Result<Value, ApiError> {
-        match method {
-            "clipboard.history.query" => {
-                let collapse = self
-                    .settings
-                    .get()
-                    .map_err(settings_error)?
-                    .collapse_self_echoes;
-                self.actions.query(decode(params)?, collapse).await
-            }
-            "clipboard.entry.details" => self.actions.details(decode(params)?).await,
-            "clipboard.entry.thumbnail" => self.actions.thumbnail(decode(params)?).await,
-            value if value.starts_with("clipboard.entry.") => {
+        match MethodRoute::for_method(method) {
+            MethodRoute::HistoryQuery => self.query_history(params).await,
+            MethodRoute::EntryDetails => self.actions.details(decode(params)?).await,
+            MethodRoute::EntryThumbnail => self.actions.thumbnail(decode(params)?).await,
+            MethodRoute::Entry => {
                 self.actions
-                    .dispatch_entry(value, params, self.max_entry_bytes()?)
+                    .dispatch_entry(method, params, self.max_entry_bytes()?)
                     .await
             }
-            value if value.starts_with("clipboard.session.") => {
-                self.actions.dispatch_session(value, params).await
-            }
-            value if value.starts_with("clipboard.history.wipe.") => {
-                self.dispatch_wipe(value, params).await
-            }
-            _ => self.dispatch_policy(method, params).await,
+            MethodRoute::Session => self.actions.dispatch_session(method, params).await,
+            MethodRoute::Wipe => self.dispatch_wipe(method, params).await,
+            MethodRoute::Policy => self.dispatch_policy(method, params).await,
         }
+    }
+
+    async fn query_history(&self, params: Value) -> Result<Value, ApiError> {
+        let collapse = self
+            .settings
+            .get()
+            .map_err(settings_error)?
+            .collapse_self_echoes;
+        self.actions.query(decode(params)?, collapse).await
     }
 
     async fn dispatch_wipe(&self, method: &str, params: Value) -> Result<Value, ApiError> {
