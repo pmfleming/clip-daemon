@@ -298,19 +298,23 @@ fn stage_config(path: &Path, bytes: &[u8], label: &'static str) -> Result<Staged
 fn commit_all(writes: Vec<StagedWrite>) -> Result<(), String> {
     for write in &writes {
         if let Err(error) = commit_staged(&write.path, &write.temp, write.label) {
-            let failures: Vec<_> = writes
-                .iter()
-                .rev()
-                .filter_map(|write| restore_previous(&write.path, write.previous.as_deref()).err())
-                .collect();
-            return if failures.is_empty() {
-                Err(error)
-            } else {
-                Err(format!("{error}; rollback failed: {}", failures.join("; ")))
-            };
+            return Err(rollback_writes(&writes, error));
         }
     }
     Ok(())
+}
+
+fn rollback_writes(writes: &[StagedWrite], error: String) -> String {
+    let failures = writes
+        .iter()
+        .rev()
+        .filter_map(|write| restore_previous(&write.path, write.previous.as_deref()).err())
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        error
+    } else {
+        format!("{error}; rollback failed: {}", failures.join("; "))
+    }
 }
 
 impl Drop for StagedWrite {
