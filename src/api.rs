@@ -5,6 +5,7 @@ use std::{
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+use shelllist_daemon_core::{ApiError as EnvelopeError, ApiIdentity, error as error_envelope};
 use tokio::sync::{Mutex, broadcast};
 use uuid::Uuid;
 
@@ -16,6 +17,7 @@ use crate::{
 
 pub const PROTOCOL: &str = protocol::NAME;
 pub const VERSION: u8 = protocol::VERSION;
+const API: ApiIdentity = ApiIdentity::new(PROTOCOL, VERSION as u32);
 #[derive(Clone, Debug)]
 pub(crate) struct LifecycleEvent {
     pub stream: &'static str,
@@ -324,14 +326,14 @@ fn finish_request(method: &str, result: Result<Value, ApiError>) -> Value {
 }
 
 pub fn success(data: Value) -> Value {
-    json!({ "protocol": PROTOCOL, "version": VERSION, "ok": true, "data": data })
+    shelllist_daemon_core::success(API, data)
 }
 
 fn error_response(error: ApiError) -> Value {
-    json!({
-        "protocol": PROTOCOL, "version": VERSION, "ok": false,
-        "error": { "code": error.code, "message": error.message, "retryable": error.retryable }
-    })
+    error_envelope(
+        API,
+        EnvelopeError::new(error.code, error.message).with_retryable(error.retryable),
+    )
 }
 
 pub fn error(code: &str, message: String) -> Value {

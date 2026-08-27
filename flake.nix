@@ -15,7 +15,10 @@
             pname = "clip-daemon";
             version = "0.1.0";
             src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              outputHashes."shelllist-daemon-core-0.1.0" = "sha256-V2ytfB6faOsv4zf8jDyJs1jKRLmCWbyb/EHUT/0OfGs=";
+            };
             nativeBuildInputs = [ pkgs.makeWrapper pkgs.pkg-config ];
             buildInputs = [ pkgs.dbus ];
             strictDeps = true;

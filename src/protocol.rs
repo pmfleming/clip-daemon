@@ -44,13 +44,11 @@ pub fn registry() -> serde_json::Result<Value> {
 }
 
 pub fn contract_fixture() -> serde_json::Result<Value> {
-    serde_json::from_str(include_str!("../test_support/clip-api-v1.json"))
+    shelllist_daemon_core::load_fixture(include_str!("../test_support/clip-api-v1.json"))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use super::{METHODS, STREAMS, VERSION, Value, contract_fixture};
 
     #[test]
@@ -64,20 +62,10 @@ mod tests {
     }
 
     fn assert_unique(values: &[&str]) {
-        let mut names = HashSet::new();
-        assert!(values.iter().all(|value| names.insert(*value)));
+        shelllist_daemon_core::validate_unique_names(values).expect("unique protocol names");
     }
 
     fn fixture_names<'a>(fixture: &'a Value, section: &str) -> Vec<&'a str> {
-        fixture["registry"][section]
-            .as_array()
-            .expect("fixture registry section must be an array")
-            .iter()
-            .map(|item| {
-                item["name"]
-                    .as_str()
-                    .expect("fixture name must be a string")
-            })
-            .collect()
+        shelllist_daemon_core::fixture_names(fixture, section).expect("fixture registry")
     }
 }
