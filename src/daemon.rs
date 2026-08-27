@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic::AtomicU64};
 
 use anyhow::{Context, Result};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use shelllist_daemon_tokio::OwnedTaskRegistry;
 use zbus::{connection, message::Header, object_server::SignalEmitter};
 
@@ -96,19 +96,14 @@ async fn emit_event(
     subscription_id: &str,
     extra: Option<Value>,
 ) {
-    let mut envelope = Map::from_iter([
-        ("protocol".into(), json!(api::PROTOCOL)),
-        ("version".into(), json!(api::VERSION)),
-        ("stream".into(), json!(stream)),
-        ("event".into(), json!(event)),
-        ("subscription_id".into(), json!(subscription_id)),
-    ]);
-    if let Some(Value::Object(fields)) = extra {
-        envelope.extend(fields);
-    }
-    if let Err(error) =
-        ClipDaemon::event(emitter, stream, &Value::Object(envelope).to_string()).await
-    {
+    let envelope = shelllist_daemon_core::event_envelope(
+        shelllist_daemon_core::ApiIdentity::new(api::PROTOCOL, api::VERSION as u32),
+        stream,
+        event,
+        shelllist_daemon_core::Correlation::Subscription(subscription_id),
+        extra.unwrap_or(Value::Null),
+    );
+    if let Err(error) = ClipDaemon::event(emitter, stream, &envelope.to_string()).await {
         tracing::warn!(%stream, %error, "clipboard subscription event could not be emitted");
     }
 }
