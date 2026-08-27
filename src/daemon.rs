@@ -1,21 +1,8 @@
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::sync::{Arc, atomic::AtomicU64};
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
-use tokio::{
-    signal::{
-        ctrl_c,
-        unix::{SignalKind, signal},
-    },
-    sync::Mutex,
-    task::JoinHandle,
-};
+use shelllist_daemon_tokio::OwnedTaskRegistry;
 use zbus::{connection, message::Header, object_server::SignalEmitter};
 
 use crate::{
@@ -31,14 +18,13 @@ pub const INTERFACE: &str = "org.laufan.ClipDaemon1";
 
 pub struct ClipDaemon {
     api: Arc<ApiService>,
-    sequence: AtomicU64,
     history_events: tokio::sync::broadcast::Sender<subscription::HistoryUpdate>,
-    subscriptions: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    subscriptions: Arc<OwnedTaskRegistry>,
 }
 
 impl ClipDaemon {
     fn next_id(&self, prefix: &str) -> String {
-        format!("{prefix}-{}", self.sequence.fetch_add(1, Ordering::Relaxed))
+        self.subscriptions.next_id(prefix)
     }
 }
 
@@ -76,9 +62,13 @@ impl ClipDaemon {
         self.api.publish_selection(mime, bytes).await.to_string()
     }
 
-    async fn cancel(&self, request_id: &str) -> String {
-        if let Some(task) = self.subscriptions.lock().await.remove(request_id) {
-            task.abort();
+    async fn cancel(&self, request_id: &str, #[zbus(header)] header: Header<'_>) -> String {
+        let owner = header.sender().map(ToString::to_string);
+        if self
+            .subscriptions
+            .cancel_owned(request_id, owner.as_deref())
+            .await
+        {
             tracing::debug!(subscription_id = %request_id, "clipboard subscription cancelled");
             return api::success(json!({ "cancelled": request_id, "kind": "subscription" }))
                 .to_string();
@@ -134,9 +124,8 @@ pub async fn run(backend: Arc<dyn ClipboardBackend>) -> Result<()> {
     ));
     let daemon = ClipDaemon {
         api,
-        sequence: AtomicU64::new(1),
         history_events,
-        subscriptions: Arc::new(Mutex::new(HashMap::new())),
+        subscriptions: Arc::new(OwnedTaskRegistry::default()),
     };
     let _connection = connection::Builder::session()
         .context("connect to session D-Bus")?
@@ -152,14 +141,5 @@ pub async fn run(backend: Arc<dyn ClipboardBackend>) -> Result<()> {
         object_path = OBJECT_PATH,
         "clip-daemon started"
     );
-    wait_for_shutdown().await
-}
-
-async fn wait_for_shutdown() -> Result<()> {
-    let mut terminate =
-        signal(SignalKind::terminate()).context("listen for SIGTERM shutdown signal")?;
-    tokio::select! {
-        result = ctrl_c() => result.context("wait for Ctrl-C shutdown signal"),
-        _ = terminate.recv() => Ok(()),
-    }
+    shelllist_daemon_tokio::wait_for_shutdown().await
 }

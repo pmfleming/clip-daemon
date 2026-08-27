@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -7,11 +6,9 @@ use std::{
     time::Duration,
 };
 
-use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Mutex, broadcast::error::RecvError},
-    task::JoinHandle,
+    sync::{broadcast::error::RecvError, oneshot},
     time::MissedTickBehavior,
 };
 use zbus::{names::UniqueName, object_server::SignalEmitter};
@@ -20,7 +17,7 @@ use crate::{api, api::ApiService, protocol};
 
 use super::{ClipDaemon, emit_event};
 
-type Subscriptions = Arc<Mutex<HashMap<String, JoinHandle<()>>>>;
+type Subscriptions = Arc<shelllist_daemon_tokio::OwnedTaskRegistry>;
 
 const HISTORY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -119,9 +116,9 @@ impl SubscriptionTask {
             () = await_optional(history) => {}
             () = await_optional(operations) => {}
             () = await_optional(lifecycle) => {}
-            () = wait_for_owner_loss(connection, self.owner) => {}
+            _ = shelllist_daemon_tokio::wait_for_owner_loss(&connection, self.owner) => {}
         }
-        self.subscriptions.lock().await.remove(&self.id);
+        self.subscriptions.remove(&self.id).await;
         tracing::debug!(subscription_id = %self.id, "clipboard subscription ended");
     }
 }
@@ -173,22 +170,34 @@ pub(super) async fn start(
     };
     let id = daemon.next_id("subscription");
     let destination = emitter.set_destination(owner.clone().into()).to_owned();
-    let mut active = daemon.subscriptions.lock().await;
-    let task = tokio::spawn(
-        SubscriptionTask {
-            destination,
-            api_service: Arc::clone(&daemon.api),
-            subscriptions: Arc::clone(&daemon.subscriptions),
-            history_events: daemon.history_events.clone(),
-            id: id.clone(),
-            streams: streams.clone(),
-            owner,
-            requested,
+    let task_owner = owner.clone();
+    let task_id = id.clone();
+    let task_streams = streams.clone();
+    let api_service = Arc::clone(&daemon.api);
+    let subscriptions = Arc::clone(&daemon.subscriptions);
+    let history_events = daemon.history_events.clone();
+    let (start, ready) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        if ready.await.is_ok() {
+            SubscriptionTask {
+                destination,
+                api_service,
+                subscriptions,
+                history_events,
+                id: task_id,
+                streams: task_streams,
+                owner,
+                requested,
+            }
+            .run()
+            .await;
         }
-        .run(),
-    );
-    active.insert(id.clone(), task);
-    drop(active);
+    });
+    daemon
+        .subscriptions
+        .insert(id.clone(), Some(task_owner.to_string()), task)
+        .await;
+    let _ = start.send(());
     tracing::debug!(subscription_id = %id, "clipboard subscription started");
     api::success(json!({ "subscription": { "id": id, "streams": streams } })).to_string()
 }
@@ -372,32 +381,6 @@ async fn emit_requested(
     ] {
         if enabled {
             emit_event(emitter, stream, event, subscription_id, Some(data.clone())).await;
-        }
-    }
-}
-
-async fn wait_for_owner_loss(connection: zbus::Connection, owner: UniqueName<'static>) {
-    let Ok(proxy) = zbus::Proxy::new(
-        &connection,
-        "org.freedesktop.DBus",
-        "/org/freedesktop/DBus",
-        "org.freedesktop.DBus",
-    )
-    .await
-    else {
-        return;
-    };
-    let Ok(mut changes) = proxy.receive_signal("NameOwnerChanged").await else {
-        return;
-    };
-    while let Some(message) = changes.next().await {
-        let Ok((name, old_owner, new_owner)) =
-            message.body().deserialize::<(String, String, String)>()
-        else {
-            continue;
-        };
-        if name == owner.as_str() && !old_owner.is_empty() && new_owner.is_empty() {
-            break;
         }
     }
 }

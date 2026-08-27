@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 use shelllist_daemon_core::DaemonEndpoint;
-use shelllist_daemon_tokio::{BasicCorrelation, CancelMode, JsonlClientConfig, run_jsonl_client};
+use shelllist_daemon_tokio::{
+    BasicCorrelation, CallFailure, CancelMode, JsonlClientConfig, run_jsonl_client,
+};
 
 use crate::{
     api,
@@ -11,11 +13,11 @@ use crate::{
 const ENDPOINT: DaemonEndpoint =
     DaemonEndpoint::new("clip-daemon", BUS_NAME, OBJECT_PATH, INTERFACE);
 
-fn call_failure(_method: &str, _error: &anyhow::Error) -> Value {
-    api::error(
+fn call_failure(_method: &str, _error: &anyhow::Error) -> CallFailure {
+    CallFailure::Api(api::error(
         "daemon-unavailable",
         "clip-daemon session service is unavailable".into(),
-    )
+    ))
 }
 
 pub async fn publish(mime: &str, bytes: Vec<u8>) -> Result<()> {
