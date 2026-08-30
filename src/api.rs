@@ -55,6 +55,7 @@ pub struct ApiService {
     settings: SettingsManager,
     actions: ClipboardService,
     lifecycle_events: broadcast::Sender<LifecycleEvent>,
+    operation_owners: Mutex<HashMap<String, Option<String>>>,
 }
 
 impl ApiService {
@@ -65,6 +66,7 @@ impl ApiService {
             settings: SettingsManager::default(),
             actions: ClipboardService::new(backend),
             lifecycle_events,
+            operation_owners: Mutex::new(HashMap::new()),
         }
     }
 
@@ -84,7 +86,21 @@ impl ApiService {
     }
 
     pub async fn cancel_operation(&self, operation_id: &str) -> bool {
-        self.actions.cancel(operation_id).await
+        self.cancel_operation_owned(operation_id, None).await
+    }
+
+    pub async fn cancel_operation_owned(&self, operation_id: &str, owner: Option<&str>) -> bool {
+        let mut owners = self.operation_owners.lock().await;
+        if owners.get(operation_id).and_then(Option::as_deref) != owner {
+            return false;
+        }
+        if self.actions.cancel(operation_id).await {
+            owners.remove(operation_id);
+            true
+        } else {
+            owners.remove(operation_id);
+            false
+        }
     }
 
     pub async fn publish_selection(&self, mime: &str, bytes: Vec<u8>) -> Value {
@@ -101,10 +117,22 @@ impl ApiService {
     }
 
     pub async fn dispatch(&self, method: &str, params: Value) -> Value {
+        self.dispatch_owned(method, params, None).await
+    }
+
+    pub async fn dispatch_owned(
+        &self,
+        method: &str,
+        params: Value,
+        owner: Option<String>,
+    ) -> Value {
         tracing::debug!(%method, "clip-api request started");
         let result = self.dispatch_method(method, params).await;
         if let Ok(data) = &result {
             self.publish_lifecycle(method, data);
+            if let Some(id) = started_operation_id(data) {
+                self.operation_owners.lock().await.insert(id.into(), owner);
+            }
         }
         finish_request(method, result)
     }
@@ -248,6 +276,12 @@ struct PauseParams {
     paused: bool,
     #[serde(default)]
     private_mode: bool,
+}
+
+fn started_operation_id(data: &Value) -> Option<&str> {
+    (data.pointer("/operation/status").and_then(Value::as_str) == Some("started"))
+        .then(|| data.pointer("/operation/id").and_then(Value::as_str))
+        .flatten()
 }
 
 fn operation_event(data: &Value) -> Option<LifecycleEvent> {
