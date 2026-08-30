@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    io::{Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom},
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
@@ -324,10 +324,10 @@ impl RingboardBackend {
             .metadata()
             .map_err(|_| invalid_entry("Could not read clipboard entry metadata"))?;
         let byte_size = metadata.len();
-        let bytes = read_bounded(&mut loaded, INSPECTION_LIMIT)?;
         let stored_mime = stored_mime_type(&loaded)?;
+        let (bytes, content_digest) = inspect_entry(&mut *loaded, byte_size)?;
         let content = ResolvedContent::resolve(&stored_mime, &bytes, MAX_WAYLAND_SELECTION_BYTES);
-        let fingerprint = entry_fingerprint(entry.id(), byte_size, content.mime(), &bytes);
+        let fingerprint = entry_fingerprint(entry.id(), byte_size, content.mime(), &content_digest);
         let id = opaque_id(&fingerprint);
         let (artifact, inline_echo_source) = {
             let registry = self.artifacts.lock().map_err(|_| lock_error())?;
@@ -880,13 +880,44 @@ fn operation_failed(message: &'static str) -> BackendError {
     BackendError::new(BackendErrorKind::OperationFailed, message)
 }
 
-fn entry_fingerprint(raw_id: u64, size: u64, mime: &str, bytes: &[u8]) -> [u8; 32] {
+fn inspect_entry(source: &mut impl Read, expected_size: u64) -> BackendResult<(Vec<u8>, [u8; 32])> {
+    let preview_capacity = usize::try_from(expected_size)
+        .unwrap_or(usize::MAX)
+        .min(INSPECTION_LIMIT);
+    let mut preview = Vec::with_capacity(preview_capacity);
     let mut hasher = Sha256::new();
-    hasher.update(b"clip-daemon:entry-fingerprint:v3:");
+    hasher.update(b"clip-daemon:entry-content:v1:");
+    let mut actual_size = 0_u64;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|_| invalid_entry("Could not read clipboard entry"))?;
+        if read == 0 {
+            break;
+        }
+        actual_size = actual_size
+            .checked_add(read as u64)
+            .ok_or_else(|| invalid_entry("Clipboard entry size is invalid"))?;
+        hasher.update(&buffer[..read]);
+        let retained = (INSPECTION_LIMIT - preview.len()).min(read);
+        preview.extend_from_slice(&buffer[..retained]);
+    }
+    if actual_size != expected_size {
+        return Err(BackendError::stale(
+            "Clipboard entry changed while its identity was calculated",
+        ));
+    }
+    Ok((preview, hasher.finalize().into()))
+}
+
+fn entry_fingerprint(raw_id: u64, size: u64, mime: &str, content_digest: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"clip-daemon:entry-fingerprint:v4:");
     hasher.update(raw_id.to_le_bytes());
     hasher.update(size.to_le_bytes());
     hasher.update(mime.as_bytes());
-    hasher.update(bytes);
+    hasher.update(content_digest);
     hasher.finalize().into()
 }
 
@@ -906,7 +937,7 @@ fn entry_revision(fingerprint: &[u8; 32]) -> u64 {
 mod tests {
     use super::{
         MAX_SAFE_JSON_INTEGER, QueryAccumulator, QueryCandidate, ResolvedEntry, SummaryCache,
-        entry_fingerprint, entry_revision, history_token_from_parts, opaque_id,
+        entry_fingerprint, entry_revision, history_token_from_parts, inspect_entry, opaque_id,
     };
     use crate::model::{EntryKind, EntrySummary};
 
@@ -980,12 +1011,18 @@ mod tests {
         }
     }
 
+    fn fingerprint(raw_id: u64, mime: &str, bytes: &[u8]) -> [u8; 32] {
+        let (_, digest) = inspect_entry(&mut std::io::Cursor::new(bytes), bytes.len() as u64)
+            .expect("fingerprint fixture");
+        entry_fingerprint(raw_id, bytes.len() as u64, mime, &digest)
+    }
+
     #[test]
     fn engine_ids_are_not_exposed_and_revisions_are_stable() {
-        let stable = entry_fingerprint(42, 3, "text/plain", b"abc");
-        assert_eq!(stable, entry_fingerprint(42, 3, "text/plain", b"abc"));
-        assert_ne!(stable, entry_fingerprint(43, 3, "text/plain", b"abc"));
-        assert_ne!(stable, entry_fingerprint(42, 3, "text/plain", b"xyz"));
+        let stable = fingerprint(42, "text/plain", b"abc");
+        assert_eq!(stable, fingerprint(42, "text/plain", b"abc"));
+        assert_ne!(stable, fingerprint(43, "text/plain", b"abc"));
+        assert_ne!(stable, fingerprint(42, "text/plain", b"xyz"));
 
         let first = [0x2a; 32];
         let second = [0x2b; 32];
@@ -995,5 +1032,18 @@ mod tests {
         assert_eq!(entry_revision(&first), entry_revision(&first));
         assert_ne!(entry_revision(&first), entry_revision(&second));
         assert!(entry_revision(&[u8::MAX; 32]) <= MAX_SAFE_JSON_INTEGER);
+    }
+
+    #[test]
+    fn entry_identity_hashes_content_beyond_the_preview() {
+        let mut first = vec![b'a'; crate::classification::INSPECTION_LIMIT + 1];
+        let mut second = first.clone();
+        first[crate::classification::INSPECTION_LIMIT] = b'x';
+        second[crate::classification::INSPECTION_LIMIT] = b'y';
+
+        assert_ne!(
+            fingerprint(42, "text/plain", &first),
+            fingerprint(42, "text/plain", &second)
+        );
     }
 }
