@@ -100,10 +100,18 @@ async fn complete_operation<F, Fut>(
         Ok(completion) => completion.event(id.clone(), &action),
         Err(error) => OperationResult::with_id(id.clone(), &action, "failed", &error.to_string()),
     };
-    let _ = events.send(event);
-    if let Ok(mut active) = operations.lock() {
-        active.remove(&id);
+    if claim_terminal_event(&operations, &id) {
+        let _ = events.send(event);
     }
+}
+
+fn claim_terminal_event(
+    operations: &Mutex<HashMap<String, OperationTask>>,
+    operation_id: &str,
+) -> bool {
+    operations
+        .lock()
+        .is_ok_and(|mut active| active.remove(operation_id).is_some())
 }
 
 impl RingboardBackend {
@@ -753,7 +761,10 @@ mod tests {
 
     use crate::editor::ImageEditorCommand;
 
-    use super::{command_status_with_timeout, remove_files, run_editor, valid_edited_image};
+    use super::{
+        OperationTask, claim_terminal_event, command_status_with_timeout, remove_files, run_editor,
+        valid_edited_image,
+    };
 
     #[test]
     fn operation_cleanup_only_removes_its_own_files() {
@@ -770,6 +781,20 @@ mod tests {
         assert!(!first.exists());
         assert!(!second.exists());
         assert!(unrelated.exists());
+    }
+
+    #[tokio::test]
+    async fn only_one_terminal_path_can_claim_an_operation() {
+        let operations = std::sync::Mutex::new(std::collections::HashMap::from([(
+            "operation-1".to_owned(),
+            OperationTask {
+                handle: tokio::spawn(async {}),
+                files: Vec::new(),
+            },
+        )]));
+
+        assert!(claim_terminal_event(&operations, "operation-1"));
+        assert!(!claim_terminal_event(&operations, "operation-1"));
     }
 
     #[test]
