@@ -20,8 +20,8 @@ image = { version = "0.25", default-features = false, features = ["gif", "jpeg",
 rustix = { version = "1", features = ["fs", "net"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-shelllist-daemon-core = { git = "https://github.com/pmfleming/daemon-framework.git", rev = "8a66b2430cfca5db971fecbd06bb5c89a67b4bd5" }
-shelllist-daemon-tokio = { git = "https://github.com/pmfleming/daemon-framework.git", rev = "8a66b2430cfca5db971fecbd06bb5c89a67b4bd5" }
+shelllist-daemon-core = { git = "https://github.com/pmfleming/daemon-framework.git", rev = "b39f5c53941cda8464d30dada6da153de9dc13a7" }
+shelllist-daemon-tokio = { git = "https://github.com/pmfleming/daemon-framework.git", rev = "b39f5c53941cda8464d30dada6da153de9dc13a7" }
 sha2 = "0.10"
 toml = "0.9"
 tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
