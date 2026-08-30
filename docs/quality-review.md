@@ -136,3 +136,26 @@ The follow-up refactored lifecycle/subscription dispatch, JSONL request processi
 | physical Rust source lines | 6,817 | 6,815 |
 
 Escape hatches remain at zero. Production reliability findings fell from one checked-fixture panic path to zero, direct `.clone()` calls fell from 75 to 72, and `.cloned()` calls fell from three to one. All 43 tests pass; coverage reports 48.69% of lines, 47.80% of functions, and 47.76% of regions, with 51.02% changed-line coverage.
+
+## Shared-client and hotspot follow-up
+
+The follow-up after `0937549` retained unbounded JSONL call draining while reusing the shared output actor and D-Bus transport, bounded concurrent requests, separated query collection from projection installation, and isolated cache cleanup, wipe, and local-image inspection policy.
+
+| Signal | Before | After |
+|---|---:|---:|
+| maximum function hotspot | 39.59 | 36.96 |
+| maximum module hotspot | 40.55 | 37.88 |
+| aggregate function effort | 3,502.21 | 3,441.03 |
+| aggregate cyclomatic complexity | 1,227 | 1,225 |
+| aggregate cognitive complexity | 304 | 299 |
+| functions scoring at least 35 | 8 | 2 |
+| JSONL client module | 40.55 | 30.03 |
+| Ringboard mutation module | 39.54 | 33.87 |
+| Ringboard content module | 36.62 | 30.65 |
+| client leverage | 64.5 | 67.5 |
+| average leverage | 67.225 | 67.250 |
+| production `.clone()` calls | 71 | 69 |
+| measured nonblank Rust lines | 6,243 | 6,233 |
+| physical Rust lines | 7,151 | 7,148 |
+
+Locality remains at the maximum 100 for every module, escape-hatch count remains zero, and the three remaining clone findings are low-risk token windows with a maximum score of 10. All 45 unit and integration tests pass with no failed or unknown results.

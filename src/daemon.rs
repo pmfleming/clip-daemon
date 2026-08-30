@@ -16,6 +16,13 @@ pub const BUS_NAME: &str = "org.laufan.ClipDaemon";
 pub const OBJECT_PATH: &str = "/org/laufan/ClipDaemon";
 pub const INTERFACE: &str = "org.laufan.ClipDaemon1";
 
+pub(crate) fn unavailable_response() -> Value {
+    api::error(
+        "daemon-unavailable",
+        "clip-daemon session service is unavailable".into(),
+    )
+}
+
 pub struct ClipDaemon {
     api: Arc<ApiService>,
     history_events: tokio::sync::broadcast::Sender<subscription::HistoryUpdate>,

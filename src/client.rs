@@ -1,31 +1,33 @@
-use std::sync::Arc;
-
-use anyhow::{Context, Result};
-use futures::StreamExt;
-use serde_json::{Value, json};
-use shelllist_daemon_core::ClientRequest as Request;
+use anyhow::{Context, Result, anyhow};
+use serde_json::Value;
+use shelllist_daemon_core::{ClientRequest, DaemonEndpoint};
+use shelllist_daemon_tokio::{
+    BasicCorrelation, JsonDbusClient, OutputCommand, OutputHandle, spawn_output_actor,
+};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    sync::Mutex,
-    task::JoinSet,
+    io::{AsyncBufReadExt, BufReader},
+    task::{JoinHandle, JoinSet},
 };
 
-use crate::{
-    api,
-    daemon::{BUS_NAME, INTERFACE, OBJECT_PATH},
-};
+use crate::daemon::{self, BUS_NAME, INTERFACE, OBJECT_PATH};
 
-type Output = Arc<Mutex<tokio::io::Stdout>>;
+const ENDPOINT: DaemonEndpoint =
+    DaemonEndpoint::new("clip-daemon", BUS_NAME, OBJECT_PATH, INTERFACE);
+const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 
 pub async fn publish(mime: &str, bytes: Vec<u8>) -> Result<()> {
-    let connection = Some(
-        zbus::Connection::session()
-            .await
-            .context("connect to session D-Bus")?,
-    );
-    let response = transport_call(&connection, "Publish", &(mime, bytes))
+    let connection = zbus::Connection::session()
+        .await
+        .context("connect to session D-Bus")?;
+    let proxy = zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE)
+        .await
+        .context("create clip-daemon proxy")?;
+    let response: String = proxy
+        .call("Publish", &(mime, bytes))
         .await
         .context("publish clipboard content")?;
+    let response: Value =
+        serde_json::from_str(&response).context("decode clipboard publish response")?;
     match response.get("ok").and_then(Value::as_bool) {
         Some(true) => Ok(()),
         _ => anyhow::bail!(
@@ -39,201 +41,150 @@ pub async fn publish(mime: &str, bytes: Vec<u8>) -> Result<()> {
 }
 
 pub async fn run() -> Result<()> {
-    let connection = zbus::Connection::session().await.ok();
-    let output = Arc::new(Mutex::new(tokio::io::stdout()));
-    if let Some(connection) = connection.clone() {
-        spawn_events(connection, Arc::clone(&output));
-    }
-    request_loop(connection, output).await
-}
-
-async fn request_loop(connection: Option<zbus::Connection>, output: Output) -> Result<()> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let dbus = JsonDbusClient::session(ENDPOINT).await.ok();
+    let (output, output_task) = spawn_output_actor(BasicCorrelation, 64, 32);
+    let watchers = dbus.as_ref().map(|client| {
+        [
+            spawn_event_forwarder(client.clone(), output.clone()),
+            spawn_owner_watcher(client.clone(), output.clone()),
+        ]
+    });
     let mut calls = JoinSet::new();
-    let shutdown_id = loop {
-        let Some(line) = lines.next_line().await.context("read client request")? else {
-            break None;
-        };
-        if let Some(id) = process_line(&line, &connection, &output, &mut calls).await? {
-            break Some(id);
-        }
-    };
-    drain_calls(&mut calls).await?;
-    match shutdown_id {
-        Some(id) => {
-            emit(
-                &output,
-                &json!({"kind":"response","id":id,"ok":true,"response":{"shutdown":true}}),
-            )
-            .await
-        }
-        None => Ok(()),
+    let shutdown_id = request_loop(dbus.as_ref(), &output, &mut calls).await?;
+    drain_calls(&mut calls).await;
+    cancel_active(dbus.as_ref(), &output).await;
+    watchers.iter().flatten().for_each(JoinHandle::abort);
+    if let Some(id) = shutdown_id {
+        output.send(OutputCommand::Shutdown(id)).await?;
     }
+    drop(output);
+    output_task
+        .await
+        .context("join JSONL output task")?
+        .context("run JSONL output task")
 }
 
-async fn process_line(
-    line: &str,
-    connection: &Option<zbus::Connection>,
-    output: &Output,
-    calls: &mut JoinSet<Result<()>>,
+async fn request_loop(
+    dbus: Option<&JsonDbusClient>,
+    output: &OutputHandle,
+    calls: &mut JoinSet<()>,
 ) -> Result<Option<String>> {
-    reap_finished_calls(calls)?;
-    match decode_request(line, output).await? {
-        Some(request) => handle_request(request, connection, output, calls).await,
-        None => Ok(None),
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    while let Some(line) = lines.next_line().await.context("read JSONL request")? {
+        let Some(request) = decode_request(&line, output).await? else {
+            continue;
+        };
+        if let ClientRequest::Shutdown { id } = request {
+            return Ok(Some(id));
+        }
+        wait_for_request_slot(calls).await;
+        calls.spawn(run_request(dbus.cloned(), output.clone(), request));
+        reap_finished(calls);
     }
+    Ok(None)
 }
 
-async fn decode_request(line: &str, output: &Output) -> Result<Option<Request>> {
+async fn decode_request(line: &str, output: &OutputHandle) -> Result<Option<ClientRequest>> {
     if line.trim().is_empty() {
         return Ok(None);
     }
     match serde_json::from_str(line) {
         Ok(request) => Ok(Some(request)),
         Err(error) => {
-            emit(
-                output,
-                &json!({"kind":"protocol-error","error":error.to_string()}),
-            )
-            .await?;
+            output
+                .send(OutputCommand::ProtocolError(error.to_string()))
+                .await?;
             Ok(None)
         }
     }
 }
 
-async fn handle_request(
-    request: Request,
-    connection: &Option<zbus::Connection>,
-    output: &Output,
-    calls: &mut JoinSet<Result<()>>,
-) -> Result<Option<String>> {
-    match request {
-        Request::Call { id, method, params } => {
-            calls.spawn(run_call(
-                connection.clone(),
-                Arc::clone(output),
-                id,
-                method,
-                params,
-            ));
+async fn run_request(dbus: Option<JsonDbusClient>, output: OutputHandle, request: ClientRequest) {
+    let (id, result, cancelled_request_id) = match request {
+        ClientRequest::Call { id, method, params } => {
+            let response = call(dbus.as_ref(), &method, params).await;
+            (id, Ok(response), None)
         }
-        Request::Subscribe { id, streams } => {
-            let response = transport_call(connection, "Subscribe", &(streams,)).await;
-            emit_transport(output, &id, response).await?;
+        ClientRequest::Subscribe { id, streams } => (
+            id,
+            transport(dbus.as_ref(), Transport::Subscribe(streams)).await,
+            None,
+        ),
+        ClientRequest::Cancel { id, request_id } => {
+            let result = transport(dbus.as_ref(), Transport::Cancel(&request_id)).await;
+            let cancelled = result.as_ref().ok().map(|_| request_id);
+            (id, result, cancelled)
         }
-        Request::Cancel { id, request_id } => {
-            let response = transport_call(connection, "Cancel", &(request_id.as_str(),)).await;
-            emit_transport(output, &id, response).await?;
-        }
-        Request::Shutdown { id } => return Ok(Some(id)),
-    }
-    Ok(None)
-}
-
-async fn run_call(
-    connection: Option<zbus::Connection>,
-    output: Output,
-    id: String,
-    method: String,
-    params: Value,
-) -> Result<()> {
-    let response = call(&connection, &method, params)
-        .await
-        .unwrap_or_else(|_| {
-            api::error(
-                "daemon-unavailable",
-                "clip-daemon session service is unavailable".into(),
-            )
-        });
-    emit(
-        &output,
-        &json!({"kind":"response","id":id,"ok":true,"response":response}),
-    )
-    .await
-}
-
-fn reap_finished_calls(calls: &mut JoinSet<Result<()>>) -> Result<()> {
-    while let Some(result) = calls.try_join_next() {
-        result.context("client call task failed")??;
-    }
-    Ok(())
-}
-
-async fn drain_calls(calls: &mut JoinSet<Result<()>>) -> Result<()> {
-    while let Some(result) = calls.join_next().await {
-        result.context("client call task failed")??;
-    }
-    Ok(())
-}
-
-async fn proxy(connection: &Option<zbus::Connection>) -> Result<zbus::Proxy<'_>> {
-    let connection = connection.as_ref().context("session D-Bus unavailable")?;
-    zbus::Proxy::new(connection, BUS_NAME, OBJECT_PATH, INTERFACE)
-        .await
-        .context("create clip-daemon proxy")
-}
-
-async fn call(connection: &Option<zbus::Connection>, method: &str, params: Value) -> Result<Value> {
-    let proxy = proxy(connection).await?;
-    let response: String = proxy
-        .call("Call", &(method, params.to_string().as_str()))
-        .await?;
-    serde_json::from_str(&response).context("decode daemon response")
-}
-
-async fn transport_call<B>(
-    connection: &Option<zbus::Connection>,
-    method: &str,
-    body: &B,
-) -> Result<Value>
-where
-    B: serde::ser::Serialize + zbus::zvariant::DynamicType + Sync,
-{
-    let proxy = proxy(connection).await?;
-    let response: String = proxy.call(method, body).await?;
-    serde_json::from_str(&response).context("decode transport response")
-}
-
-fn spawn_events(connection: zbus::Connection, output: Output) {
-    tokio::spawn(async move {
-        let Ok(proxy) = zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE).await
-        else {
-            return;
-        };
-        let Ok(mut signals) = proxy.receive_signal("Event").await else {
-            return;
-        };
-        while let Some(message) = signals.next().await {
-            let Ok((stream, event_json)) = message.body().deserialize::<(String, String)>() else {
-                continue;
-            };
-            let event = serde_json::from_str::<Value>(&event_json)
-                .unwrap_or_else(|_| json!({"raw":event_json}));
-            if emit(
-                &output,
-                &json!({"kind":"event","stream":stream,"event":event}),
-            )
-            .await
-            .is_err()
-            {
-                break;
-            }
-        }
-    });
-}
-
-async fn emit_transport(output: &Output, id: &str, result: Result<Value>) -> Result<()> {
-    let value = match result {
-        Ok(response) => json!({"kind":"response","id":id,"ok":true,"response":response}),
-        Err(error) => json!({"kind":"response","id":id,"ok":false,"error":error.to_string()}),
+        ClientRequest::Shutdown { .. } => return,
     };
-    emit(output, &value).await
+    let _ = output
+        .send(OutputCommand::Response {
+            id,
+            result,
+            cancelled_request_id,
+        })
+        .await;
 }
 
-async fn emit(output: &Output, value: &Value) -> Result<()> {
-    let mut output = output.lock().await;
-    let mut bytes = serde_json::to_vec(value)?;
-    bytes.push(b'\n');
-    output.write_all(&bytes).await?;
-    output.flush().await.context("flush client output")
+async fn call(dbus: Option<&JsonDbusClient>, method: &str, params: Value) -> Value {
+    let result = match dbus {
+        Some(client) => client.call(method, params).await,
+        None => Err(anyhow!("session D-Bus unavailable")),
+    };
+    result.unwrap_or_else(|_| daemon::unavailable_response())
+}
+
+enum Transport<'a> {
+    Subscribe(Vec<String>),
+    Cancel(&'a str),
+}
+
+async fn transport(dbus: Option<&JsonDbusClient>, request: Transport<'_>) -> Result<Value, String> {
+    match (dbus, request) {
+        (Some(client), Transport::Subscribe(streams)) => client.subscribe(streams).await,
+        (Some(client), Transport::Cancel(id)) => client.cancel_json(id).await,
+        (None, _) => Err(anyhow!("session D-Bus unavailable")),
+    }
+    .map_err(|error| error.to_string())
+}
+
+fn spawn_event_forwarder(dbus: JsonDbusClient, output: OutputHandle) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(error) = dbus.forward_events(&output).await {
+            let _ = output
+                .send(OutputCommand::TransportError(error.to_string()))
+                .await;
+        }
+    })
+}
+
+fn spawn_owner_watcher(dbus: JsonDbusClient, output: OutputHandle) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let message = match dbus.watch_replacement().await {
+            Ok(()) => "clip-daemon restarted; reconnecting".to_owned(),
+            Err(error) => error.to_string(),
+        };
+        let _ = output.send(OutputCommand::TransportError(message)).await;
+    })
+}
+
+async fn wait_for_request_slot(calls: &mut JoinSet<()>) {
+    while calls.len() >= MAX_IN_FLIGHT_REQUESTS {
+        let _ = calls.join_next().await;
+    }
+}
+
+fn reap_finished(calls: &mut JoinSet<()>) {
+    while calls.try_join_next().is_some() {}
+}
+
+async fn drain_calls(calls: &mut JoinSet<()>) {
+    while calls.join_next().await.is_some() {}
+}
+
+async fn cancel_active(dbus: Option<&JsonDbusClient>, output: &OutputHandle) {
+    let Some(dbus) = dbus else { return };
+    for id in output.active_ids().await {
+        let _ = dbus.cancel_json(&id).await;
+    }
 }

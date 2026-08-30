@@ -426,37 +426,8 @@ impl RingboardBackend {
     fn query_sync(&self, query: HistoryQuery) -> BackendResult<HistoryPage> {
         let (database, mut reader) = Self::open()?;
         let token = history_token(&database)?;
-        let main = database.main().rev().collect::<Vec<_>>();
-        let needle = query.query.trim().to_lowercase();
-        let mut results = QueryAccumulator {
-            needle: &needle,
-            current_id: main.first().map(Entry::id),
-            offset: query.offset,
-            limit: query.limit.clamp(1, MAX_QUERY_LIMIT),
-            collapse_echoes: query.collapse_self_echoes,
-            complete: true,
-            candidates: Vec::new(),
-        };
-        let mut cache = self.summaries.lock().map_err(|_| lock_error())?;
-        cache.select_token(token);
-        for entry in database.favorites().rev().chain(main) {
-            results.load(self, &mut cache, entry, &mut reader)?;
-        }
-        drop(cache);
-        let mut projection = results.finish();
-        *self.ids.lock().map_err(|_| lock_error())? = std::mem::take(&mut projection.bindings);
-        prune_thumbnails(&projection.thumbnails);
-        self.reconcile_projection(&projection)?;
-        let consumed = query.offset.saturating_add(projection.entries.len());
-        let has_more = projection.matched > consumed;
-        Ok(HistoryPage {
-            revision: self.revision_for(token)?,
-            generation: query.generation,
-            current: projection.current,
-            has_more,
-            next_offset: has_more.then_some(consumed),
-            entries: projection.entries,
-        })
+        let projection = collect_query_projection(self, &database, &mut reader, &query, token)?;
+        finalize_query(self, query, token, projection)
     }
 
     fn details_sync(&self, opaque_id: &str, max_text_bytes: usize) -> BackendResult<EntryDetails> {
@@ -631,6 +602,54 @@ impl RingboardBackend {
             .copied()
             .ok_or_else(|| BackendError::not_found("Clipboard entry ID is unknown or stale"))
     }
+}
+
+fn collect_query_projection(
+    backend: &RingboardBackend,
+    database: &DatabaseReader,
+    reader: &mut EntryReader,
+    query: &HistoryQuery,
+    token: u64,
+) -> BackendResult<QueryProjection> {
+    let main = database.main().rev().collect::<Vec<_>>();
+    let needle = query.query.trim().to_lowercase();
+    let mut results = QueryAccumulator {
+        needle: &needle,
+        current_id: main.first().map(Entry::id),
+        offset: query.offset,
+        limit: query.limit.clamp(1, MAX_QUERY_LIMIT),
+        collapse_echoes: query.collapse_self_echoes,
+        complete: true,
+        candidates: Vec::new(),
+    };
+    let mut cache = backend.summaries.lock().map_err(|_| lock_error())?;
+    cache.select_token(token);
+    for entry in database.favorites().rev().chain(main) {
+        results.load(backend, &mut cache, entry, reader)?;
+    }
+    drop(cache);
+    Ok(results.finish())
+}
+
+fn finalize_query(
+    backend: &RingboardBackend,
+    query: HistoryQuery,
+    token: u64,
+    mut projection: QueryProjection,
+) -> BackendResult<HistoryPage> {
+    *backend.ids.lock().map_err(|_| lock_error())? = std::mem::take(&mut projection.bindings);
+    prune_thumbnails(&projection.thumbnails);
+    backend.reconcile_projection(&projection)?;
+    let consumed = query.offset.saturating_add(projection.entries.len());
+    let has_more = projection.matched > consumed;
+    Ok(HistoryPage {
+        revision: backend.revision_for(token)?,
+        generation: query.generation,
+        current: projection.current,
+        has_more,
+        next_offset: has_more.then_some(consumed),
+        entries: projection.entries,
+    })
 }
 
 #[async_trait]

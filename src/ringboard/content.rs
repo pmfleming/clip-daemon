@@ -104,8 +104,8 @@ impl ResolvedContent {
 
     pub fn image_metadata(&self) -> Option<ImageMetadata> {
         match &self.image {
-            Some(ResolvedImage::Inline { dimensions, .. }) => dimensions.clone(),
-            Some(ResolvedImage::LocalFile(source)) => Some(source.dimensions.clone()),
+            Some(ResolvedImage::Inline { dimensions, .. }) => *dimensions,
+            Some(ResolvedImage::LocalFile(source)) => Some(source.dimensions),
             None => None,
         }
     }
@@ -329,20 +329,29 @@ fn local_image_source_from_files(
     max_bytes: u64,
 ) -> Option<LocalImageSource> {
     let [file] = files else { return None };
-    let path = Url::parse(&file.uri).ok()?.to_file_path().ok()?;
-    let metadata = path.symlink_metadata().ok()?;
-    (metadata.file_type().is_file() && metadata.len() <= max_bytes).then_some(())?;
-    let mut reader = ImageReader::open(&path)
-        .and_then(ImageReader::with_guessed_format)
-        .ok()?;
-    let format = reader.format()?;
-    reader.limits(image_decode_limits());
-    let (width, height) = reader.into_dimensions().ok()?;
+    let path = safe_local_file(&file.uri, max_bytes)?;
+    let (mime, dimensions) = inspect_local_image(&path)?;
     Some(LocalImageSource {
         path,
-        mime: format.to_mime_type(),
-        dimensions: ImageMetadata { width, height },
+        mime,
+        dimensions,
     })
+}
+
+fn safe_local_file(uri: &str, max_bytes: u64) -> Option<PathBuf> {
+    let path = Url::parse(uri).ok()?.to_file_path().ok()?;
+    let metadata = path.symlink_metadata().ok()?;
+    (metadata.file_type().is_file() && metadata.len() <= max_bytes).then_some(path)
+}
+
+fn inspect_local_image(path: &Path) -> Option<(&'static str, ImageMetadata)> {
+    let mut reader = ImageReader::open(path)
+        .and_then(ImageReader::with_guessed_format)
+        .ok()?;
+    let mime = reader.format()?.to_mime_type();
+    reader.limits(image_decode_limits());
+    let (width, height) = reader.into_dimensions().ok()?;
+    Some((mime, ImageMetadata { width, height }))
 }
 
 fn image_dimensions(bytes: &[u8]) -> Option<ImageMetadata> {

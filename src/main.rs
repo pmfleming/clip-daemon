@@ -64,15 +64,17 @@ async fn run(command: Command) -> Result<()> {
         Command::Client => client::run().await,
         Command::Publish { mime } => publish_stdin(&mime).await,
         Command::ProbeRingboard => probe_ringboard().await,
-        Command::Debug { command } => {
-            let value = match command {
-                DebugCommand::ProtocolRegistry => protocol::registry()?,
-                DebugCommand::ContractFixture => protocol::contract_fixture()?,
-            };
-            println!("{}", serde_json::to_string_pretty(&value)?);
-            Ok(())
-        }
+        Command::Debug { command } => print_debug(command),
     }
+}
+
+fn print_debug(command: DebugCommand) -> Result<()> {
+    let value = match command {
+        DebugCommand::ProtocolRegistry => protocol::registry()?,
+        DebugCommand::ContractFixture => protocol::contract_fixture()?,
+    };
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
 }
 
 async fn publish_stdin(mime: &str) -> Result<()> {

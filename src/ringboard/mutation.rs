@@ -88,21 +88,22 @@ async fn complete_operation<F, Fut>(
     events: broadcast::Sender<OperationResult>,
     run: F,
 ) where
-    F: FnOnce(String) -> Fut,
+    F: FnOnce() -> Fut,
     Fut: Future<Output = BackendResult<OperationCompletion>>,
 {
     let result = if ready.await.is_ok() {
-        run(id.clone()).await
+        run().await
     } else {
         Err(operation_error("Clipboard operation could not start"))
     };
-    let event = match result {
-        Ok(completion) => completion.event(id.clone(), &action),
-        Err(error) => OperationResult::with_id(id.clone(), &action, "failed", &error.to_string()),
-    };
-    if claim_terminal_event(&operations, &id) {
-        let _ = events.send(event);
+    if !claim_terminal_event(&operations, &id) {
+        return;
     }
+    let event = match result {
+        Ok(completion) => completion.event(id, &action),
+        Err(error) => OperationResult::with_id(id, &action, "failed", &error.to_string()),
+    };
+    let _ = events.send(event);
 }
 
 fn claim_terminal_event(
@@ -208,7 +209,7 @@ impl RingboardBackend {
         run: F,
     ) -> BackendResult<OperationResult>
     where
-        F: FnOnce(String) -> Fut + Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = BackendResult<OperationCompletion>> + Send + 'static,
     {
         let mut operation = OperationResult::completed(action, message);
@@ -250,7 +251,7 @@ impl RingboardBackend {
             "Image editor started",
             "Annotation task could not be started",
             files,
-            move |_task_id| async move { run_annotation(backend, editor, staged).await },
+            move || async move { run_annotation(backend, editor, staged).await },
         )
     }
 
@@ -346,19 +347,7 @@ impl RingboardBackend {
     }
 
     pub(super) fn cleanup_artifacts(&self) -> BackendResult<OperationResult> {
-        for (_, operation) in self
-            .operations
-            .lock()
-            .map_err(|_| operation_error("Clipboard operation state is unavailable"))?
-            .drain()
-        {
-            operation.handle.abort();
-        }
-        super::content::clear_cache()?;
-        let runtime = runtime_directory("clip-daemon")?;
-        fs::remove_dir_all(&runtime).map_err(operation_error)?;
-        let references = self.generated_artifact_references()?;
-        let removed = self.artifact_registry()?.reconcile(&references)?;
+        let removed = cleanup_backend(self)?;
         Ok(completed(
             "cleanup",
             &format!("Clipboard caches cleared; {removed} unreferenced generated files removed"),
@@ -366,21 +355,43 @@ impl RingboardBackend {
     }
 
     pub(super) fn wipe_entries(&self) -> BackendResult<OperationResult> {
-        let (database, _) = Self::open()?;
-        let ids: Vec<_> = database
-            .favorites()
-            .chain(database.main())
-            .map(|entry| entry.id())
-            .collect();
-        let server = server()?;
-        for id in ids {
-            remove_raw(&server, id)?;
-        }
-        self.cleanup_artifacts()?;
+        remove_all_entries()?;
+        cleanup_backend(self)?;
         self.artifact_registry()?.clear_all()?;
         self.clear_identity_state()?;
         Ok(completed("wipe", "Clipboard history cleared"))
     }
+}
+
+fn cleanup_backend(backend: &RingboardBackend) -> BackendResult<usize> {
+    stop_operations(backend)?;
+    super::content::clear_cache()?;
+    let runtime = runtime_directory("clip-daemon")?;
+    fs::remove_dir_all(runtime).map_err(operation_error)?;
+    let references = backend.generated_artifact_references()?;
+    backend.artifact_registry()?.reconcile(&references)
+}
+
+fn stop_operations(backend: &RingboardBackend) -> BackendResult<()> {
+    let mut operations = backend
+        .operations
+        .lock()
+        .map_err(|_| operation_error("Clipboard operation state is unavailable"))?;
+    operations
+        .drain()
+        .for_each(|(_, operation)| operation.handle.abort());
+    Ok(())
+}
+
+fn remove_all_entries() -> BackendResult<()> {
+    let (database, _) = RingboardBackend::open()?;
+    let ids = database
+        .favorites()
+        .chain(database.main())
+        .map(|entry| entry.id())
+        .collect::<Vec<_>>();
+    let server = server()?;
+    ids.into_iter().try_for_each(|id| remove_raw(&server, id))
 }
 
 fn capture_and_publish(
@@ -458,17 +469,15 @@ fn command_status_with_timeout(
         .spawn()
         .map_err(|_| operation_error("Could not start screenshot capture"))?;
     let deadline = Instant::now() + timeout;
-    loop {
+    while Instant::now() < deadline {
         if let Some(status) = child.try_wait().map_err(operation_error)? {
             return Ok(status);
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(operation_error("Screenshot capture timed out"));
-        }
         std::thread::sleep(Duration::from_millis(25));
     }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(operation_error("Screenshot capture timed out"))
 }
 
 async fn run_editor(editor: &ImageEditorCommand, input: &Path, output: &Path) -> BackendResult<()> {

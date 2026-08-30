@@ -35,7 +35,7 @@ pub struct HistoryPage {
     pub next_offset: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageMetadata {
     pub width: u32,
     pub height: u32,
