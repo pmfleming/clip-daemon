@@ -1,9 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
+    fs::{self, File},
     io::{Read, Seek, SeekFrom},
+    os::unix::fs::MetadataExt,
     panic::{AssertUnwindSafe, catch_unwind},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -275,7 +276,7 @@ impl RingboardBackend {
     }
 
     fn change_token_sync(&self) -> BackendResult<u64> {
-        Ok(history_token(&Self::open_database()?))
+        history_token(&Self::open_database()?)
     }
 
     fn selected(
@@ -424,7 +425,7 @@ impl RingboardBackend {
 
     fn query_sync(&self, query: HistoryQuery) -> BackendResult<HistoryPage> {
         let (database, mut reader) = Self::open()?;
-        let token = history_token(&database);
+        let token = history_token(&database)?;
         let main = database.main().rev().collect::<Vec<_>>();
         let needle = query.query.trim().to_lowercase();
         let mut results = QueryAccumulator {
@@ -817,15 +818,57 @@ fn stored_mime_type(loaded: &LoadedEntry<'_, File>) -> BackendResult<String> {
         .map_err(|_| invalid_entry("Clipboard MIME metadata is not valid UTF-8"))
 }
 
-fn history_token(database: &DatabaseReader) -> u64 {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RingFileState {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl RingFileState {
+    fn load(path: &Path) -> BackendResult<Self> {
+        let metadata = fs::metadata(path)
+            .map_err(|_| BackendError::unavailable("Ringboard history metadata is unavailable"))?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+
+    fn hash_into(self, hasher: &mut Sha256) {
+        hasher.update(self.device.to_le_bytes());
+        hasher.update(self.inode.to_le_bytes());
+        hasher.update(self.size.to_le_bytes());
+        hasher.update(self.modified_seconds.to_le_bytes());
+        hasher.update(self.modified_nanoseconds.to_le_bytes());
+        hasher.update(self.changed_seconds.to_le_bytes());
+        hasher.update(self.changed_nanoseconds.to_le_bytes());
+    }
+}
+
+fn history_token(database: &DatabaseReader) -> BackendResult<u64> {
+    use clipboard_history_client_sdk::core::protocol::RingKind;
+
     let main = database.main();
     let favorites = database.favorites();
-    history_token_from_parts(
+    let directory = clipboard_history_client_sdk::core::dirs::data_dir();
+    Ok(history_token_from_parts(
         main.ring().write_head(),
         favorites.ring().write_head(),
         main.ring().len(),
         favorites.ring().len(),
-    )
+        RingFileState::load(&directory.join(RingKind::Main.file_name()))?,
+        RingFileState::load(&directory.join(RingKind::Favorites.file_name()))?,
+    ))
 }
 
 fn history_token_from_parts(
@@ -833,12 +876,16 @@ fn history_token_from_parts(
     favorites_head: u32,
     main_len: u32,
     favorites_len: u32,
+    main_file: RingFileState,
+    favorites_file: RingFileState,
 ) -> u64 {
     let mut hasher = Sha256::new();
-    hasher.update(b"clip-daemon:history-token:v1:");
+    hasher.update(b"clip-daemon:history-token:v2:");
     for value in [main_head, favorites_head, main_len, favorites_len] {
         hasher.update(value.to_le_bytes());
     }
+    main_file.hash_into(&mut hasher);
+    favorites_file.hash_into(&mut hasher);
     let digest = hasher.finalize();
     let mut token = [0; 8];
     token.copy_from_slice(&digest[..8]);
@@ -936,8 +983,9 @@ fn entry_revision(fingerprint: &[u8; 32]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SAFE_JSON_INTEGER, QueryAccumulator, QueryCandidate, ResolvedEntry, SummaryCache,
-        entry_fingerprint, entry_revision, history_token_from_parts, inspect_entry, opaque_id,
+        MAX_SAFE_JSON_INTEGER, QueryAccumulator, QueryCandidate, ResolvedEntry, RingFileState,
+        SummaryCache, entry_fingerprint, entry_revision, history_token_from_parts, inspect_entry,
+        opaque_id,
     };
     use crate::model::{EntryKind, EntrySummary};
 
@@ -999,13 +1047,43 @@ mod tests {
 
     #[test]
     fn every_history_component_changes_the_token() {
-        let baseline = history_token_from_parts(1, 2, 3, 4);
-        assert_eq!(baseline, history_token_from_parts(1, 2, 3, 4));
+        let main_file = RingFileState {
+            inode: 10,
+            modified_nanoseconds: 20,
+            ..RingFileState::default()
+        };
+        let favorites_file = RingFileState {
+            inode: 30,
+            modified_nanoseconds: 40,
+            ..RingFileState::default()
+        };
+        let token = |main_head, favorites_head, main_len, favorites_len, main_file| {
+            history_token_from_parts(
+                main_head,
+                favorites_head,
+                main_len,
+                favorites_len,
+                main_file,
+                favorites_file,
+            )
+        };
+        let baseline = token(1, 2, 3, 4, main_file);
+        assert_eq!(baseline, token(1, 2, 3, 4, main_file));
         for changed in [
-            history_token_from_parts(9, 2, 3, 4),
-            history_token_from_parts(1, 9, 3, 4),
-            history_token_from_parts(1, 2, 9, 4),
-            history_token_from_parts(1, 2, 3, 9),
+            token(9, 2, 3, 4, main_file),
+            token(1, 9, 3, 4, main_file),
+            token(1, 2, 9, 4, main_file),
+            token(1, 2, 3, 9, main_file),
+            token(
+                1,
+                2,
+                3,
+                4,
+                RingFileState {
+                    modified_nanoseconds: 21,
+                    ..main_file
+                },
+            ),
         ] {
             assert_ne!(baseline, changed);
         }
