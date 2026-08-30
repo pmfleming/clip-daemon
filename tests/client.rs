@@ -24,8 +24,11 @@ fn jsonl_client_drains_calls_after_stdin_eof() {
 
     let output = child.wait_with_output().expect("wait for JSONL client");
     assert!(output.status.success());
-    let line = std::str::from_utf8(&output.stdout).expect("UTF-8 JSONL response");
-    let response: serde_json::Value = serde_json::from_str(line.trim()).expect("JSONL response");
+    let lines = std::str::from_utf8(&output.stdout).expect("UTF-8 JSONL responses");
+    let response = lines
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSONL response"))
+        .find(|message| message["kind"] == "response" && message["id"] == "eof-call")
+        .expect("response for the accepted request");
     assert_eq!(response["kind"], "response");
-    assert_eq!(response["id"], "eof-call");
 }
