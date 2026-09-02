@@ -14,7 +14,7 @@ use tokio::{
 };
 
 use async_trait::async_trait;
-use clipboard_history_client_sdk::{DatabaseReader, Entry, EntryReader, LoadedEntry};
+use clipboard_history_client_sdk::{DatabaseReader, Entry, EntryReader, Kind, LoadedEntry};
 use sha2::{Digest, Sha256};
 use url::Url;
 
@@ -62,7 +62,19 @@ struct RevisionState {
 #[derive(Default)]
 struct SummaryCache {
     token: Option<u64>,
-    entries: HashMap<u64, Option<ResolvedEntry>>,
+    entries: HashMap<u64, CachedSummary>,
+}
+
+#[derive(Clone)]
+struct CachedSummary {
+    signature: EntrySignature,
+    resolved: Option<ResolvedEntry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EntrySignature {
+    kind: Kind,
+    file: Option<RingFileState>,
 }
 
 #[derive(Clone)]
@@ -80,10 +92,7 @@ struct IdentityBinding {
 
 impl SummaryCache {
     fn select_token(&mut self, token: u64) {
-        if self.token != Some(token) {
-            self.token = Some(token);
-            self.entries.clear();
-        }
+        self.token = Some(token);
     }
 }
 
@@ -369,12 +378,11 @@ impl RingboardBackend {
         entry: Entry,
         reader: &mut EntryReader,
     ) -> BackendResult<Option<ResolvedEntry>> {
-        if let Some(summary) = cache.entries.get(&entry.id())
-            && summary
-                .as_ref()
-                .is_none_or(|summary| summary.generated_path.is_none())
+        let signature = entry_signature(entry, reader)?;
+        if let Some(cached) = cache.entries.get(&entry.id())
+            && cached.signature == signature
         {
-            return Ok(summary.clone());
+            return Ok(cached.resolved.clone());
         }
         let summary = match catch_unwind(AssertUnwindSafe(|| self.summarize(entry, reader))) {
             Ok(Ok(summary)) => Some(summary),
@@ -393,7 +401,13 @@ impl RingboardBackend {
                 None
             }
         };
-        cache.entries.insert(entry.id(), summary.clone());
+        cache.entries.insert(
+            entry.id(),
+            CachedSummary {
+                signature,
+                resolved: summary.clone(),
+            },
+        );
         Ok(summary)
     }
 
@@ -852,7 +866,11 @@ impl RingFileState {
     fn load(path: &Path) -> BackendResult<Self> {
         let metadata = fs::metadata(path)
             .map_err(|_| BackendError::unavailable("Ringboard history metadata is unavailable"))?;
-        Ok(Self {
+        Ok(Self::from_metadata(&metadata))
+    }
+
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
             device: metadata.dev(),
             inode: metadata.ino(),
             size: metadata.size(),
@@ -860,7 +878,7 @@ impl RingFileState {
             modified_nanoseconds: metadata.mtime_nsec(),
             changed_seconds: metadata.ctime(),
             changed_nanoseconds: metadata.ctime_nsec(),
-        })
+        }
     }
 
     fn hash_into(self, hasher: &mut Sha256) {
@@ -909,6 +927,22 @@ fn history_token_from_parts(
     let mut token = [0; 8];
     token.copy_from_slice(&digest[..8]);
     u64::from_le_bytes(token)
+}
+
+fn entry_signature(entry: Entry, reader: &mut EntryReader) -> BackendResult<EntrySignature> {
+    let kind = entry.kind();
+    let file = if kind == Kind::File {
+        let loaded = entry
+            .to_file(reader)
+            .map_err(|_| invalid_entry("Could not open clipboard entry"))?;
+        let metadata = loaded
+            .metadata()
+            .map_err(|_| invalid_entry("Could not read clipboard entry metadata"))?;
+        Some(RingFileState::from_metadata(&metadata))
+    } else {
+        None
+    };
+    Ok(EntrySignature { kind, file })
 }
 
 fn encode_file_uris(paths: &[PathBuf]) -> BackendResult<Vec<u8>> {
@@ -1002,9 +1036,9 @@ fn entry_revision(fingerprint: &[u8; 32]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SAFE_JSON_INTEGER, QueryAccumulator, QueryCandidate, ResolvedEntry, RingFileState,
-        SummaryCache, entry_fingerprint, entry_revision, history_token_from_parts, inspect_entry,
-        opaque_id,
+        CachedSummary, EntrySignature, MAX_SAFE_JSON_INTEGER, QueryAccumulator, QueryCandidate,
+        ResolvedEntry, RingFileState, SummaryCache, entry_fingerprint, entry_revision,
+        history_token_from_parts, inspect_entry, opaque_id,
     };
     use crate::model::{EntryKind, EntrySummary};
 
@@ -1029,15 +1063,23 @@ mod tests {
     }
 
     #[test]
-    fn summary_cache_is_retained_until_the_history_token_changes() {
+    fn summary_cache_is_retained_across_history_changes() {
         let mut cache = SummaryCache::default();
         cache.select_token(1);
-        cache.entries.insert(42, None);
-        cache.select_token(1);
-        assert!(cache.entries.contains_key(&42));
-
+        cache.entries.insert(
+            42,
+            CachedSummary {
+                signature: EntrySignature {
+                    kind: clipboard_history_client_sdk::Kind::File,
+                    file: Some(RingFileState::default()),
+                },
+                resolved: None,
+            },
+        );
         cache.select_token(2);
-        assert!(cache.entries.is_empty());
+
+        assert!(cache.entries.contains_key(&42));
+        assert_eq!(cache.token, Some(2));
     }
 
     #[test]
