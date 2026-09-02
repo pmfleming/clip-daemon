@@ -36,6 +36,12 @@
         "stream": "clipboard.history.changed"
       },
       {
+        "name": "clipboard.history.revision",
+        "params_example": {},
+        "response_key": "revision",
+        "stream": "clipboard.history.changed"
+      },
+      {
         "name": "clipboard.entry.details",
         "params_example": {
           "entry_id": "entry-opaque",

@@ -28,6 +28,7 @@ pub(crate) struct LifecycleEvent {
 #[derive(Clone, Copy)]
 enum MethodRoute {
     HistoryQuery,
+    HistoryRevision,
     EntryDetails,
     EntryThumbnail,
     Entry,
@@ -40,6 +41,7 @@ impl MethodRoute {
     fn for_method(method: &str) -> Self {
         match method {
             "clipboard.history.query" => Self::HistoryQuery,
+            "clipboard.history.revision" => Self::HistoryRevision,
             "clipboard.entry.details" => Self::EntryDetails,
             "clipboard.entry.thumbnail" => Self::EntryThumbnail,
             value if value.starts_with("clipboard.entry.") => Self::Entry,
@@ -149,6 +151,7 @@ impl ApiService {
     async fn dispatch_method(&self, method: &str, params: Value) -> Result<Value, ApiError> {
         match MethodRoute::for_method(method) {
             MethodRoute::HistoryQuery => self.query_history(params).await,
+            MethodRoute::HistoryRevision => self.history_revision().await,
             MethodRoute::EntryDetails => self.actions.details(decode(params)?).await,
             MethodRoute::EntryThumbnail => self.actions.thumbnail(decode(params)?).await,
             MethodRoute::Entry => {
@@ -160,6 +163,10 @@ impl ApiService {
             MethodRoute::Wipe => self.dispatch_wipe(method, params).await,
             MethodRoute::Policy => self.dispatch_policy(method, params).await,
         }
+    }
+
+    async fn history_revision(&self) -> Result<Value, ApiError> {
+        Ok(json!({ "revision": self.actions.change_token().await? }))
     }
 
     async fn query_history(&self, params: Value) -> Result<Value, ApiError> {
