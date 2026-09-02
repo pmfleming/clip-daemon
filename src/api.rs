@@ -193,6 +193,16 @@ impl ApiService {
             }
             "clipboard.settings.get" => self.get_settings(),
             "clipboard.settings.update" => self.update_settings(decode(params)?).await,
+            "clipboard.selection.publishText" => {
+                let request = decode::<PublishTextParams>(params)?;
+                self.actions
+                    .publish(
+                        "text/plain;charset=utf-8",
+                        request.text.into_bytes(),
+                        self.max_entry_bytes()?,
+                    )
+                    .await
+            }
             "clipboard.selection.publishFiles" => {
                 self.actions
                     .publish_files(decode(params)?, self.max_entry_bytes()?)
@@ -335,6 +345,12 @@ fn policy_event(method: &str, data: &Value) -> Option<LifecycleEvent> {
         event: event.into(),
         data: data.clone(),
     })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishTextParams {
+    text: String,
 }
 
 fn unknown_method(method: &str) -> ApiError {

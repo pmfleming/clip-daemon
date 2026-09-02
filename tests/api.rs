@@ -69,6 +69,24 @@ async fn history_pagination_is_stable() {
 }
 
 #[tokio::test]
+async fn text_publication_uses_the_daemon_operation_boundary() {
+    let api = ApiService::new(Arc::new(FakeBackend::default()));
+    let response = api
+        .dispatch(
+            "clipboard.selection.publishText",
+            json!({ "text": "WIFI:T:WPA;S:Example;P:secret;;" }),
+        )
+        .await;
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["data"]["operation"]["action"], "publish");
+
+    let empty = api
+        .dispatch("clipboard.selection.publishText", json!({ "text": "" }))
+        .await;
+    assert_eq!(empty["error"]["code"], "validation-error");
+}
+
+#[tokio::test]
 async fn validation_unknown_methods_and_wipe_challenges_are_stable() {
     let api = ApiService::new(Arc::new(FakeBackend::default()));
     for (method, params, code) in [

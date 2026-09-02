@@ -117,6 +117,14 @@
         "stream": "clipboard.operation"
       },
       {
+        "name": "clipboard.selection.publishText",
+        "params_example": {
+          "text": "Example clipboard text"
+        },
+        "response_key": "operation",
+        "stream": "clipboard.operation"
+      },
+      {
         "name": "clipboard.selection.publishFiles",
         "params_example": {
           "operation": "copy",
