@@ -167,10 +167,10 @@ impl ClipboardBackend for FakeBackend {
     async fn thumbnail(
         &self,
         opaque_id: &str,
-        expected_revision: u64,
+        expected_revision: Option<u64>,
         _edge: u32,
     ) -> BackendResult<EntryThumbnail> {
-        self.validate_revision(opaque_id, Some(expected_revision))?;
+        self.validate_revision(opaque_id, expected_revision)?;
         Err(BackendError::not_found(format!(
             "No thumbnail fixture for {}",
             opaque_id
@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(backend.change_token().await.unwrap(), 5);
         assert_eq!(backend.revision("other").await.unwrap(), 3);
         assert!(backend.details("missing", 10).await.is_err());
-        let stale_thumbnail = backend.thumbnail("other", 2, 512).await.unwrap_err();
+        let stale_thumbnail = backend.thumbnail("other", Some(2), 512).await.unwrap_err();
         assert_eq!(stale_thumbnail.kind.code(), "stale-action");
         let stale = backend
             .mutate("other", Some(2), BackendMutation::Remove)

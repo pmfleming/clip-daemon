@@ -8,6 +8,7 @@ use tokio::{process::Command, sync::Mutex, time::sleep};
 use uuid::Uuid;
 
 const SESSION_TTL: Duration = Duration::from_secs(300);
+const ACTIVE_TARGET_TIMEOUT: Duration = Duration::from_millis(200);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const SESSION_TTL_MS: u64 = 300_000;
 
@@ -136,15 +137,12 @@ fn view(id: String, target_available: bool, state: &'static str) -> SessionView 
 }
 
 async fn active_target() -> Option<Target> {
-    let output = tokio::time::timeout(
-        COMMAND_TIMEOUT,
-        Command::new("hyprctl")
-            .args(["-j", "activewindow"])
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let mut command = Command::new("hyprctl");
+    command.args(["-j", "activewindow"]).kill_on_drop(true);
+    let output = tokio::time::timeout(ACTIVE_TARGET_TIMEOUT, command.output())
+        .await
+        .ok()?
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -160,6 +158,7 @@ fn valid_window_address(address: &str) -> bool {
 }
 
 async fn command_output(command: &mut Command) -> std::io::Result<std::process::Output> {
+    command.kill_on_drop(true);
     tokio::time::timeout(COMMAND_TIMEOUT, command.output())
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "command timed out"))?

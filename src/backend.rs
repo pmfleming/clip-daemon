@@ -157,7 +157,7 @@ pub trait ClipboardBackend: Send + Sync {
     async fn thumbnail(
         &self,
         opaque_id: &str,
-        expected_revision: u64,
+        expected_revision: Option<u64>,
         edge: u32,
     ) -> BackendResult<EntryThumbnail>;
     async fn capture_screenshot(

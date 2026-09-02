@@ -63,6 +63,7 @@ struct RevisionState {
 struct SummaryCache {
     token: Option<u64>,
     entries: HashMap<u64, CachedSummary>,
+    projection: Option<CachedProjection>,
 }
 
 #[derive(Clone)]
@@ -92,6 +93,9 @@ struct IdentityBinding {
 
 impl SummaryCache {
     fn select_token(&mut self, token: u64) {
+        if self.token != Some(token) {
+            self.projection = None;
+        }
         self.token = Some(token);
     }
 }
@@ -107,9 +111,17 @@ impl Drop for OperationTask {
     }
 }
 
+#[derive(Clone)]
 struct QueryCandidate {
     raw_id: u64,
     resolved: ResolvedEntry,
+}
+
+#[derive(Clone)]
+struct CachedProjection {
+    current_id: Option<u64>,
+    candidates: Vec<QueryCandidate>,
+    complete: bool,
 }
 
 struct QueryAccumulator<'a> {
@@ -298,7 +310,12 @@ impl RingboardBackend {
         let entry = database
             .get_raw(binding.raw_id)
             .map_err(|_| BackendError::stale("Clipboard entry is stale or missing"))?;
-        let summary = self.summarize(entry, &mut reader)?.summary;
+        let summary = {
+            let mut cache = self.summaries.lock().map_err(|_| lock_error())?;
+            self.cached_summary(&mut cache, entry, &mut reader)?
+                .ok_or_else(|| invalid_entry("Clipboard entry is unreadable"))?
+                .summary
+        };
         self.verify_selection(opaque_id, expected_revision, binding, &summary)?;
         Ok((entry, reader, summary))
     }
@@ -473,10 +490,10 @@ impl RingboardBackend {
     fn thumbnail_sync(
         &self,
         opaque_id: &str,
-        expected_revision: u64,
+        expected_revision: Option<u64>,
         edge: u32,
     ) -> BackendResult<EntryThumbnail> {
-        let (entry, mut reader, summary) = self.selected(opaque_id, Some(expected_revision))?;
+        let (entry, mut reader, summary) = self.selected(opaque_id, expected_revision)?;
         let mut loaded = entry
             .to_file(&mut reader)
             .map_err(|_| invalid_entry("Could not open clipboard image"))?;
@@ -563,6 +580,7 @@ impl RingboardBackend {
         let mut cache = self.summaries.lock().map_err(|_| lock_error())?;
         cache.token = None;
         cache.entries.clear();
+        cache.projection = None;
         Ok(())
     }
 
@@ -625,24 +643,44 @@ fn collect_query_projection(
     query: &HistoryQuery,
     token: u64,
 ) -> BackendResult<QueryProjection> {
-    let main = database.main().rev().collect::<Vec<_>>();
     let needle = query.query.trim().to_lowercase();
-    let mut results = QueryAccumulator {
+    let mut cache = backend.summaries.lock().map_err(|_| lock_error())?;
+    cache.select_token(token);
+    let projection = if let Some(projection) = cache.projection.clone() {
+        projection
+    } else {
+        let main = database.main().rev().collect::<Vec<_>>();
+        let mut results = QueryAccumulator {
+            needle: "",
+            current_id: main.first().map(Entry::id),
+            offset: 0,
+            limit: MAX_QUERY_LIMIT,
+            collapse_echoes: false,
+            complete: true,
+            candidates: Vec::new(),
+        };
+        for entry in database.favorites().rev().chain(main) {
+            results.load(backend, &mut cache, entry, reader)?;
+        }
+        let projection = CachedProjection {
+            current_id: results.current_id,
+            candidates: results.candidates,
+            complete: results.complete,
+        };
+        cache.projection = Some(projection.clone());
+        projection
+    };
+    drop(cache);
+    Ok(QueryAccumulator {
         needle: &needle,
-        current_id: main.first().map(Entry::id),
+        current_id: projection.current_id,
         offset: query.offset,
         limit: query.limit.clamp(1, MAX_QUERY_LIMIT),
         collapse_echoes: query.collapse_self_echoes,
-        complete: true,
-        candidates: Vec::new(),
-    };
-    let mut cache = backend.summaries.lock().map_err(|_| lock_error())?;
-    cache.select_token(token);
-    for entry in database.favorites().rev().chain(main) {
-        results.load(backend, &mut cache, entry, reader)?;
+        complete: projection.complete,
+        candidates: projection.candidates,
     }
-    drop(cache);
-    Ok(results.finish())
+    .finish())
 }
 
 fn finalize_query(
@@ -704,7 +742,7 @@ impl ClipboardBackend for RingboardBackend {
     async fn thumbnail(
         &self,
         opaque_id: &str,
-        expected_revision: u64,
+        expected_revision: Option<u64>,
         edge: u32,
     ) -> BackendResult<EntryThumbnail> {
         let opaque_id = opaque_id.to_owned();
@@ -1036,9 +1074,9 @@ fn entry_revision(fingerprint: &[u8; 32]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedSummary, EntrySignature, MAX_SAFE_JSON_INTEGER, QueryAccumulator, QueryCandidate,
-        ResolvedEntry, RingFileState, SummaryCache, entry_fingerprint, entry_revision,
-        history_token_from_parts, inspect_entry, opaque_id,
+        CachedProjection, CachedSummary, EntrySignature, MAX_SAFE_JSON_INTEGER, QueryAccumulator,
+        QueryCandidate, ResolvedEntry, RingFileState, SummaryCache, entry_fingerprint,
+        entry_revision, history_token_from_parts, inspect_entry, opaque_id,
     };
     use crate::model::{EntryKind, EntrySummary};
 
@@ -1076,9 +1114,17 @@ mod tests {
                 resolved: None,
             },
         );
-        cache.select_token(2);
+        cache.projection = Some(CachedProjection {
+            current_id: Some(42),
+            candidates: vec![candidate(42, "entry", false)],
+            complete: true,
+        });
+        cache.select_token(1);
+        assert!(cache.projection.is_some());
 
+        cache.select_token(2);
         assert!(cache.entries.contains_key(&42));
+        assert!(cache.projection.is_none());
         assert_eq!(cache.token, Some(2));
     }
 

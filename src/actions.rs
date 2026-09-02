@@ -152,13 +152,11 @@ impl ClipboardService {
 
     pub(crate) async fn thumbnail(&self, params: EntryParams) -> Result<Value, ApiError> {
         validate_entry_id(&params.entry_id)?;
-        let revision = self.backend.revision(&params.entry_id).await?;
-        validate_revision(params.revision, revision)?;
         let thumbnail = self
             .backend
             .thumbnail(
                 &params.entry_id,
-                params.revision.unwrap_or(revision),
+                params.revision,
                 params.edge.unwrap_or(512),
             )
             .await?;
