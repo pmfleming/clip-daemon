@@ -1,5 +1,5 @@
 use std::{
-    env, fs,
+    fs,
     fs::{File, OpenOptions},
     io,
     io::Write,
@@ -11,6 +11,7 @@ use std::{
 
 use clipboard_history_client_sdk::{config, core::dirs::data_dir};
 use serde::{Deserialize, Serialize};
+use shelllist_daemon_core::{XdgRoot, resolve_xdg_path};
 use tokio::{
     process::Command,
     sync::Mutex as AsyncMutex,
@@ -235,10 +236,7 @@ fn encoded_ringboard_config(value: &ClipboardSettings) -> Result<(PathBuf, Vec<u
 }
 
 fn settings_path() -> Option<PathBuf> {
-    let root = env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?;
-    Some(root.join("clip-daemon/settings.json"))
+    resolve_xdg_path(XdgRoot::State, "clip-daemon", Path::new("settings.json"))
 }
 
 fn load_settings(path: Option<&Path>) -> Result<ClipboardSettings, String> {

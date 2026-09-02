@@ -9,6 +9,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use shelllist_daemon_core::{XdgRoot, resolve_xdg_root};
 use url::Url;
 use uuid::Uuid;
 
@@ -320,9 +321,7 @@ fn generated_root() -> Option<PathBuf> {
 }
 
 fn state_root() -> Option<PathBuf> {
-    env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+    resolve_xdg_root(XdgRoot::State)
 }
 
 const PRUNE_GRACE_SECONDS: u64 = 60;
