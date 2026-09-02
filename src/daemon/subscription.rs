@@ -138,7 +138,7 @@ impl HistoryState {
         match result {
             Ok(token) => self
                 .changed(token)
-                .then_some(HistoryUpdate::Changed(Value::Null)),
+                .then_some(HistoryUpdate::Changed(Value::from(token))),
             Err(error) if !std::mem::replace(&mut self.unavailable, true) => {
                 Some(HistoryUpdate::Unavailable(error))
             }
@@ -230,9 +230,13 @@ async fn observe_history_tick(
         return;
     };
     let update = match update {
-        HistoryUpdate::Changed(_) => {
+        HistoryUpdate::Changed(history_revision) => {
             let revision = event_revision.fetch_add(1, Ordering::Relaxed) + 1;
-            HistoryUpdate::Changed(json!({ "data": { "revision": revision, "change": "reset" } }))
+            HistoryUpdate::Changed(json!({ "data": {
+                "revision": revision,
+                "history_revision": history_revision,
+                "change": "reset"
+            } }))
         }
         unavailable => unavailable,
     };
