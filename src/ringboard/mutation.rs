@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use crate::{
     backend::{
-        BackendError, BackendErrorKind, BackendResult, MAX_WAYLAND_SELECTION_BYTES,
+        BackendError, BackendErrorKind, BackendResult, EntryTarget, MAX_WAYLAND_SELECTION_BYTES,
         ScreenshotRegion,
     },
     editor::ImageEditorCommand,
@@ -325,6 +325,31 @@ impl RingboardBackend {
         remove_raw(server, entry.id())?;
         self.clear_identity_state()?;
         Ok(completed("delete", "Clipboard entry deleted"))
+    }
+
+    pub(super) fn remove_entries(&self, targets: &[EntryTarget]) -> BackendResult<OperationResult> {
+        // Resolve and validate the complete selection before mutating history so
+        // a stale row cannot turn a bulk request into an avoidable partial delete.
+        let raw_ids = targets
+            .iter()
+            .map(|target| {
+                self.selected(&target.opaque_id, Some(target.expected_revision))
+                    .map(|(entry, _, _)| entry.id())
+            })
+            .collect::<BackendResult<Vec<_>>>()?;
+        let server = server()?;
+        for raw_id in raw_ids {
+            remove_raw(&server, raw_id)?;
+        }
+        self.clear_identity_state()?;
+        let count = targets.len();
+        Ok(completed(
+            "delete-many",
+            &format!(
+                "{count} clipboard {} deleted",
+                if count == 1 { "entry" } else { "entries" }
+            ),
+        ))
     }
 
     pub(super) fn move_entry(

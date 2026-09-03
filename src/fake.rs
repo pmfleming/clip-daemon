@@ -1,11 +1,14 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashSet,
+    sync::{Arc, RwLock},
+};
 
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use crate::{
     backend::{
-        BackendError, BackendMutation, BackendResult, ClipboardBackend, FileSelection,
+        BackendError, BackendMutation, BackendResult, ClipboardBackend, EntryTarget, FileSelection,
         HistoryQuery, ScreenshotRegion,
     },
     classification::{bounded_preview, classify},
@@ -235,6 +238,25 @@ impl ClipboardBackend for FakeBackend {
             }
             BackendMutation::Cleanup => completed("cleanup", "Fake caches cleared"),
         }
+    }
+
+    async fn remove_many(&self, targets: &[EntryTarget]) -> BackendResult<OperationResult> {
+        for target in targets {
+            self.validate_revision(&target.opaque_id, Some(target.expected_revision))?;
+        }
+        let ids = targets
+            .iter()
+            .map(|target| target.opaque_id.as_str())
+            .collect::<HashSet<_>>();
+        self.entries
+            .write()
+            .map_err(fake_unavailable)?
+            .retain(|entry| !ids.contains(entry.entry.id.as_str()));
+        let count = targets.len();
+        completed(
+            "delete-many",
+            &format!("{count} fake clipboard entries deleted"),
+        )
     }
 
     async fn replace(

@@ -32,6 +32,7 @@ enum MethodRoute {
     EntryDetails,
     EntryThumbnail,
     Entry,
+    EntriesDelete,
     Session,
     Wipe,
     Policy,
@@ -44,6 +45,7 @@ impl MethodRoute {
             "clipboard.history.revision" => Self::HistoryRevision,
             "clipboard.entry.details" => Self::EntryDetails,
             "clipboard.entry.thumbnail" => Self::EntryThumbnail,
+            "clipboard.entries.delete" => Self::EntriesDelete,
             value if value.starts_with("clipboard.entry.") => Self::Entry,
             value if value.starts_with("clipboard.session.") => Self::Session,
             value if value.starts_with("clipboard.history.wipe.") => Self::Wipe,
@@ -159,6 +161,7 @@ impl ApiService {
                     .dispatch_entry(method, params, self.max_entry_bytes()?)
                     .await
             }
+            MethodRoute::EntriesDelete => self.actions.delete_entries(params).await,
             MethodRoute::Session => self.actions.dispatch_session(method, params).await,
             MethodRoute::Wipe => self.dispatch_wipe(method, params).await,
             MethodRoute::Policy => self.dispatch_policy(method, params).await,

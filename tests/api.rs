@@ -69,6 +69,73 @@ async fn history_pagination_is_stable() {
 }
 
 #[tokio::test]
+async fn bulk_delete_validates_the_selection_before_removing_entries() {
+    let api = ApiService::new(Arc::new(FakeBackend::with_entries(vec![
+        entry("one", EntryKind::Text, Some("one")),
+        entry("two", EntryKind::Text, Some("two")),
+        entry("three", EntryKind::Text, Some("three")),
+    ])));
+    let stale_selection = api
+        .dispatch(
+            "clipboard.entries.delete",
+            json!({"entries":[
+                {"entry_id":"one","revision":1},
+                {"entry_id":"two","revision":99}
+            ]}),
+        )
+        .await;
+    assert_ne!(stale_selection["ok"], true);
+    let untouched = api
+        .dispatch(
+            "clipboard.history.query",
+            json!({"query":"", "generation":10, "offset":0, "limit":10}),
+        )
+        .await;
+    assert_eq!(
+        untouched["data"]["history"]["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+
+    let deleted = api
+        .dispatch(
+            "clipboard.entries.delete",
+            json!({"entries":[
+                {"entry_id":"one","revision":1},
+                {"entry_id":"three","revision":1}
+            ]}),
+        )
+        .await;
+    assert_eq!(deleted["data"]["operation"]["action"], "delete-many");
+
+    let remaining = api
+        .dispatch(
+            "clipboard.history.query",
+            json!({"query":"", "generation":11, "offset":0, "limit":10}),
+        )
+        .await;
+    let entries = remaining["data"]["history"]["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["id"], "two");
+
+    for params in [
+        json!({"entries":[]}),
+        json!({"entries":[
+            {"entry_id":"two","revision":1},
+            {"entry_id":"two","revision":1}
+        ]}),
+        json!({"entries":[{"entry_id":"two","revision":99}]}),
+    ] {
+        assert_ne!(
+            api.dispatch("clipboard.entries.delete", params).await["ok"],
+            true
+        );
+    }
+}
+
+#[tokio::test]
 async fn text_publication_uses_the_daemon_operation_boundary() {
     let api = ApiService::new(Arc::new(FakeBackend::default()));
     let response = api

@@ -20,6 +20,7 @@ pub const METHODS: &[&str] = &[
     "clipboard.entry.details",
     "clipboard.entry.thumbnail",
     "clipboard.entry.action",
+    "clipboard.entries.delete",
     "clipboard.entry.edit.begin",
     "clipboard.entry.edit.commit",
     "clipboard.entry.edit.cancel",

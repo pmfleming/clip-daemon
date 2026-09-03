@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 use crate::{
     backend::{
-        BackendError, BackendErrorKind, BackendMutation, ClipboardBackend, FileSelection,
-        FileSelectionOperation, HistoryQuery, MAX_QUERY_LIMIT, ScreenshotRegion,
+        BackendError, BackendErrorKind, BackendMutation, ClipboardBackend, EntryTarget,
+        FileSelection, FileSelectionOperation, HistoryQuery, MAX_QUERY_LIMIT, ScreenshotRegion,
     },
     model::{EntryDetails, EntryKind, FilePreview, OperationResult},
     session::SessionManager,
@@ -22,6 +22,7 @@ use crate::{
 
 const MAX_EDIT_BYTES: usize = 256 * 1024;
 const MAX_PUBLISHED_FILES: usize = 100;
+const MAX_DELETE_ENTRIES: usize = 5000;
 pub type Backend = Arc<dyn ClipboardBackend>;
 pub(crate) type OperationEvents = tokio::sync::broadcast::Receiver<OperationResult>;
 
@@ -92,6 +93,29 @@ impl ClipboardService {
             "clipboard.entry.edit.cancel" => self.cancel_edit(decode(params)?).await,
             _ => Err(ApiError::unsupported("Unsupported entry method")),
         }
+    }
+
+    pub async fn delete_entries(&self, params: Value) -> Result<Value, ApiError> {
+        let request = decode::<DeleteEntriesParams>(params)?;
+        if !(1..=MAX_DELETE_ENTRIES).contains(&request.entries.len()) {
+            return Err(ApiError::validation(
+                "entries must contain between 1 and 5000 clipboard entries",
+            ));
+        }
+        let mut unique_ids = HashSet::with_capacity(request.entries.len());
+        let mut targets = Vec::with_capacity(request.entries.len());
+        for entry in request.entries {
+            validate_entry_id(&entry.entry_id)?;
+            if !unique_ids.insert(entry.entry_id.clone()) {
+                return Err(ApiError::validation("entries must not contain duplicates"));
+            }
+            targets.push(EntryTarget {
+                opaque_id: entry.entry_id,
+                expected_revision: entry.revision,
+            });
+        }
+        let operation = self.backend.remove_many(&targets).await?;
+        Ok(json!({ "operation": operation }))
     }
 
     pub async fn dispatch_session(&self, method: &str, params: Value) -> Result<Value, ApiError> {
@@ -373,6 +397,17 @@ struct EditLease {
     revision: u64,
     mime: String,
     expires: Instant,
+}
+
+#[derive(Deserialize)]
+struct DeleteEntriesParams {
+    entries: Vec<DeleteEntryParams>,
+}
+
+#[derive(Deserialize)]
+struct DeleteEntryParams {
+    entry_id: String,
+    revision: u64,
 }
 
 #[derive(Deserialize)]

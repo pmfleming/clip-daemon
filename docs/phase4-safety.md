@@ -9,6 +9,7 @@
 - Wayland selection publication validates exact MIME values and applies the configured entry limit plus a 64 MiB hard ceiling before retaining bytes in the daemon-owned publisher.
 - Delete and favorite changes use Ringboard's server protocol rather than writing database files.
 - Wipe requires a one-use, 30-second challenge and clears regular history, favorites, thumbnails, temporary transfers, and pending annotation tasks.
+- Multi-delete accepts at most 5,000 unique entry ID/revision pairs and validates the complete selection before removing any entry. This keeps stale UI selections from causing an avoidable partial delete.
 - Pause and private mode stop `ringboard-wayland.service`; resuming starts it again. The visible API state is stored with user-only permissions.
 - Retention changes stage and sync both daemon and Ringboard configuration files before
   atomic renames, roll back partial commits, skip no-op restarts, and report restart errors

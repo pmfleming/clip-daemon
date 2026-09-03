@@ -21,7 +21,7 @@ use url::Url;
 use crate::{
     backend::{
         BackendError, BackendErrorKind, BackendMutation, BackendResult, ClipboardBackend,
-        FileSelection, HistoryQuery, MAX_QUERY_LIMIT, MAX_WAYLAND_SELECTION_BYTES,
+        EntryTarget, FileSelection, HistoryQuery, MAX_QUERY_LIMIT, MAX_WAYLAND_SELECTION_BYTES,
         ScreenshotRegion,
     },
     classification::{INSPECTION_LIMIT, bounded_preview},
@@ -792,6 +792,11 @@ impl ClipboardBackend for RingboardBackend {
         }
         let opaque_id = opaque_id.to_owned();
         run_backend!(self, mutate_sync(&opaque_id, expected_revision, mutation))
+    }
+
+    async fn remove_many(&self, targets: &[EntryTarget]) -> BackendResult<OperationResult> {
+        let targets = targets.to_vec();
+        run_backend!(self, remove_entries(&targets))
     }
 
     async fn replace(

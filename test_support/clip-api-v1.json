@@ -72,6 +72,19 @@
         "stream": "clipboard.operation"
       },
       {
+        "name": "clipboard.entries.delete",
+        "params_example": {
+          "entries": [
+            {
+              "entry_id": "entry-opaque",
+              "revision": 1
+            }
+          ]
+        },
+        "response_key": "operation",
+        "stream": "clipboard.operation"
+      },
+      {
         "name": "clipboard.entry.edit.begin",
         "params_example": {
           "entry_id": "entry-opaque",

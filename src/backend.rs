@@ -19,6 +19,12 @@ pub struct HistoryQuery {
     pub collapse_self_echoes: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntryTarget {
+    pub opaque_id: String,
+    pub expected_revision: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScreenshotRegion {
     pub x: i32,
@@ -182,6 +188,7 @@ pub trait ClipboardBackend: Send + Sync {
         expected_revision: Option<u64>,
         mutation: BackendMutation,
     ) -> BackendResult<OperationResult>;
+    async fn remove_many(&self, targets: &[EntryTarget]) -> BackendResult<OperationResult>;
     async fn replace(
         &self,
         opaque_id: &str,
