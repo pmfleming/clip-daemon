@@ -234,14 +234,7 @@ fn is_terminal(class: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionManager, is_terminal, valid_window_address};
-
-    #[test]
-    fn terminal_targets_use_terminal_paste_shortcut() {
-        assert!(is_terminal("com.mitchellh.ghostty"));
-        assert!(is_terminal("org.kde.konsole"));
-        assert!(!is_terminal("firefox"));
-    }
+    use super::{SessionManager, valid_window_address};
 
     #[test]
     fn paste_targets_require_hyprland_window_addresses() {

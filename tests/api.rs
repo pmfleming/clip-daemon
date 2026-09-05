@@ -169,6 +169,16 @@ async fn validation_unknown_methods_and_wipe_challenges_are_stable() {
             "validation-error",
         ),
         (
+            "clipboard.capture.screenshot",
+            json!({"x":0,"y":0,"width":16385,"height":1}),
+            "validation-error",
+        ),
+        (
+            "clipboard.capture.screenshot",
+            json!({"x":0,"y":0,"width":16384,"height":16384}),
+            "validation-error",
+        ),
+        (
             "clipboard.selection.publishFiles",
             json!({"operation":"copy","paths":["relative.txt"]}),
             "validation-error",

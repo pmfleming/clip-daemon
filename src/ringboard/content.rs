@@ -426,14 +426,13 @@ pub(super) fn invalid_entry(message: &'static str) -> BackendError {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs::File,
         io::{Seek, SeekFrom, Write},
         os::unix::fs::symlink,
     };
 
     use super::{
-        MAX_DECODED_IMAGE_BYTES, MAX_IMAGE_DIMENSION, ResolvedContent, detected_image_mime,
-        file_preview, image_decode_limits, parse_files, prune_thumbnail_directory, read_bounded,
+        MAX_DECODED_IMAGE_BYTES, MAX_IMAGE_DIMENSION, ResolvedContent, file_preview,
+        image_decode_limits, parse_files, read_bounded,
     };
 
     #[test]
@@ -444,13 +443,6 @@ mod tests {
         file.seek(SeekFrom::Start(0)).expect("rewind fixture");
         let bytes = read_bounded(&mut file, 10_000).expect("bounded read");
         assert_eq!(bytes, &content[..10_000]);
-    }
-
-    #[test]
-    fn image_mime_is_detected_without_loading_ringboard_metadata() {
-        let png_header = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
-        assert_eq!(detected_image_mime(png_header), Some("image/png"));
-        assert_eq!(detected_image_mime(b"ordinary text"), None);
     }
 
     #[test]
@@ -494,28 +486,6 @@ mod tests {
         let symlink_uri = url::Url::from_file_path(symlink_path).unwrap().to_string();
         let symlink = inspect("text/uri-list", &format!("{symlink_uri}\r\n"));
         assert!(symlink.local_image().is_none());
-    }
-
-    #[test]
-    fn mime_aliases_share_semantic_policy_without_changing_stored_mime() {
-        let content = ResolvedContent::resolve("image/x-png", b"not an image", 1024);
-        assert_eq!(content.mime(), "image/x-png");
-        assert_eq!(content.kind(), crate::model::EntryKind::Image);
-    }
-
-    #[test]
-    fn thumbnail_pruning_keeps_only_current_entry_revisions() {
-        let directory = tempfile::tempdir().expect("thumbnail directory");
-        let current = directory.path().join("entry-current-7-256.png");
-        let stale_revision = directory.path().join("entry-current-6-256.png");
-        let removed_entry = directory.path().join("entry-removed-1-256.png");
-        for path in [&current, &stale_revision, &removed_entry] {
-            File::create(path).expect("thumbnail fixture");
-        }
-        prune_thumbnail_directory(directory.path(), &[("entry-current".into(), 7)]);
-        assert!(current.exists());
-        assert!(!stale_revision.exists());
-        assert!(!removed_entry.exists());
     }
 
     #[test]

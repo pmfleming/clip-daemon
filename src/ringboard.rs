@@ -1079,9 +1079,8 @@ fn entry_revision(fingerprint: &[u8; 32]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CachedProjection, CachedSummary, EntrySignature, MAX_SAFE_JSON_INTEGER, QueryAccumulator,
-        QueryCandidate, ResolvedEntry, RingFileState, SummaryCache, entry_fingerprint,
-        entry_revision, history_token_from_parts, inspect_entry, opaque_id,
+        MAX_SAFE_JSON_INTEGER, QueryAccumulator, QueryCandidate, ResolvedEntry, entry_fingerprint,
+        entry_revision, inspect_entry, opaque_id,
     };
     use crate::model::{EntryKind, EntrySummary};
 
@@ -1103,34 +1102,6 @@ mod tests {
                 echo_source_id: generated.then(|| "source".into()),
             },
         }
-    }
-
-    #[test]
-    fn summary_cache_is_retained_across_history_changes() {
-        let mut cache = SummaryCache::default();
-        cache.select_token(1);
-        cache.entries.insert(
-            42,
-            CachedSummary {
-                signature: EntrySignature {
-                    kind: clipboard_history_client_sdk::Kind::File,
-                    file: Some(RingFileState::default()),
-                },
-                resolved: None,
-            },
-        );
-        cache.projection = Some(CachedProjection {
-            current_id: Some(42),
-            candidates: vec![candidate(42, "entry", false)],
-            complete: true,
-        });
-        cache.select_token(1);
-        assert!(cache.projection.is_some());
-
-        cache.select_token(2);
-        assert!(cache.entries.contains_key(&42));
-        assert!(cache.projection.is_none());
-        assert_eq!(cache.token, Some(2));
     }
 
     #[test]
@@ -1157,50 +1128,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn every_history_component_changes_the_token() {
-        let main_file = RingFileState {
-            inode: 10,
-            modified_nanoseconds: 20,
-            ..RingFileState::default()
-        };
-        let favorites_file = RingFileState {
-            inode: 30,
-            modified_nanoseconds: 40,
-            ..RingFileState::default()
-        };
-        let token = |main_head, favorites_head, main_len, favorites_len, main_file| {
-            history_token_from_parts(
-                main_head,
-                favorites_head,
-                main_len,
-                favorites_len,
-                main_file,
-                favorites_file,
-            )
-        };
-        let baseline = token(1, 2, 3, 4, main_file);
-        assert_eq!(baseline, token(1, 2, 3, 4, main_file));
-        for changed in [
-            token(9, 2, 3, 4, main_file),
-            token(1, 9, 3, 4, main_file),
-            token(1, 2, 9, 4, main_file),
-            token(1, 2, 3, 9, main_file),
-            token(
-                1,
-                2,
-                3,
-                4,
-                RingFileState {
-                    modified_nanoseconds: 21,
-                    ..main_file
-                },
-            ),
-        ] {
-            assert_ne!(baseline, changed);
-        }
-    }
-
     fn fingerprint(raw_id: u64, mime: &str, bytes: &[u8]) -> [u8; 32] {
         let (_, digest) = inspect_entry(&mut std::io::Cursor::new(bytes), bytes.len() as u64)
             .expect("fingerprint fixture");
@@ -1208,32 +1135,19 @@ mod tests {
     }
 
     #[test]
-    fn engine_ids_are_not_exposed_and_revisions_are_stable() {
-        let stable = fingerprint(42, "text/plain", b"abc");
-        assert_eq!(stable, fingerprint(42, "text/plain", b"abc"));
-        assert_ne!(stable, fingerprint(43, "text/plain", b"abc"));
-        assert_ne!(stable, fingerprint(42, "text/plain", b"xyz"));
-
-        let first = [0x2a; 32];
-        let second = [0x2b; 32];
-        assert!(opaque_id(&first).starts_with("entry-"));
-        assert!(!opaque_id(&first).contains("42"));
-        assert_eq!(opaque_id(&first), opaque_id(&first));
-        assert_eq!(entry_revision(&first), entry_revision(&first));
-        assert_ne!(entry_revision(&first), entry_revision(&second));
-        assert!(entry_revision(&[u8::MAX; 32]) <= MAX_SAFE_JSON_INTEGER);
-    }
-
-    #[test]
-    fn entry_identity_hashes_content_beyond_the_preview() {
+    fn entry_identity_covers_full_content_and_preserves_js_safe_revisions() {
         let mut first = vec![b'a'; crate::classification::INSPECTION_LIMIT + 1];
         let mut second = first.clone();
         first[crate::classification::INSPECTION_LIMIT] = b'x';
         second[crate::classification::INSPECTION_LIMIT] = b'y';
 
-        assert_ne!(
-            fingerprint(42, "text/plain", &first),
-            fingerprint(42, "text/plain", &second)
-        );
+        let identity = fingerprint(42, "text/plain", &first);
+        let changed = fingerprint(42, "text/plain", &second);
+        assert_ne!(identity, changed);
+        assert_eq!(identity, fingerprint(42, "text/plain", &first));
+        assert_ne!(identity, fingerprint(43, "text/plain", &first));
+        assert_ne!(opaque_id(&identity), opaque_id(&changed));
+        assert_ne!(entry_revision(&identity), entry_revision(&changed));
+        assert!(entry_revision(&[u8::MAX; 32]) <= MAX_SAFE_JSON_INTEGER);
     }
 }

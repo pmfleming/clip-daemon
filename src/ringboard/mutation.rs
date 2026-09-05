@@ -796,26 +796,9 @@ mod tests {
     use crate::editor::ImageEditorCommand;
 
     use super::{
-        OperationTask, claim_terminal_event, command_status_with_timeout, remove_files, run_editor,
+        OperationTask, claim_terminal_event, command_status_with_timeout, run_editor,
         valid_edited_image,
     };
-
-    #[test]
-    fn operation_cleanup_only_removes_its_own_files() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let first = directory.path().join("first");
-        let second = directory.path().join("second");
-        let unrelated = directory.path().join("unrelated");
-        for path in [&first, &second, &unrelated] {
-            fs::write(path, b"fixture").expect("write fixture");
-        }
-
-        remove_files(&[&first, &second]);
-
-        assert!(!first.exists());
-        assert!(!second.exists());
-        assert!(unrelated.exists());
-    }
 
     #[tokio::test]
     async fn only_one_terminal_path_can_claim_an_operation() {

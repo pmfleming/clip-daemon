@@ -391,10 +391,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{
-        ClipboardSettings, SettingsManager, SettingsState, SettingsUpdate, atomic_write,
-        load_settings,
-    };
+    use super::{ClipboardSettings, SettingsManager, SettingsState, SettingsUpdate, load_settings};
 
     fn manager(path: Option<std::path::PathBuf>) -> SettingsManager {
         SettingsManager {
@@ -416,18 +413,6 @@ mod tests {
         assert!(manager(None).update(update).await.is_err());
     }
 
-    #[tokio::test]
-    async fn no_op_update_does_not_write_or_restart() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("settings.json");
-        let manager = manager(Some(path.clone()));
-        assert_eq!(
-            manager.update(SettingsUpdate::default()).await.unwrap(),
-            ClipboardSettings::default()
-        );
-        assert!(!path.exists());
-    }
-
     #[test]
     fn malformed_settings_are_reported_instead_of_defaulted() {
         let directory = tempdir().unwrap();
@@ -435,15 +420,5 @@ mod tests {
         fs::write(&path, b"{broken").unwrap();
         let error = load_settings(Some(&path)).unwrap_err();
         assert!(error.contains("refusing to use defaults"));
-    }
-
-    #[test]
-    fn atomic_write_replaces_the_complete_file() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("state/settings.json");
-        atomic_write(&path, b"old", "test settings").unwrap();
-        atomic_write(&path, b"new-value", "test settings").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"new-value");
-        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
     }
 }

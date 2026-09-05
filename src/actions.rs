@@ -659,7 +659,7 @@ const fn default_query_limit() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{complete_text, validate_screenshot_dimensions};
+    use super::complete_text;
     use crate::model::{EntryDetails, EntryKind, EntrySummary};
 
     fn text_details(truncated: bool) -> EntryDetails {
@@ -688,13 +688,5 @@ mod tests {
             "https://example.test"
         );
         assert!(complete_text(&text_details(true)).is_err());
-    }
-
-    #[test]
-    fn screenshots_have_edge_and_allocation_limits() {
-        assert!(validate_screenshot_dimensions(1920, 1080).is_ok());
-        assert!(validate_screenshot_dimensions(0, 1080).is_err());
-        assert!(validate_screenshot_dimensions(16_385, 1).is_err());
-        assert!(validate_screenshot_dimensions(16_384, 16_384).is_err());
     }
 }

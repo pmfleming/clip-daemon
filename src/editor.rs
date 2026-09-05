@@ -120,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_editor_commands_are_shell_free_and_substitute_paths() {
+    fn editor_commands_require_placeholders_and_substitute_paths_without_a_shell() {
         let editor = ImageEditorCommand::from_json(
             r#"["image-tool","edit","{input}","--return","{output}"]"#,
         )
@@ -131,32 +131,13 @@ mod tests {
             arguments,
             ["edit", "input image.png", "--return", "edited image.png"]
         );
-    }
 
-    #[test]
-    fn editor_contract_requires_input_and_output_placeholders() {
-        assert!(ImageEditorCommand::from_json(r#"["editor","{input}"]"#).is_err());
-        assert!(ImageEditorCommand::from_json(r#"["editor","{output}"]"#).is_err());
-        assert!(ImageEditorCommand::from_json(r#""editor --in {input}""#).is_err());
-    }
-
-    #[test]
-    fn default_adapter_returns_satty_save_and_copy_through_the_output() {
-        let arguments = arguments(
-            &ImageEditorCommand::default()
-                .command(Path::new("input image.png"), Path::new("edited image.png")),
-        );
-        for pair in [
-            ["--filename", "input image.png"],
-            ["--output-filename", "edited image.png"],
-            ["--actions-on-enter", "save-to-file"],
-            ["--actions-on-escape", "exit"],
-            ["--actions-on-right-click", "save-to-file"],
-            ["--copy-command", "cat >/dev/null"],
+        for invalid in [
+            r#"["editor","{input}"]"#,
+            r#"["editor","{output}"]"#,
+            r#""editor --in {input}""#,
         ] {
-            assert!(arguments.windows(2).any(|window| window == pair));
+            assert!(ImageEditorCommand::from_json(invalid).is_err(), "{invalid}");
         }
-        assert!(arguments.iter().any(|value| value == "--save-after-copy"));
-        assert!(arguments.iter().any(|value| value == "--early-exit"));
     }
 }

@@ -104,37 +104,33 @@ mod tests {
     use crate::model::EntryKind;
 
     #[test]
-    fn authoritative_mimes_win_over_text_sniffing() {
-        assert_kind("image/png", b"https://example.test", EntryKind::Image);
-        assert_kind("text/uri-list", b"file:///tmp/a", EntryKind::Files);
-        assert_kind("application/octet-stream", b"hello", EntryKind::Binary);
+    fn classification_respects_authoritative_mimes_before_refining_text() {
+        let cases: [(&str, &[u8], EntryKind); 8] = [
+            ("image/png", b"https://example.test", EntryKind::Image),
+            ("text/uri-list", b"file:///tmp/a", EntryKind::Files),
+            ("application/octet-stream", b"hello", EntryKind::Binary),
+            ("text/plain", b"https://example.test/a", EntryKind::Link),
+            ("text/plain", br#"{"ok":true}"#, EntryKind::Json),
+            ("text/plain", b"#1a2b3c", EntryKind::Color),
+            ("", b"ordinary text", EntryKind::Text),
+            ("", &[0xff, 0xfe], EntryKind::Binary),
+        ];
+        for (mime, bytes, expected) in cases {
+            assert_eq!(classify(mime, bytes), expected, "{mime}: {bytes:?}");
+        }
     }
 
     #[test]
-    fn bounded_text_inspection_refines_semantic_kinds() {
-        assert_kind("text/plain", b"https://example.test/a", EntryKind::Link);
-        assert_kind("text/plain", br#"{"ok":true}"#, EntryKind::Json);
-        assert_kind("text/plain", b"#1a2b3c", EntryKind::Color);
-        assert_kind("", b"ordinary text", EntryKind::Text);
-        assert_kind("", &[0xff, 0xfe], EntryKind::Binary);
-    }
-
-    fn assert_kind(mime: &str, bytes: &[u8], expected: EntryKind) {
-        assert_eq!(classify(mime, bytes), expected);
-    }
-
-    #[test]
-    fn previews_are_single_line_and_bounded() {
-        assert_eq!(bounded_preview(b" first\n\tsecond ", 1024), "first second");
+    fn previews_are_bounded_single_line_and_strip_spoofing_characters() {
+        for (input, expected) in [
+            (" first\n\tsecond ", "first second"),
+            (
+                "safe\u{202e}gpj.exe zero\u{200b}width عربي",
+                "safegpj.exe zerowidth عربي",
+            ),
+        ] {
+            assert_eq!(bounded_preview(input.as_bytes(), 1024), expected);
+        }
         assert!(bounded_preview(&vec![b'a'; 1024], 1024).len() <= 256);
-    }
-
-    #[test]
-    fn previews_remove_bidi_and_zero_width_spoofing_characters() {
-        let preview = bounded_preview(
-            "safe\u{202e}gpj.exe zero\u{200b}width عربي".as_bytes(),
-            1024,
-        );
-        assert_eq!(preview, "safegpj.exe zerowidth عربي");
     }
 }
