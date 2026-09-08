@@ -15,6 +15,7 @@ use tokio::{
 
 use async_trait::async_trait;
 use clipboard_history_client_sdk::{DatabaseReader, Entry, EntryReader, Kind, LoadedEntry};
+use clipboard_history_core::{dirs::data_dir, protocol::RingKind};
 use sha2::{Digest, Sha256};
 use url::Url;
 
@@ -265,14 +266,14 @@ impl Default for RingboardBackend {
 
 impl RingboardBackend {
     fn open_database() -> BackendResult<DatabaseReader> {
-        let mut directory = clipboard_history_client_sdk::core::dirs::data_dir();
+        let mut directory = data_dir();
         DatabaseReader::open(&mut directory)
             .map_err(|_| BackendError::unavailable("Ringboard history is unavailable"))
     }
 
     fn open() -> BackendResult<(DatabaseReader, EntryReader)> {
         let database = Self::open_database()?;
-        let mut directory = clipboard_history_client_sdk::core::dirs::data_dir();
+        let mut directory = data_dir();
         let reader = EntryReader::open(&mut directory)
             .map_err(|_| BackendError::unavailable("Ringboard entries are unavailable"))?;
         Ok((database, reader))
@@ -376,8 +377,7 @@ impl RingboardBackend {
                 kind: content.kind(),
                 mime: content.mime().to_owned(),
                 byte_size,
-                favorite: entry.ring()
-                    == clipboard_history_client_sdk::core::protocol::RingKind::Favorites,
+                favorite: entry.ring() == RingKind::Favorites,
                 current: false,
                 preview: bounded_preview(&bytes, INSPECTION_LIMIT),
             },
@@ -909,11 +909,9 @@ impl RingFileState {
 }
 
 fn history_token(database: &DatabaseReader) -> BackendResult<u64> {
-    use clipboard_history_client_sdk::core::protocol::RingKind;
-
     let main = database.main();
     let favorites = database.favorites();
-    let directory = clipboard_history_client_sdk::core::dirs::data_dir();
+    let directory = data_dir();
     Ok(history_token_from_parts(
         main.ring().write_head(),
         favorites.ring().write_head(),

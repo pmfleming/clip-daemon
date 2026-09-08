@@ -4,8 +4,10 @@
 Only disposable source archives and synthetic fixtures are used. Results include
 allocation counts/bytes, latency samples, and matching semantic fingerprints.
 """
+import hashlib
 import json
 from pathlib import Path
+import platform
 import shutil
 import statistics
 import subprocess
@@ -14,11 +16,11 @@ import tempfile
 PROJECT = Path(__file__).resolve().parents[1]
 BASELINE = "fc1ac57"
 ADAPTER = '''    let projection = cached.clone();
-    QueryAccumulator {
+    super::QueryAccumulator {
         needle: &query.query.trim().to_lowercase(),
         current_id: projection.current_id,
         offset: query.offset,
-        limit: query.limit.clamp(1, MAX_QUERY_LIMIT),
+        limit: query.limit.clamp(1, crate::backend::MAX_QUERY_LIMIT),
         collapse_echoes: query.collapse_self_echoes,
         complete: projection.complete,
         candidates: projection.candidates,
@@ -81,6 +83,9 @@ def main():
             "allocated_bytes_reduction_percent": round(100 * (1 - new["allocated_bytes"] / old["allocated_bytes"]), 2),
         })
     report = {"baseline": BASELINE, "current": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=PROJECT, text=True).strip(),
+              "working_tree_dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=PROJECT)),
+              "source_sha256": hashlib.sha256(b"".join((PROJECT / name).read_bytes() for name in ["Cargo.toml", "Cargo.lock", "src/ringboard.rs", "src/ringboard/benchmarks.rs"])).hexdigest(),
+              "platform": platform.platform(),
               "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
               "scope": "synthetic warm projection only; excludes DB, hashing, D-Bus and thumbnail cleanup", "comparisons": comparisons}
     (output / "results.json").write_text(json.dumps(report, indent=2) + "\n")

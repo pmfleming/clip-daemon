@@ -277,7 +277,8 @@ if __name__ == "__main__":
         acceptance(root)
     else:
         # Keep the runtime path short enough for Hyprland's Unix-domain sockets.
-        with tempfile.TemporaryDirectory(prefix="c-") as directory:
+        # Nix's TMPDIR can be too long for a Unix-domain socket path.
+        with tempfile.TemporaryDirectory(prefix="c-", dir="/tmp") as directory:
             root = Path(directory)
             env = dict(os.environ, AQ_DRM_DEVICES="/dev/null", RINGBOARD_SOCK=str(root / "server.sock"),
                        PASTE_SOCK=str(root / "paste.sock"), GDK_BACKEND="wayland")

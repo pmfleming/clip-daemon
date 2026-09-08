@@ -26,8 +26,8 @@
             nativeBuildInputs = [ pkgs.makeWrapper pkgs.pkg-config ];
             buildInputs = [ pkgs.dbus ];
             strictDeps = true;
-            # Ringboard 0.16.2 still declares core_io_borrowed_buf as nightly-only.
-            RUSTC_BOOTSTRAP = "1";
+            # Only the pinned Ringboard crates need core_io_borrowed_buf.
+            RUSTC_BOOTSTRAP = "clipboard_history_core,clipboard_history_client_sdk";
             postInstall = ''
               install -Dm644 ${./packaging/systemd/clip-daemon.service} $out/share/systemd/user/clip-daemon.service
               install -Dm644 ${./packaging/dbus/org.laufan.ClipDaemon.service} \
@@ -70,12 +70,13 @@
 
       devShells = forAllSystems (system: pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo cargo-audit cargo-llvm-cov clippy dbus grim jq just llvmPackages.llvm pkg-config ringboard-wayland rust-analyzer rustc rustfmt wayland-utils ];
+          packages = with pkgs; [ cargo cargo-audit cargo-machete cargo-llvm-cov clippy dbus gobject-introspection grim gtk3 hyprland jq just llvmPackages.llvm pkg-config (python3.withPackages (ps: [ ps.pygobject3 ])) ringboard-wayland rust-analyzer rustc rustfmt satty wayland-utils wl-clipboard ];
+          GI_TYPELIB_PATH = pkgs.lib.makeSearchPath "lib/girepository-1.0" [ pkgs.gtk3 pkgs.glib pkgs.pango pkgs.gdk-pixbuf pkgs.at-spi2-core pkgs.harfbuzz ];
           LLVM_COV = "${pkgs.llvmPackages.llvm}/bin/llvm-cov";
           LLVM_PROFDATA = "${pkgs.llvmPackages.llvm}/bin/llvm-profdata";
           RUST_BACKTRACE = "1";
           RUST_LOG = "clip_daemon=debug";
-          RUSTC_BOOTSTRAP = "1";
+          RUSTC_BOOTSTRAP = "clipboard_history_core,clipboard_history_client_sdk";
         };
       });
 

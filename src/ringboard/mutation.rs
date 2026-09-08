@@ -17,10 +17,10 @@ use std::{
 use clipboard_history_client_sdk::{
     Entry, EntryReader,
     api::{AddRequest, MoveToFrontRequest, RemoveRequest, SwapRequest, connect_to_server},
-    core::{
-        dirs::socket_file,
-        protocol::{AddResponse, MimeType, MoveToFrontResponse, RingKind},
-    },
+};
+use clipboard_history_core::{
+    dirs::socket_file,
+    protocol::{AddResponse, MimeType, MoveToFrontResponse, RingKind},
 };
 use image::ImageReader;
 use rustix::net::SocketAddrUnix;

@@ -9,7 +9,8 @@ use std::{
     sync::Mutex as StdMutex,
 };
 
-use clipboard_history_client_sdk::{config, core::dirs::data_dir};
+use clipboard_history_client_sdk::config;
+use clipboard_history_core::dirs::data_dir;
 use serde::{Deserialize, Serialize};
 use shelllist_daemon_core::{XdgRoot, resolve_xdg_path};
 use tokio::{

@@ -346,7 +346,6 @@ dependencies = [
  "clap",
  "clipboard-history-client-sdk",
  "clipboard-history-core",
- "futures",
  "hex",
  "image",
  "rustix",

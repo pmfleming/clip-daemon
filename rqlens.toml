@@ -9,3 +9,13 @@ identity_resolution = "auto"
 rust_analyzer = "rust-analyzer"
 identity_timeout_seconds = 60
 identity_offline = true
+
+[verification]
+workspace = true
+all_targets = true
+all_features = true
+locked = true
+audit = true
+unused_dependencies = true
+unused_dependency_backend = "cargo-machete"
+flaky_test_runs = 3

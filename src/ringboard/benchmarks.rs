@@ -1,8 +1,13 @@
 //! Opt-in, ignored release benchmark; no desktop or real history access.
 use std::{hint::black_box, time::Instant};
 
-use super::*;
-use crate::model::EntryKind;
+use sha2::{Digest, Sha256};
+
+use super::{CachedProjection, QueryCandidate, QueryProjection, ResolvedEntry};
+use crate::{
+    backend::HistoryQuery,
+    model::{EntryKind, EntrySummary},
+};
 
 fn project(cached: &CachedProjection, query: &HistoryQuery) -> QueryProjection {
     cached.project(query)

@@ -8,11 +8,16 @@ Rust clipboard policy and `clip-api` facade for the Shelllist clipboard surface.
 direnv allow
 # or
 nix develop
-just check
-just hardware-acceptance
+just check                 # locked tests, Clippy, unused dependencies, RustSec
+just quality               # full RQLens evidence and verification
+just live-acceptance       # disposable nested desktop; never wipes normal history
+just benchmark-history     # synthetic release projection comparison
+just hardware-acceptance   # remaining manual hardware gates
 ```
 
-The flake provides Rust/Cargo tooling and the pinned Nixpkgs Ringboard package. The SDK is pinned to 0.16.2 to match the reviewed Ringboard protocol.
+The tested minimum toolchain is Rust **1.95.0**, pinned in `rust-toolchain.toml` and supplied by the development flake. The SDK/core are locked to **0.16.2** to match the reviewed Ringboard protocol. These upstream crates still require `core_io_borrowed_buf`; the Nix environment scopes `RUSTC_BOOTSTRAP` to `clipboard_history_core,clipboard_history_client_sdk`, not the daemon or all dependencies. Outside Nix, use the same scoped environment when building on 1.95.0. This is an explicit upstream compatibility exception, not a claim of an exception-free stable dependency graph.
+
+`just check` requires network access to refresh RustSec advisories (or an already usable local database). The known unmaintained transitive `paste` advisory is reported, not suppressed. Do not blindly update Ringboard's broad internal core range to 0.17; it is protocol/API-incompatible. See `docs/follow-up-validation.md` for gate results and `docs/history-benchmark.md` for benchmark scope and results.
 
 ## Commands
 
@@ -36,7 +41,7 @@ The daemon supports bounded history queries, semantic details, private image thu
 
 Phase 3 adds copy and compositor-aware paste sessions, terminal/GUI shortcuts after the picker is hidden, image-as-file materialization, external image annotation with validated PNG return, and two-phase history wipe. Phase 4 adds delete, favorite/current pinning, pause/private mode, native Ringboard retention settings, cancellation, and cache cleanup. Phase 5 adds bounded inline editing, explicit validated URL/file launch actions, a daemon-enforced type/action matrix, and position-preserving text/image replacement. Generated files use collision-safe names, private permissions, and a persistent ownership registry; unreferenced daemon-owned files are pruned without touching unrelated files. Equivalent Ringboard echoes of generated file URIs and completed annotations are collapsed by default in the API projection and can be retained with the `collapse_self_echoes` setting. Raw clipboard images and single safe local image-file entries use the same `ResolvedContent` policy: MIME aliases, summaries, details, thumbnails, normal image publication, and file-URI publication all resolve through one abstraction. `clip-daemon` publishes exact-MIME Wayland selections directly while Ringboard remains the sole capture/history engine.
 
-`publish` reads bounded content from stdin and sends it over D-Bus to the running daemon. The daemon enforces the configured entry-size limit, validates the MIME type, and remains the Wayland selection owner. This supports short-lived producers without `wl-copy`; for example, standalone Satty can use `copy-command = "clip-daemon publish --mime image/png"`.
+`publish` reads bounded content from stdin and sends it over D-Bus to the running daemon. The daemon enforces the configured entry-size limit, validates the MIME type, and remains the Wayland selection owner. Valid UTF-8 plain text retains its exact offer and also exposes standard text aliases for GTK and other desktop consumers; binary/image/file-list offers do not gain text aliases. This supports short-lived producers without `wl-copy`; for example, standalone Satty can use `copy-command = "clip-daemon publish --mime image/png"`.
 
 The default image-editor adapter uses Satty. The annotation pipeline itself is editor-neutral: an editor receives private `{input}` and `{output}` paths, blocks until it finishes, and either writes a PNG to `{output}` or leaves it absent to cancel. A different editor can be selected with a shell-free JSON argv template:
 
