@@ -1011,22 +1011,17 @@ fn inspect_entry(source: &mut impl Read, expected_size: u64) -> BackendResult<(V
     let mut preview = Vec::with_capacity(preview_capacity);
     let mut hasher = Sha256::new();
     hasher.update(b"clip-daemon:entry-content:v1:");
-    let mut actual_size = 0_u64;
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let read = source
-            .read(&mut buffer)
-            .map_err(|_| invalid_entry("Could not read clipboard entry"))?;
-        if read == 0 {
-            break;
-        }
-        actual_size = actual_size
-            .checked_add(read as u64)
-            .ok_or_else(|| invalid_entry("Clipboard entry size is invalid"))?;
-        hasher.update(&buffer[..read]);
-        let retained = (INSPECTION_LIMIT - preview.len()).min(read);
-        preview.extend_from_slice(&buffer[..retained]);
-    }
+    let read_error = |_| invalid_entry("Could not read clipboard entry");
+    source
+        .by_ref()
+        .take(INSPECTION_LIMIT as u64)
+        .read_to_end(&mut preview)
+        .map_err(read_error)?;
+    hasher.update(&preview);
+    let remaining = std::io::copy(source, &mut hasher).map_err(read_error)?;
+    let actual_size = remaining
+        .checked_add(preview.len() as u64)
+        .ok_or_else(|| invalid_entry("Clipboard entry size is invalid"))?;
     if actual_size != expected_size {
         return Err(BackendError::stale(
             "Clipboard entry changed while its identity was calculated",
@@ -1165,6 +1160,36 @@ mod tests {
         let (_, digest) = inspect_entry(&mut std::io::Cursor::new(bytes), bytes.len() as u64)
             .expect("fingerprint fixture");
         entry_fingerprint(raw_id, bytes.len() as u64, mime, &digest)
+    }
+
+    struct InterruptOnce<R>(bool, R);
+
+    impl<R: std::io::Read> std::io::Read for InterruptOnce<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if std::mem::take(&mut self.0) {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            self.1.read(buffer)
+        }
+    }
+
+    #[test]
+    fn inspection_is_bounded_and_hashes_the_full_stream_across_interruptions() {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+        let limit = crate::classification::INSPECTION_LIMIT;
+        for size in [0, 1, limit - 1, limit, limit + 1, limit + 8193] {
+            let bytes = vec![b'x'; size];
+            let split = size.min(limit);
+            let tail = InterruptOnce(true, &bytes[split..]);
+            let mut source = InterruptOnce(true, (&bytes[..split]).chain(tail));
+            let (preview, digest) = inspect_entry(&mut source, size as u64).unwrap();
+            assert_eq!(preview, bytes[..split]);
+            let mut expected = Sha256::new();
+            expected.update(b"clip-daemon:entry-content:v1:");
+            expected.update(&bytes);
+            assert_eq!(digest.as_slice(), expected.finalize().as_slice());
+        }
     }
 
     #[test]

@@ -504,11 +504,11 @@ fn editable_value(details: &EntryDetails) -> Result<&str, ApiError> {
 
 async fn launch_action(params: &ActionParams, details: &EntryDetails) -> Result<Value, ApiError> {
     let operation = match params.action.as_str() {
-        "open-url" => open_url(complete_text(details)?)?,
-        "open-file" => open_file(selected_file(details, params.file_index)?)?,
-        "reveal-file" => reveal_file(selected_file(details, params.file_index)?).await?,
-        _ => return Err(ApiError::validation("unsupported launch action")),
-    };
+        "open-url" => open_url(complete_text(details)?),
+        "open-file" => open_file(selected_file(details, params.file_index)?),
+        "reveal-file" => reveal_file(selected_file(details, params.file_index)?).await,
+        _ => Err(ApiError::validation("unsupported launch action")),
+    }?;
     Ok(json!({ "operation": operation }))
 }
 
@@ -533,8 +533,7 @@ fn open_url(value: &str) -> Result<OperationResult, ApiError> {
 
 fn open_file(file: &FilePreview) -> Result<OperationResult, ApiError> {
     let path = existing_local_path(file)?;
-    let path = path.to_string_lossy();
-    spawn("xdg-open", &[path.as_ref()])?;
+    spawn("xdg-open", &[path])?;
     Ok(OperationResult::completed("open-file", "File opened"))
 }
 
@@ -571,7 +570,7 @@ fn existing_local_path(file: &FilePreview) -> Result<PathBuf, ApiError> {
         .ok_or_else(|| BackendError::not_found("Clipboard file no longer exists").into())
 }
 
-fn spawn(program: &str, arguments: &[&str]) -> Result<(), ApiError> {
+fn spawn(program: &str, arguments: &[impl AsRef<std::ffi::OsStr>]) -> Result<(), ApiError> {
     Command::new(program)
         .args(arguments)
         .spawn()

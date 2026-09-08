@@ -200,33 +200,30 @@ impl ArtifactRegistry {
     }
 
     pub fn reconcile(&mut self, referenced: &HashSet<PathBuf>) -> BackendResult<usize> {
-        self.prune(referenced, false)
+        self.prune(referenced, PRUNE_GRACE_SECONDS)
     }
 
     pub fn clear_all(&mut self) -> BackendResult<usize> {
         self.active_selection = None;
         self.inline_echoes.clear();
-        self.prune(&HashSet::new(), true)
+        self.prune(&HashSet::new(), 0)
     }
 
-    fn prune(&mut self, referenced: &HashSet<PathBuf>, force: bool) -> BackendResult<usize> {
+    fn prune(&mut self, referenced: &HashSet<PathBuf>, minimum_age: u64) -> BackendResult<usize> {
         let now = unix_time();
         let mut removed = 0;
         self.records.retain(|path, record| {
             let protected = referenced.contains(path)
-                || (!force
-                    && (self.active_selection.as_ref() == Some(path)
-                        || now.saturating_sub(record.created_at) < PRUNE_GRACE_SECONDS));
+                || self.active_selection.as_ref() == Some(path)
+                || now.saturating_sub(record.created_at) < minimum_age;
             if protected {
                 return true;
             }
-            match remove_artifact(self.root.as_deref(), path) {
-                Some(file_removed) => {
-                    removed += usize::from(file_removed);
-                    false
-                }
-                None => true,
-            }
+            let Some(file_removed) = remove_artifact(self.root.as_deref(), path) else {
+                return true;
+            };
+            removed += usize::from(file_removed);
+            false
         });
         self.persist()?;
         Ok(removed)
@@ -408,6 +405,11 @@ mod tests {
         std::fs::remove_dir(&generated).unwrap();
         assert_eq!(registry.clear_all().unwrap(), 0);
         assert!(registry.records.is_empty());
+        std::fs::write(&generated, b"image").unwrap();
+        registry
+            .register(&generated, "source", "image/png", b"image")
+            .unwrap();
+        assert_eq!(registry.clear_all().unwrap(), 1); // bypass active selection and grace
         assert!(!generated.exists());
         assert!(unrelated.exists());
     }
