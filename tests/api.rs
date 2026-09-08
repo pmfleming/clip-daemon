@@ -127,6 +127,10 @@ async fn bulk_delete_validates_the_selection_before_removing_entries() {
             {"entry_id":"two","revision":1}
         ]}),
         json!({"entries":[{"entry_id":"two","revision":99}]}),
+        json!({"entries":[{"entry_id":"","revision":1}]}),
+        json!({"entries":[{"entry_id":"two"}]}),
+        json!({"entries":[{"entry_id":"two","revision":-1}]}),
+        json!({"entries":vec![json!({"entry_id":"two","revision":1}); 5001]}),
     ] {
         assert_ne!(
             api.dispatch("clipboard.entries.delete", params).await["ok"],
@@ -151,6 +155,13 @@ async fn text_publication_uses_the_daemon_operation_boundary() {
         .dispatch("clipboard.selection.publishText", json!({ "text": "" }))
         .await;
     assert_eq!(empty["error"]["code"], "validation-error");
+    let unknown_field = api
+        .dispatch(
+            "clipboard.selection.publishText",
+            json!({"text":"ok", "extra":true}),
+        )
+        .await;
+    assert_eq!(unknown_field["error"]["code"], "validation-error");
 }
 
 #[tokio::test]

@@ -33,7 +33,6 @@ use crate::{
         BackendError, BackendErrorKind, BackendResult, EntryTarget, MAX_WAYLAND_SELECTION_BYTES,
         ScreenshotRegion,
     },
-    editor::ImageEditorCommand,
     model::{EntryKind, OperationResult},
 };
 
@@ -54,45 +53,27 @@ pub(super) struct AnnotationStage {
 }
 
 struct OperationCompletion {
-    message: String,
+    message: &'static str,
     warning: Option<String>,
 }
 
 impl OperationCompletion {
-    fn completed(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            warning: None,
-        }
-    }
-
-    fn with_warning(message: impl Into<String>, warning: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            warning: Some(warning.into()),
-        }
-    }
-
     fn event(self, id: String, action: &str) -> OperationResult {
-        let mut event = OperationResult::with_id(id, action, "completed", &self.message);
+        let mut event = OperationResult::with_id(id, action, "completed", self.message);
         event.warning = self.warning;
         event
     }
 }
 
-async fn complete_operation<F, Fut>(
+async fn complete_annotation(
     id: String,
-    action: String,
     ready: oneshot::Receiver<()>,
     operations: Arc<Mutex<HashMap<String, OperationTask>>>,
     events: broadcast::Sender<OperationResult>,
-    run: F,
-) where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = BackendResult<OperationCompletion>>,
-{
+    run: impl Future<Output = BackendResult<OperationCompletion>>,
+) {
     let result = if ready.await.is_ok() {
-        run().await
+        run.await
     } else {
         Err(operation_error("Clipboard operation could not start"))
     };
@@ -100,8 +81,8 @@ async fn complete_operation<F, Fut>(
         return;
     }
     let event = match result {
-        Ok(completion) => completion.event(id, &action),
-        Err(error) => OperationResult::with_id(id, &action, "failed", &error.to_string()),
+        Ok(completion) => completion.event(id, "annotate"),
+        Err(error) => OperationResult::with_id(id, "annotate", "failed", &error.to_string()),
     };
     let _ = events.send(event);
 }
@@ -200,29 +181,21 @@ impl RingboardBackend {
         Ok(result)
     }
 
-    fn launch_operation<F, Fut>(
+    pub(super) fn launch_annotation(
         &self,
-        action: &str,
-        message: &str,
-        start_error: &'static str,
-        files: Vec<PathBuf>,
-        run: F,
-    ) -> BackendResult<OperationResult>
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = BackendResult<OperationCompletion>> + Send + 'static,
-    {
-        let mut operation = OperationResult::completed(action, message);
+        staged: AnnotationStage,
+    ) -> BackendResult<OperationResult> {
+        let files = vec![staged.input.clone(), staged.output.clone()];
+        let mut operation = OperationResult::completed("annotate", "Image editor started");
         operation.status = "started".into();
         let operation_id = operation.id.clone();
         let (start, ready) = oneshot::channel();
-        let handle = tokio::spawn(complete_operation(
+        let handle = tokio::spawn(complete_annotation(
             operation_id.clone(),
-            action.to_owned(),
             ready,
             Arc::clone(&self.operations),
             self.operation_events.clone(),
-            run,
+            run_annotation(self.clone(), staged),
         ));
         let mut active = match self.operations.lock() {
             Ok(active) => active,
@@ -234,25 +207,11 @@ impl RingboardBackend {
         };
         active.insert(operation_id, OperationTask { handle, files });
         drop(active);
-        start.send(()).map_err(|_| operation_error(start_error))?;
+        start
+            .send(())
+            .map_err(|_| operation_error("Annotation task could not be started"))?;
         let _ = self.operation_events.send(operation.clone());
         Ok(operation)
-    }
-
-    pub(super) fn launch_annotation(
-        &self,
-        staged: AnnotationStage,
-    ) -> BackendResult<OperationResult> {
-        let backend = self.clone();
-        let editor = self.editor.clone();
-        let files = vec![staged.input.clone(), staged.output.clone()];
-        self.launch_operation(
-            "annotate",
-            "Image editor started",
-            "Annotation task could not be started",
-            files,
-            move || async move { run_annotation(backend, editor, staged).await },
-        )
     }
 
     pub(super) fn stage_annotation(
@@ -451,7 +410,6 @@ fn capture_and_publish(
 
 async fn run_annotation(
     backend: RingboardBackend,
-    editor: ImageEditorCommand,
     staged: AnnotationStage,
 ) -> BackendResult<OperationCompletion> {
     let AnnotationStage {
@@ -463,7 +421,12 @@ async fn run_annotation(
     } = staged;
     // Give the picker time to hide so the editor becomes focused when it maps.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    match run_editor(&editor, &input, &output).await {
+    match backend
+        .editor
+        .run(&input, &output)
+        .await
+        .map_err(operation_error)
+    {
         Ok(()) if output.is_file() => {
             run_blocking(move || {
                 apply_annotation(&backend, &opaque_id, revision, &output, max_bytes)
@@ -472,17 +435,6 @@ async fn run_annotation(
         }
         Ok(()) => Err(operation_error("Image edit was cancelled")),
         Err(error) => Err(error),
-    }
-}
-
-struct EditorProcessGroup(Option<rustix::process::Pid>);
-
-impl Drop for EditorProcessGroup {
-    fn drop(&mut self) {
-        if let Some(process_group) = self.0 {
-            let _ =
-                rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
-        }
     }
 }
 
@@ -505,25 +457,6 @@ fn command_status_with_timeout(
     Err(operation_error("Screenshot capture timed out"))
 }
 
-async fn run_editor(editor: &ImageEditorCommand, input: &Path, output: &Path) -> BackendResult<()> {
-    let mut child = editor
-        .command(input, output)
-        .spawn()
-        .map_err(operation_error)?;
-    let _process_group = EditorProcessGroup(
-        child
-            .id()
-            .and_then(|id| rustix::process::Pid::from_raw(id as i32)),
-    );
-    child
-        .wait()
-        .await
-        .map_err(operation_error)?
-        .success()
-        .then_some(())
-        .ok_or_else(|| operation_error("Image editor exited unsuccessfully"))
-}
-
 fn apply_annotation(
     backend: &RingboardBackend,
     opaque_id: &str,
@@ -535,13 +468,15 @@ fn apply_annotation(
         return Err(operation_error("Annotation returned an invalid image"));
     }
     let raw_id = backend.replace_file_entry(opaque_id, Some(revision), output, "image/png")?;
-    match publish_annotation(backend, raw_id, output, max_bytes) {
-        Ok(()) => Ok(OperationCompletion::completed("Image edit completed")),
-        Err(error) => Ok(OperationCompletion::with_warning(
-            "Image edit committed",
-            format!("Clipboard publication failed: {error}"),
-        )),
+    let mut completion = OperationCompletion {
+        message: "Image edit completed",
+        warning: None,
+    };
+    if let Err(error) = publish_annotation(backend, raw_id, output, max_bytes) {
+        completion.message = "Image edit committed";
+        completion.warning = Some(format!("Clipboard publication failed: {error}"));
     }
+    Ok(completion)
 }
 
 fn publish_annotation(
@@ -591,11 +526,8 @@ fn remove_raw(server: impl AsFd, id: u64) -> BackendResult<()> {
 }
 
 fn server() -> BackendResult<OwnedFd> {
-    connect_to_server(&socket_address(socket_file())?).map_err(operation_error)
-}
-
-fn socket_address(path: PathBuf) -> BackendResult<SocketAddrUnix> {
-    SocketAddrUnix::new(path).map_err(operation_error)
+    let address = SocketAddrUnix::new(socket_file()).map_err(operation_error)?;
+    connect_to_server(&address).map_err(operation_error)
 }
 
 fn selected_bytes(
@@ -793,11 +725,8 @@ fn operation_error(error: impl std::fmt::Display) -> BackendError {
 mod tests {
     use std::fs;
 
-    use crate::editor::ImageEditorCommand;
-
     use super::{
-        OperationTask, claim_terminal_event, command_status_with_timeout, run_editor,
-        valid_edited_image,
+        OperationTask, claim_terminal_event, command_status_with_timeout, valid_edited_image,
     };
 
     #[tokio::test]
@@ -823,27 +752,6 @@ mod tests {
             command_status_with_timeout(&mut slow, std::time::Duration::from_millis(40)).is_err()
         );
         assert!(started.elapsed() < std::time::Duration::from_millis(500));
-    }
-
-    #[tokio::test]
-    async fn editor_exit_status_and_output_are_observable() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let input = directory.path().join("input.png");
-        let output = directory.path().join("output.png");
-        fs::write(&input, b"input").expect("write input");
-        let success = ImageEditorCommand::from_json(
-            r#"["sh","-c","cp \"$1\" \"$2\"","editor","{input}","{output}"]"#,
-        )
-        .expect("success editor");
-        run_editor(&success, &input, &output)
-            .await
-            .expect("editor succeeds");
-        assert_eq!(fs::read(&output).unwrap(), b"input");
-
-        let failure =
-            ImageEditorCommand::from_json(r#"["sh","-c","exit 9","editor","{input}","{output}"]"#)
-                .expect("failure editor");
-        assert!(run_editor(&failure, &input, &output).await.is_err());
     }
 
     #[test]

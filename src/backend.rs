@@ -19,9 +19,11 @@ pub struct HistoryQuery {
     pub collapse_self_echoes: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct EntryTarget {
+    #[serde(rename = "entry_id")]
     pub opaque_id: String,
+    #[serde(rename = "revision")]
     pub expected_revision: u64,
 }
 

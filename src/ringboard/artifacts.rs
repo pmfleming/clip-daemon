@@ -17,13 +17,12 @@ use crate::backend::{BackendError, BackendErrorKind, BackendResult, MAX_WAYLAND_
 
 use super::content::{LocalImageSource, image_identity};
 
-#[derive(Clone)]
 pub(super) struct ArtifactMatch {
     pub path: PathBuf,
     pub source_entry_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ArtifactRecord {
     path: PathBuf,
     source_entry_id: String,
@@ -32,7 +31,7 @@ struct ArtifactRecord {
     created_at: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct InlineEchoRecord {
     source_entry_id: String,
     image_identity: String,
@@ -66,7 +65,8 @@ pub(super) struct ArtifactRegistry {
 impl Default for ArtifactRegistry {
     fn default() -> Self {
         let root = generated_root();
-        let manifest_path = state_root().map(|root| root.join("clip-daemon/generated-files.json"));
+        let manifest_path = resolve_xdg_root(XdgRoot::State)
+            .map(|root| root.join("clip-daemon/generated-files.json"));
         Self::load(root, manifest_path)
     }
 }
@@ -187,8 +187,11 @@ impl ArtifactRegistry {
         })
     }
 
-    pub fn match_file_uris(&self, uris: impl Iterator<Item = String>) -> Option<ArtifactMatch> {
-        uris.filter_map(|uri| Url::parse(&uri).ok()?.to_file_path().ok())
+    pub fn match_file_uris<'a>(
+        &self,
+        uris: impl Iterator<Item = &'a str>,
+    ) -> Option<ArtifactMatch> {
+        uris.filter_map(|uri| Url::parse(uri).ok()?.to_file_path().ok())
             .find(|path| self.records.contains_key(path))
             .map(|path| ArtifactMatch {
                 path,
@@ -208,25 +211,23 @@ impl ArtifactRegistry {
 
     fn prune(&mut self, referenced: &HashSet<PathBuf>, force: bool) -> BackendResult<usize> {
         let now = unix_time();
-        let stale = self
-            .records
-            .iter()
-            .filter(|(path, record)| {
-                !referenced.contains(*path)
-                    && (force
-                        || (self.active_selection.as_ref() != Some(*path)
-                            && now.saturating_sub(record.created_at) >= PRUNE_GRACE_SECONDS))
-            })
-            .map(|(path, _)| path.clone())
-            .collect::<Vec<_>>();
         let mut removed = 0;
-        for path in stale {
-            let Some(file_removed) = remove_artifact(self.root.as_deref(), &path) else {
-                continue;
-            };
-            self.records.remove(&path);
-            removed += usize::from(file_removed);
-        }
+        self.records.retain(|path, record| {
+            let protected = referenced.contains(path)
+                || (!force
+                    && (self.active_selection.as_ref() == Some(path)
+                        || now.saturating_sub(record.created_at) < PRUNE_GRACE_SECONDS));
+            if protected {
+                return true;
+            }
+            match remove_artifact(self.root.as_deref(), path) {
+                Some(file_removed) => {
+                    removed += usize::from(file_removed);
+                    false
+                }
+                None => true,
+            }
+        });
         self.persist()?;
         Ok(removed)
     }
@@ -320,10 +321,6 @@ fn generated_root() -> Option<PathBuf> {
         .map(|home| home.join("Pictures/Screenshots/clipboard-history"))
 }
 
-fn state_root() -> Option<PathBuf> {
-    resolve_xdg_root(XdgRoot::State)
-}
-
 const PRUNE_GRACE_SECONDS: u64 = 60;
 const MAX_INLINE_ECHOES: usize = 128;
 
@@ -389,9 +386,28 @@ mod tests {
         registry
             .register(&generated, "entry-source", "image/png", b"image")
             .unwrap();
+        let empty = std::collections::HashSet::new();
         registry.clear_active_selection();
-        registry.clear_all().unwrap();
+        assert_eq!(registry.reconcile(&empty).unwrap(), 0); // grace period
+        registry.records.get_mut(&generated).unwrap().created_at = 0;
+        registry.activate_if_generated(&generated);
+        assert_eq!(registry.reconcile(&empty).unwrap(), 0); // active selection
+        registry.clear_active_selection();
+        let referenced = std::collections::HashSet::from([generated.clone()]);
+        assert_eq!(registry.reconcile(&referenced).unwrap(), 0);
+        assert_eq!(registry.reconcile(&empty).unwrap(), 1);
+        assert!(registry.records.is_empty());
 
+        // Failed deletions stay registered for retry; missing files are forgotten.
+        registry
+            .register(&generated, "source", "image/png", b"image")
+            .unwrap();
+        std::fs::create_dir(&generated).unwrap();
+        assert_eq!(registry.clear_all().unwrap(), 0);
+        assert!(registry.records.contains_key(&generated));
+        std::fs::remove_dir(&generated).unwrap();
+        assert_eq!(registry.clear_all().unwrap(), 0);
+        assert!(registry.records.is_empty());
         assert!(!generated.exists());
         assert!(unrelated.exists());
     }

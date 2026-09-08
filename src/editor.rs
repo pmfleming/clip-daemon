@@ -1,4 +1,4 @@
-use std::{env, path::Path};
+use std::{env, io, path::Path};
 
 use tokio::process::Command;
 
@@ -53,6 +53,21 @@ impl ImageEditorCommand {
         Ok(Self { argv })
     }
 
+    pub(crate) async fn run(&self, input: &Path, output: &Path) -> io::Result<()> {
+        let mut child = self.command(input, output).spawn()?;
+        let _process_group = EditorProcessGroup(
+            child
+                .id()
+                .and_then(|id| rustix::process::Pid::from_raw(id as i32)),
+        );
+        child
+            .wait()
+            .await?
+            .success()
+            .then_some(())
+            .ok_or_else(|| io::Error::other("Image editor exited unsuccessfully"))
+    }
+
     pub fn command(&self, input: &Path, output: &Path) -> Command {
         let mut command = Command::new(&self.argv[0]);
         command.kill_on_drop(true);
@@ -105,6 +120,17 @@ impl Default for ImageEditorCommand {
     }
 }
 
+struct EditorProcessGroup(Option<rustix::process::Pid>);
+
+impl Drop for EditorProcessGroup {
+    fn drop(&mut self) {
+        if let Some(process_group) = self.0 {
+            let _ =
+                rustix::process::kill_process_group(process_group, rustix::process::Signal::KILL);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -117,6 +143,24 @@ mod tests {
             .get_args()
             .map(|value| value.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[tokio::test]
+    async fn editor_exit_status_and_output_are_observable() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let input = directory.path().join("input.png");
+        let output = directory.path().join("output.png");
+        std::fs::write(&input, b"input").expect("write input");
+        let success = ImageEditorCommand::from_json(
+            r#"["sh","-c","cp \"$1\" \"$2\"","editor","{input}","{output}"]"#,
+        )
+        .expect("success editor");
+        success.run(&input, &output).await.expect("editor succeeds");
+        assert_eq!(std::fs::read(&output).unwrap(), b"input");
+        let failure =
+            ImageEditorCommand::from_json(r#"["sh","-c","exit 9","editor","{input}","{output}"]"#)
+                .expect("failure editor");
+        assert!(failure.run(&input, &output).await.is_err());
     }
 
     #[test]

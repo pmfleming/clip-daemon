@@ -66,7 +66,6 @@ struct SummaryCache {
     projection: Option<CachedProjection>,
 }
 
-#[derive(Clone)]
 struct CachedSummary {
     signature: EntrySignature,
     resolved: Option<ResolvedEntry>,
@@ -111,27 +110,15 @@ impl Drop for OperationTask {
     }
 }
 
-#[derive(Clone)]
 struct QueryCandidate {
     raw_id: u64,
     resolved: ResolvedEntry,
 }
 
-#[derive(Clone)]
 struct CachedProjection {
     current_id: Option<u64>,
     candidates: Vec<QueryCandidate>,
     complete: bool,
-}
-
-struct QueryAccumulator<'a> {
-    needle: &'a str,
-    current_id: Option<u64>,
-    offset: usize,
-    limit: usize,
-    collapse_echoes: bool,
-    complete: bool,
-    candidates: Vec<QueryCandidate>,
 }
 
 #[derive(Default)]
@@ -140,13 +127,12 @@ struct QueryProjection {
     entries: Vec<EntrySummary>,
     matched: usize,
     bindings: HashMap<String, IdentityBinding>,
-    thumbnails: Vec<(String, u64)>,
     artifact_references: HashSet<PathBuf>,
     complete: bool,
 }
 
 impl QueryCandidate {
-    fn collapsed_source(&self, collapse_echoes: bool, ids: &HashSet<String>) -> Option<&str> {
+    fn collapsed_source(&self, collapse_echoes: bool, ids: &HashSet<&str>) -> Option<&str> {
         collapse_echoes
             .then_some(self.resolved.echo_source_id.as_deref())
             .flatten()
@@ -155,43 +141,51 @@ impl QueryCandidate {
 }
 
 impl QueryProjection {
-    fn push(&mut self, candidate: QueryCandidate, current_id: Option<&str>) {
-        let mut summary = candidate.resolved.summary;
-        summary.current = current_id == Some(&summary.id);
+    fn push(&mut self, candidate: &QueryCandidate, current_id: Option<&str>) {
+        let summary = &candidate.resolved.summary;
         let binding = IdentityBinding {
             raw_id: candidate.raw_id,
             revision: summary.revision,
         };
         self.bindings.insert(summary.id.clone(), binding);
-        self.thumbnails.push((summary.id.clone(), summary.revision));
-        if summary.current {
-            self.current = Some(summary.clone());
+        if current_id == Some(summary.id.as_str()) {
+            let mut current = summary.clone();
+            current.current = true;
+            self.current = Some(current);
         }
-        self.entries.push(summary);
     }
 }
 
-impl QueryAccumulator<'_> {
+impl CachedProjection {
     fn load(
-        &mut self,
         backend: &RingboardBackend,
         cache: &mut SummaryCache,
-        entry: Entry,
+        database: &DatabaseReader,
         reader: &mut EntryReader,
-    ) -> BackendResult<()> {
-        let raw_id = entry.id();
-        match backend.cached_summary(cache, entry, reader)? {
-            Some(resolved) => self.candidates.push(QueryCandidate { raw_id, resolved }),
-            None => self.complete = false,
+    ) -> BackendResult<Self> {
+        let mut main = database.main().rev().peekable();
+        let mut projection = Self {
+            current_id: main.peek().map(Entry::id),
+            candidates: Vec::new(),
+            complete: true,
+        };
+        for entry in database.favorites().rev().chain(main) {
+            match backend.cached_summary(cache, entry, reader)? {
+                Some(resolved) => projection.candidates.push(QueryCandidate {
+                    raw_id: entry.id(),
+                    resolved,
+                }),
+                None => projection.complete = false,
+            }
         }
-        Ok(())
+        Ok(projection)
     }
 
-    fn finish(self) -> QueryProjection {
+    fn project(&self, query: &HistoryQuery) -> QueryProjection {
         let ids = self
             .candidates
             .iter()
-            .map(|candidate| candidate.resolved.summary.id.clone())
+            .map(|candidate| candidate.resolved.summary.id.as_str())
             .collect::<HashSet<_>>();
         let current_id = self
             .candidates
@@ -199,9 +193,8 @@ impl QueryAccumulator<'_> {
             .find(|candidate| self.current_id == Some(candidate.raw_id))
             .map(|candidate| {
                 candidate
-                    .collapsed_source(self.collapse_echoes, &ids)
+                    .collapsed_source(query.collapse_self_echoes, &ids)
                     .unwrap_or(&candidate.resolved.summary.id)
-                    .to_owned()
             });
         let mut projection = QueryProjection {
             artifact_references: self
@@ -212,23 +205,29 @@ impl QueryAccumulator<'_> {
             complete: self.complete,
             ..QueryProjection::default()
         };
-        for candidate in self.candidates {
-            if candidate
-                .collapsed_source(self.collapse_echoes, &ids)
-                .is_none()
-            {
-                projection.push(candidate, current_id.as_deref());
-            }
-        }
-        projection
-            .entries
-            .retain(|summary| matches_query(summary, self.needle));
-        projection.matched = projection.entries.len();
-        projection.entries = projection
-            .entries
+        let needle = query.query.trim().to_lowercase();
+        let matches: Vec<_> = self
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .collapsed_source(query.collapse_self_echoes, &ids)
+                    .is_none()
+            })
+            .inspect(|candidate| projection.push(candidate, current_id))
+            .map(|candidate| &candidate.resolved.summary)
+            .filter(|summary| matches_query(summary, &needle))
+            .collect();
+        projection.matched = matches.len();
+        projection.entries = matches
             .into_iter()
-            .skip(self.offset)
-            .take(self.limit)
+            .skip(query.offset)
+            .take(query.limit.clamp(1, MAX_QUERY_LIMIT))
+            .map(|summary| {
+                let mut summary = summary.clone();
+                summary.current = current_id == Some(summary.id.as_str());
+                summary
+            })
             .collect();
         projection
     }
@@ -344,12 +343,7 @@ impl RingboardBackend {
     }
 
     fn summarize(&self, entry: Entry, reader: &mut EntryReader) -> BackendResult<ResolvedEntry> {
-        let mut loaded = entry
-            .to_file(reader)
-            .map_err(|_| invalid_entry("Could not open clipboard entry"))?;
-        let metadata = loaded
-            .metadata()
-            .map_err(|_| invalid_entry("Could not read clipboard entry metadata"))?;
+        let (mut loaded, metadata) = load_entry(entry, reader)?;
         let byte_size = metadata.len();
         let stored_mime = stored_mime_type(&loaded)?;
         let (bytes, content_digest) = inspect_entry(&mut *loaded, byte_size)?;
@@ -362,7 +356,7 @@ impl RingboardBackend {
                 .local_image()
                 .and_then(|source| registry.match_local_image(source))
                 .or_else(|| {
-                    registry.match_file_uris(content.files().iter().map(|file| file.uri.clone()))
+                    registry.match_file_uris(content.files().iter().map(|file| file.uri.as_str()))
                 });
             let inline_echo_source =
                 matches!(content.image(), Some(content::ResolvedImage::Inline { .. }))
@@ -370,6 +364,9 @@ impl RingboardBackend {
                     .flatten();
             (artifact, inline_echo_source)
         };
+        let (generated_path, echo_source_id) = artifact
+            .map(|artifact| (Some(artifact.path), artifact.source_entry_id))
+            .unwrap_or_default();
         Ok(ResolvedEntry {
             summary: EntrySummary {
                 revision: entry_revision(&fingerprint),
@@ -382,10 +379,8 @@ impl RingboardBackend {
                 current: false,
                 preview: bounded_preview(&bytes, INSPECTION_LIMIT),
             },
-            generated_path: artifact.as_ref().map(|artifact| artifact.path.clone()),
-            echo_source_id: artifact
-                .and_then(|artifact| artifact.source_entry_id)
-                .or(inline_echo_source),
+            generated_path,
+            echo_source_id: echo_source_id.or(inline_echo_source),
         })
     }
 
@@ -643,44 +638,15 @@ fn collect_query_projection(
     query: &HistoryQuery,
     token: u64,
 ) -> BackendResult<QueryProjection> {
-    let needle = query.query.trim().to_lowercase();
     let mut cache = backend.summaries.lock().map_err(|_| lock_error())?;
     cache.select_token(token);
-    let projection = if let Some(projection) = cache.projection.clone() {
-        projection
-    } else {
-        let main = database.main().rev().collect::<Vec<_>>();
-        let mut results = QueryAccumulator {
-            needle: "",
-            current_id: main.first().map(Entry::id),
-            offset: 0,
-            limit: MAX_QUERY_LIMIT,
-            collapse_echoes: false,
-            complete: true,
-            candidates: Vec::new(),
-        };
-        for entry in database.favorites().rev().chain(main) {
-            results.load(backend, &mut cache, entry, reader)?;
-        }
-        let projection = CachedProjection {
-            current_id: results.current_id,
-            candidates: results.candidates,
-            complete: results.complete,
-        };
-        cache.projection = Some(projection.clone());
-        projection
-    };
-    drop(cache);
-    Ok(QueryAccumulator {
-        needle: &needle,
-        current_id: projection.current_id,
-        offset: query.offset,
-        limit: query.limit.clamp(1, MAX_QUERY_LIMIT),
-        collapse_echoes: query.collapse_self_echoes,
-        complete: projection.complete,
-        candidates: projection.candidates,
+    if let Some(projection) = &cache.projection {
+        return Ok(projection.project(query));
     }
-    .finish())
+    let projection = CachedProjection::load(backend, &mut cache, database, reader)?;
+    let result = projection.project(query);
+    cache.projection = Some(projection);
+    Ok(result)
 }
 
 fn finalize_query(
@@ -689,8 +655,13 @@ fn finalize_query(
     token: u64,
     mut projection: QueryProjection,
 ) -> BackendResult<HistoryPage> {
+    prune_thumbnails(
+        projection
+            .bindings
+            .iter()
+            .map(|(id, binding)| (id.as_str(), binding.revision)),
+    );
     *backend.ids.lock().map_err(|_| lock_error())? = std::mem::take(&mut projection.bindings);
-    prune_thumbnails(&projection.thumbnails);
     backend.reconcile_projection(&projection)?;
     let consumed = query.offset.saturating_add(projection.entries.len());
     let has_more = projection.matched > consumed;
@@ -972,15 +943,23 @@ fn history_token_from_parts(
     u64::from_le_bytes(token)
 }
 
+fn load_entry(
+    entry: Entry,
+    reader: &mut EntryReader,
+) -> BackendResult<(LoadedEntry<'_, File>, fs::Metadata)> {
+    let loaded = entry
+        .to_file(reader)
+        .map_err(|_| invalid_entry("Could not open clipboard entry"))?;
+    let metadata = loaded
+        .metadata()
+        .map_err(|_| invalid_entry("Could not read clipboard entry metadata"))?;
+    Ok((loaded, metadata))
+}
+
 fn entry_signature(entry: Entry, reader: &mut EntryReader) -> BackendResult<EntrySignature> {
     let kind = entry.kind();
     let file = if kind == Kind::File {
-        let loaded = entry
-            .to_file(reader)
-            .map_err(|_| invalid_entry("Could not open clipboard entry"))?;
-        let metadata = loaded
-            .metadata()
-            .map_err(|_| invalid_entry("Could not read clipboard entry metadata"))?;
+        let (_, metadata) = load_entry(entry, reader)?;
         Some(RingFileState::from_metadata(&metadata))
     } else {
         None
@@ -1079,10 +1058,28 @@ fn entry_revision(fingerprint: &[u8; 32]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SAFE_JSON_INTEGER, QueryAccumulator, QueryCandidate, ResolvedEntry, entry_fingerprint,
+        CachedProjection, MAX_SAFE_JSON_INTEGER, QueryCandidate, ResolvedEntry, entry_fingerprint,
         entry_revision, inspect_entry, opaque_id,
     };
-    use crate::model::{EntryKind, EntrySummary};
+    use crate::{
+        backend::HistoryQuery,
+        model::{EntryKind, EntrySummary},
+    };
+
+    fn query(
+        needle: &str,
+        offset: usize,
+        limit: usize,
+        collapse_self_echoes: bool,
+    ) -> HistoryQuery {
+        HistoryQuery {
+            query: needle.into(),
+            generation: 1,
+            offset,
+            limit,
+            collapse_self_echoes,
+        }
+    }
 
     fn candidate(raw_id: u64, id: &str, generated: bool) -> QueryCandidate {
         QueryCandidate {
@@ -1105,26 +1102,60 @@ mod tests {
     }
 
     #[test]
-    fn equivalent_generated_echoes_can_be_collapsed_into_the_source() {
-        let candidates = vec![candidate(2, "echo", true), candidate(1, "source", false)];
-        let projection = QueryAccumulator {
-            needle: "",
+    fn cached_projection_preserves_identity_and_current_outside_the_page() {
+        let cached = CachedProjection {
             current_id: Some(2),
-            offset: 0,
-            limit: 10,
-            collapse_echoes: true,
-            complete: true,
-            candidates,
+            complete: false,
+            candidates: vec![candidate(2, "echo", true), candidate(1, "source", false)],
+        };
+        for (request, expected, matched, current) in [
+            (query("", 0, 10, false), vec!["echo", "source"], 2, "echo"),
+            (query("", 0, 10, true), vec!["source"], 1, "source"),
+            (query(" IMAGE/PNG ", 1, 1, false), vec!["source"], 2, "echo"),
+            (query("missing", 0, 10, true), vec![], 0, "source"),
+            (query("", usize::MAX, 10, true), vec![], 1, "source"),
+            (query("", 0, 0, true), vec!["source"], 1, "source"),
+        ] {
+            let page = cached.project(&request);
+            assert_eq!(
+                page.entries
+                    .iter()
+                    .map(|entry| entry.id.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(page.matched, matched);
+            assert_eq!(page.current.as_ref().unwrap().id, current);
+            assert!(page.current.as_ref().unwrap().current);
+            assert_eq!(page.bindings["source"].raw_id, 1);
+            assert_eq!(
+                page.bindings.contains_key("echo"),
+                !request.collapse_self_echoes
+            );
+            assert!(
+                page.entries
+                    .iter()
+                    .all(|entry| entry.current == (entry.id == current))
+            );
+            assert!(
+                page.artifact_references
+                    .contains(std::path::Path::new("/generated/image.png"))
+            );
+            assert!(!page.complete);
         }
-        .finish();
-
-        assert_eq!(projection.entries.len(), 1);
-        assert_eq!(projection.entries[0].id, "source");
-        assert!(projection.entries[0].current);
         assert!(
-            projection
-                .artifact_references
-                .contains(std::path::Path::new("/generated/image.png"))
+            cached
+                .candidates
+                .iter()
+                .all(|candidate| !candidate.resolved.summary.current)
+        );
+        let orphan = CachedProjection {
+            candidates: vec![candidate(2, "echo", true)],
+            ..cached
+        };
+        assert_eq!(
+            orphan.project(&query("", 0, 10, true)).entries[0].id,
+            "echo"
         );
     }
 
@@ -1149,5 +1180,7 @@ mod tests {
         assert_ne!(opaque_id(&identity), opaque_id(&changed));
         assert_ne!(entry_revision(&identity), entry_revision(&changed));
         assert!(entry_revision(&[u8::MAX; 32]) <= MAX_SAFE_JSON_INTEGER);
+        assert!(inspect_entry(&mut &b"abc"[..], 2).is_err());
+        assert!(inspect_entry(&mut &b"abc"[..], 4).is_err());
     }
 }

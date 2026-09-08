@@ -159,3 +159,45 @@ The follow-up after `0937549` retained unbounded JSONL call draining while reusi
 | physical Rust lines | 7,151 | 7,148 |
 
 Locality remains at the maximum 100 for every module, escape-hatch count remains zero, and the three remaining clone findings are low-risk token windows with a maximum score of 10. All 45 unit and integration tests pass with no failed or unknown results.
+
+## Borrowed projection and policy-locality review
+
+Fresh measurements against `fc1ac57`, using the local `../rust-quality-lens` checkout (Rust 1.95). These compare the same current extractor and configuration, rather than the historical test counts above. Raw evidence is in ignored `target/analysis-before-refactor/` and `target/analysis/`.
+
+| Signal | Before | After |
+|---|---:|---:|
+| aggregate function effort (sum of hotspot scores) | 3,461.73 | 3,411.43 |
+| aggregate cognitive complexity | 302 | 296 |
+| aggregate cyclomatic complexity | 1,211 | 1,199 |
+| maximum function hotspot | 37.46 | 36.62 |
+| maximum module hotspot | 40.04 | 39.27 |
+| minimum / average leverage | 53 / 67.200 | 56 / 67.225 |
+| minimum / average locality | 100 / 100 | 100 / 100 |
+| duplication records / duplicated lines | 4 / 54 | 3 / 42 |
+| production direct `.clone()` calls | 62 | 51 |
+| production physical Rust lines (excluding inline tests) | 6,062 | 5,954 |
+| physical Rust lines including all tests | 7,161 | 7,136 |
+| RQLens source nonblank lines | 6,158 | 6,127 |
+| measured line coverage | 43.13% | 44.63% |
+
+Changes and review findings:
+
+- **History queries:** borrow cached candidates, IDs, and summaries instead of deep-cloning the entire projection on every request. Clone summaries only for the page and current entry. Identity bindings still cover all visible history, and generated-file references include collapsed echoes. Thumbnail cleanup reuses the bindings instead of maintaining another owned ID list.
+- **API and deletion policy:** remove the duplicate routing enum, deserialize bulk selections directly into typed backend targets, and validate duplicate IDs by reference before any deletion. Text publication policy lives in the action service; decoding still precedes the settings lookup.
+- **Editor locality:** put process execution and process-group cleanup beside the editor command adapter and its tests. Remove the single-use generic operation-launch layer, redundant editor cloning, unused private `Clone` implementations, and forwarding helpers. Preserve cancellation ownership and partial annotation-publication results.
+- **Other allocations:** retain artifact records in place, borrow file URIs and canonical MIME strings, return saved settings from the blocking task by ownership, and clone only paginated fake-backend summaries. Bounded reads use `Read::take`; thumbnail result construction is shared between cache hits and newly generated images.
+
+The expanded table-driven query test includes the former echo-collapse test and covers filtering, pagination, current-entry flags, orphan echoes, identity bindings, and incomplete projections. Other regression cases cover artifact grace periods, active/referenced files, failed deletion retries, missing files, bounded-read position/EOF, malformed bulk selections, and strict publication decoding. All **32** current unit/integration tests pass; no tests are failed or unknown.
+
+Validation:
+
+```sh
+cargo clippy --all-targets --locked -- -D warnings
+../rust-quality-lens/target/debug/rqlens measure all --config rqlens.toml
+../rust-quality-lens/target/debug/rqlens verify --config rqlens.toml
+../rust-quality-lens/target/debug/rqlens check --config rqlens.toml --fail-on partial --fail-on test-failure
+```
+
+Formatting, compilation, Clippy, tests, doctests, and rustdoc pass. Escape-hatch and production reliability findings remain zero. Locality was already at the tool's ceiling; it is preserved, not claimed as improved. Artifact pruning's individual hotspot rises from 30.80 to 36.62 in exchange for removing the temporary cloned-path collection; aggregate complexity and effort still fall. Remaining duplication findings are low-risk token windows, not justification for more macros.
+
+Review limitations: these are static/coverage results, not measured runtime speedups or live Wayland/Ringboard acceptance. The SDK panic-containment boundary remains intentional. RQLens still reports missing MSRV, contribution, conduct, security-policy, and changelog declarations; optional audit, unused-dependency, mutation, and other advanced gates were not enabled. The informational architecture threshold remains exceeded by the Ringboard adapter and mutation module; no thresholds or exclusions were relaxed.

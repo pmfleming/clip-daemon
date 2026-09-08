@@ -13,7 +13,7 @@ use crate::{
     },
     classification::{bounded_preview, classify},
     model::{
-        BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
+        BackendStatus, EntryDetails, EntryThumbnail, HistoryPage, OperationResult,
         ReplacementResult,
     },
 };
@@ -43,9 +43,7 @@ impl FakeBackend {
     }
 
     fn entries(&self) -> BackendResult<std::sync::RwLockReadGuard<'_, Vec<EntryDetails>>> {
-        self.entries
-            .read()
-            .map_err(|_| BackendError::unavailable("Fake clipboard backend is unavailable"))
+        self.entries.read().map_err(fake_unavailable)
     }
 
     fn mutate_entry<T>(
@@ -61,21 +59,20 @@ impl FakeBackend {
             .ok_or_else(unknown_entry)
     }
 
-    fn operation(&self, opaque_id: &str, action: &str) -> BackendResult<OperationResult> {
+    fn with_entry<T>(
+        &self,
+        opaque_id: &str,
+        read: impl FnOnce(&EntryDetails) -> T,
+    ) -> BackendResult<T> {
         self.entries()?
             .iter()
             .find(|item| item.entry.id == opaque_id)
-            .ok_or_else(unknown_entry)?;
-        completed(action, "Fake operation completed")
+            .map(read)
+            .ok_or_else(unknown_entry)
     }
 
     fn validate_revision(&self, opaque_id: &str, expected: Option<u64>) -> BackendResult<()> {
-        let actual = self
-            .entries()?
-            .iter()
-            .find(|item| item.entry.id == opaque_id)
-            .map(|item| item.entry.revision)
-            .ok_or_else(unknown_entry)?;
+        let actual = self.with_entry(opaque_id, |item| item.entry.revision)?;
         if expected.is_some_and(|revision| revision != actual) {
             return Err(BackendError::stale("Clipboard entry revision is stale"));
         }
@@ -90,6 +87,11 @@ impl FakeBackend {
             .ok_or_else(unknown_entry)?;
         entries.remove(position);
         completed("delete", "Fake entry deleted")
+    }
+
+    fn wipe(&self) -> BackendResult<OperationResult> {
+        self.entries.write().map_err(fake_unavailable)?.clear();
+        completed("wipe", "Fake history cleared")
     }
 
     fn favorite(&self, opaque_id: &str, favorite: bool) -> BackendResult<OperationResult> {
@@ -124,9 +126,9 @@ impl ClipboardBackend for FakeBackend {
             .iter()
             .find(|item| item.entry.current)
             .map(|item| item.entry.clone());
-        let matches: Vec<EntrySummary> = entries
+        let matches: Vec<_> = entries
             .iter()
-            .map(|item| item.entry.clone())
+            .map(|item| &item.entry)
             .filter(|item| needle.is_empty() || item.preview.to_lowercase().contains(&needle))
             .collect();
         let matched = matches.len();
@@ -134,6 +136,7 @@ impl ClipboardBackend for FakeBackend {
             .into_iter()
             .skip(query.offset)
             .take(query.limit)
+            .cloned()
             .collect();
         let consumed = query.offset.saturating_add(page.len());
         let has_more = matched > consumed;
@@ -152,19 +155,11 @@ impl ClipboardBackend for FakeBackend {
         opaque_id: &str,
         _max_text_bytes: usize,
     ) -> BackendResult<EntryDetails> {
-        self.entries()?
-            .iter()
-            .find(|item| item.entry.id == opaque_id)
-            .cloned()
-            .ok_or_else(unknown_entry)
+        self.with_entry(opaque_id, Clone::clone)
     }
 
     async fn revision(&self, opaque_id: &str) -> BackendResult<u64> {
-        self.entries()?
-            .iter()
-            .find(|item| item.entry.id == opaque_id)
-            .map(|item| item.entry.revision)
-            .ok_or_else(unknown_entry)
+        self.with_entry(opaque_id, |item| item.entry.revision)
     }
 
     async fn thumbnail(
@@ -227,15 +222,14 @@ impl ClipboardBackend for FakeBackend {
             self.validate_revision(opaque_id, expected_revision)?;
         }
         match mutation {
-            BackendMutation::Restore { .. } => self.operation(opaque_id, "copy"),
-            BackendMutation::ImageAsFile { .. } => self.operation(opaque_id, "image-as-file"),
-            BackendMutation::Annotate { .. } => self.operation(opaque_id, "annotate"),
+            BackendMutation::Restore { .. } => completed("copy", "Fake operation completed"),
+            BackendMutation::ImageAsFile { .. } => {
+                completed("image-as-file", "Fake operation completed")
+            }
+            BackendMutation::Annotate { .. } => completed("annotate", "Fake operation completed"),
             BackendMutation::Remove => self.remove(opaque_id),
             BackendMutation::SetFavorite(value) => self.favorite(opaque_id, value),
-            BackendMutation::Wipe => {
-                self.entries.write().map_err(fake_unavailable)?.clear();
-                completed("wipe", "Fake history cleared")
-            }
+            BackendMutation::Wipe => self.wipe(),
             BackendMutation::Cleanup => completed("cleanup", "Fake caches cleared"),
         }
     }

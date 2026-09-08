@@ -25,35 +25,6 @@ pub(crate) struct LifecycleEvent {
     pub data: Value,
 }
 
-#[derive(Clone, Copy)]
-enum MethodRoute {
-    HistoryQuery,
-    HistoryRevision,
-    EntryDetails,
-    EntryThumbnail,
-    Entry,
-    EntriesDelete,
-    Session,
-    Wipe,
-    Policy,
-}
-
-impl MethodRoute {
-    fn for_method(method: &str) -> Self {
-        match method {
-            "clipboard.history.query" => Self::HistoryQuery,
-            "clipboard.history.revision" => Self::HistoryRevision,
-            "clipboard.entry.details" => Self::EntryDetails,
-            "clipboard.entry.thumbnail" => Self::EntryThumbnail,
-            "clipboard.entries.delete" => Self::EntriesDelete,
-            value if value.starts_with("clipboard.entry.") => Self::Entry,
-            value if value.starts_with("clipboard.session.") => Self::Session,
-            value if value.starts_with("clipboard.history.wipe.") => Self::Wipe,
-            _ => Self::Policy,
-        }
-    }
-}
-
 pub struct ApiService {
     wipe_challenges: Mutex<HashMap<String, Instant>>,
     settings: SettingsManager,
@@ -98,13 +69,9 @@ impl ApiService {
         if owners.get(operation_id).and_then(Option::as_deref) != owner {
             return false;
         }
-        if self.actions.cancel(operation_id).await {
-            owners.remove(operation_id);
-            true
-        } else {
-            owners.remove(operation_id);
-            false
-        }
+        let cancelled = self.actions.cancel(operation_id).await;
+        owners.remove(operation_id);
+        cancelled
     }
 
     pub async fn publish_selection(&self, mime: &str, bytes: Vec<u8>) -> Value {
@@ -151,20 +118,24 @@ impl ApiService {
     }
 
     async fn dispatch_method(&self, method: &str, params: Value) -> Result<Value, ApiError> {
-        match MethodRoute::for_method(method) {
-            MethodRoute::HistoryQuery => self.query_history(params).await,
-            MethodRoute::HistoryRevision => self.history_revision().await,
-            MethodRoute::EntryDetails => self.actions.details(decode(params)?).await,
-            MethodRoute::EntryThumbnail => self.actions.thumbnail(decode(params)?).await,
-            MethodRoute::Entry => {
+        match method {
+            "clipboard.history.query" => self.query_history(params).await,
+            "clipboard.history.revision" => self.history_revision().await,
+            "clipboard.entry.details" => self.actions.details(decode(params)?).await,
+            "clipboard.entry.thumbnail" => self.actions.thumbnail(decode(params)?).await,
+            method if method.starts_with("clipboard.entry.") => {
                 self.actions
                     .dispatch_entry(method, params, self.max_entry_bytes()?)
                     .await
             }
-            MethodRoute::EntriesDelete => self.actions.delete_entries(params).await,
-            MethodRoute::Session => self.actions.dispatch_session(method, params).await,
-            MethodRoute::Wipe => self.dispatch_wipe(method, params).await,
-            MethodRoute::Policy => self.dispatch_policy(method, params).await,
+            "clipboard.entries.delete" => self.actions.delete_entries(params).await,
+            method if method.starts_with("clipboard.session.") => {
+                self.actions.dispatch_session(method, params).await
+            }
+            method if method.starts_with("clipboard.history.wipe.") => {
+                self.dispatch_wipe(method, params).await
+            }
+            _ => self.dispatch_policy(method, params).await,
         }
     }
 
@@ -197,13 +168,8 @@ impl ApiService {
             "clipboard.settings.get" => self.get_settings(),
             "clipboard.settings.update" => self.update_settings(decode(params)?).await,
             "clipboard.selection.publishText" => {
-                let request = decode::<PublishTextParams>(params)?;
                 self.actions
-                    .publish(
-                        "text/plain;charset=utf-8",
-                        request.text.into_bytes(),
-                        self.max_entry_bytes()?,
-                    )
+                    .publish_text(decode(params)?, self.max_entry_bytes()?)
                     .await
             }
             "clipboard.selection.publishFiles" => {
@@ -348,12 +314,6 @@ fn policy_event(method: &str, data: &Value) -> Option<LifecycleEvent> {
         event: event.into(),
         data: data.clone(),
     })
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PublishTextParams {
-    text: String,
 }
 
 fn unknown_method(method: &str) -> ApiError {

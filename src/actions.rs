@@ -97,24 +97,8 @@ impl ClipboardService {
 
     pub async fn delete_entries(&self, params: Value) -> Result<Value, ApiError> {
         let request = decode::<DeleteEntriesParams>(params)?;
-        if !(1..=MAX_DELETE_ENTRIES).contains(&request.entries.len()) {
-            return Err(ApiError::validation(
-                "entries must contain between 1 and 5000 clipboard entries",
-            ));
-        }
-        let mut unique_ids = HashSet::with_capacity(request.entries.len());
-        let mut targets = Vec::with_capacity(request.entries.len());
-        for entry in request.entries {
-            validate_entry_id(&entry.entry_id)?;
-            if !unique_ids.insert(entry.entry_id.clone()) {
-                return Err(ApiError::validation("entries must not contain duplicates"));
-            }
-            targets.push(EntryTarget {
-                opaque_id: entry.entry_id,
-                expected_revision: entry.revision,
-            });
-        }
-        let operation = self.backend.remove_many(&targets).await?;
+        validate_delete_targets(&request.entries)?;
+        let operation = self.backend.remove_many(&request.entries).await?;
         Ok(json!({ "operation": operation }))
     }
 
@@ -219,6 +203,19 @@ impl ClipboardService {
         }
         let operation = self.backend.publish(mime, bytes, max_entry_bytes).await?;
         Ok(json!({ "operation": operation }))
+    }
+
+    pub(crate) async fn publish_text(
+        &self,
+        params: PublishTextParams,
+        max_bytes: u64,
+    ) -> Result<Value, ApiError> {
+        self.publish(
+            "text/plain;charset=utf-8",
+            params.text.into_bytes(),
+            max_bytes,
+        )
+        .await
     }
 
     pub(crate) async fn publish_files(
@@ -401,13 +398,7 @@ struct EditLease {
 
 #[derive(Deserialize)]
 struct DeleteEntriesParams {
-    entries: Vec<DeleteEntryParams>,
-}
-
-#[derive(Deserialize)]
-struct DeleteEntryParams {
-    entry_id: String,
-    revision: u64,
+    entries: Vec<EntryTarget>,
 }
 
 #[derive(Deserialize)]
@@ -444,6 +435,12 @@ pub(crate) struct QueryParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PublishTextParams {
+    text: String,
+}
+
+#[derive(Deserialize)]
 pub(crate) struct PublishFilesParams {
     operation: String,
     paths: Vec<PathBuf>,
@@ -466,6 +463,22 @@ struct EditCommitParams {
 #[derive(Deserialize)]
 struct EditCancelParams {
     edit_id: String,
+}
+
+fn validate_delete_targets(entries: &[EntryTarget]) -> Result<(), ApiError> {
+    if !(1..=MAX_DELETE_ENTRIES).contains(&entries.len()) {
+        return Err(ApiError::validation(
+            "entries must contain between 1 and 5000 clipboard entries",
+        ));
+    }
+    let mut unique_ids = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        validate_entry_id(&entry.opaque_id)?;
+        if !unique_ids.insert(entry.opaque_id.as_str()) {
+            return Err(ApiError::validation("entries must not contain duplicates"));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn decode<T: DeserializeOwned>(params: Value) -> Result<T, ApiError> {

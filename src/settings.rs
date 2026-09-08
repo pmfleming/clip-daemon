@@ -139,10 +139,12 @@ impl SettingsManager {
         saved: &str,
     ) -> Result<ClipboardSettings, String> {
         let path = self.path.clone();
-        let persisted = updated.clone();
-        spawn_blocking(move || write(path.as_deref(), &persisted))
-            .await
-            .map_err(|_| "Clipboard settings transaction failed")??;
+        let updated = spawn_blocking(move || {
+            write(path.as_deref(), &updated)?;
+            Ok::<_, String>(updated)
+        })
+        .await
+        .map_err(|_| "Clipboard settings transaction failed")??;
         self.commit(updated)
             .map_err(|error| format!("{saved}, but {error}"))
     }

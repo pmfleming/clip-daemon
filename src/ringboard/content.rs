@@ -22,7 +22,6 @@ use super::{INSPECTION_LIMIT, MAX_FILES, MAX_THUMBNAIL_BYTES};
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_DECODED_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
-#[derive(Clone)]
 pub(super) struct LocalImageSource {
     pub path: PathBuf,
     pub mime: &'static str,
@@ -65,9 +64,9 @@ impl ResolvedContent {
             };
         }
 
-        let semantic_mime = canonical_mime(&stored_mime).to_owned();
-        let files = if accepts_local_image_mime(&semantic_mime) {
-            parse_files(&semantic_mime, bytes)
+        let semantic_mime = canonical_mime(&stored_mime);
+        let files = if accepts_local_image_mime(semantic_mime) {
+            parse_files(semantic_mime, bytes)
         } else {
             Vec::new()
         };
@@ -75,7 +74,7 @@ impl ResolvedContent {
         let kind = if local_image.is_some() {
             EntryKind::Image
         } else {
-            classify(&semantic_mime, bytes)
+            classify(semantic_mime, bytes)
         };
         Self {
             stored_mime,
@@ -134,18 +133,9 @@ impl ResolvedContent {
 
 pub(super) fn read_bounded(file: &mut File, limit: usize) -> BackendResult<Vec<u8>> {
     let mut bytes = Vec::with_capacity(limit.min(INSPECTION_LIMIT));
-    let mut buffer = [0_u8; 8192];
-    while bytes.len() < limit {
-        let remaining = limit - bytes.len();
-        let chunk_size = remaining.min(buffer.len());
-        let read = file
-            .read(&mut buffer[..chunk_size])
-            .map_err(|_| invalid_entry("Could not read clipboard entry"))?;
-        if read == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&buffer[..read]);
-    }
+    file.take(limit as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid_entry("Could not read clipboard entry"))?;
     Ok(bytes)
 }
 
@@ -185,28 +175,26 @@ fn create_thumbnail_from_image(
     let edge = edge.clamp(32, 1024);
     let path =
         thumbnail_directory()?.join(format!("{}-{}-{edge}.png", summary.id, summary.revision));
-    if let Some((width, height)) = cached_dimensions(&path) {
-        return Ok(EntryThumbnail {
-            entry_id: summary.id.clone(),
-            revision: summary.revision,
-            path: path.to_string_lossy().into_owned(),
-            width,
-            height,
-        });
-    }
-    let image = decode_image(file)?;
-    let thumbnail = image.thumbnail(edge, edge);
-    thumbnail
-        .save_with_format(&path, image::ImageFormat::Png)
-        .map_err(|_| invalid_entry("Clipboard thumbnail could not be written"))?;
-    private_permissions(&path, 0o600)?;
+    let (width, height) = match cached_dimensions(&path) {
+        Some(dimensions) => dimensions,
+        None => write_thumbnail(file, &path, edge)?,
+    };
     Ok(EntryThumbnail {
         entry_id: summary.id.clone(),
         revision: summary.revision,
         path: path.to_string_lossy().into_owned(),
-        width: thumbnail.width(),
-        height: thumbnail.height(),
+        width,
+        height,
     })
+}
+
+fn write_thumbnail(file: &File, path: &Path, edge: u32) -> BackendResult<(u32, u32)> {
+    let thumbnail = decode_image(file)?.thumbnail(edge, edge);
+    thumbnail
+        .save_with_format(path, image::ImageFormat::Png)
+        .map_err(|_| invalid_entry("Clipboard thumbnail could not be written"))?;
+    private_permissions(path, 0o600)?;
+    Ok((thumbnail.width(), thumbnail.height()))
 }
 
 fn cached_dimensions(path: &Path) -> Option<(u32, u32)> {
@@ -363,7 +351,7 @@ fn image_dimensions(bytes: &[u8]) -> Option<ImageMetadata> {
     Some(ImageMetadata { width, height })
 }
 
-pub(super) fn prune_thumbnails(valid: &[(String, u64)]) {
+pub(super) fn prune_thumbnails<'a>(valid: impl Iterator<Item = (&'a str, u64)>) {
     let Ok(root) = cache_root() else {
         return;
     };
@@ -371,12 +359,11 @@ pub(super) fn prune_thumbnails(valid: &[(String, u64)]) {
     prune_thumbnail_directory(&directory, valid);
 }
 
-fn prune_thumbnail_directory(directory: &Path, valid: &[(String, u64)]) {
+fn prune_thumbnail_directory<'a>(directory: &Path, valid: impl Iterator<Item = (&'a str, u64)>) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
     let prefixes: HashSet<String> = valid
-        .iter()
         .map(|(id, revision)| format!("{id}-{revision}-"))
         .collect();
     for entry in entries.flatten() {
@@ -443,6 +430,11 @@ mod tests {
         file.seek(SeekFrom::Start(0)).expect("rewind fixture");
         let bytes = read_bounded(&mut file, 10_000).expect("bounded read");
         assert_eq!(bytes, &content[..10_000]);
+        assert_eq!(file.stream_position().unwrap(), 10_000);
+        assert!(read_bounded(&mut file, 0).unwrap().is_empty());
+        assert_eq!(file.stream_position().unwrap(), 10_000);
+        assert_eq!(read_bounded(&mut file, 20_000).unwrap(), &content[10_000..]);
+        assert!(read_bounded(&mut file, 1).unwrap().is_empty());
     }
 
     #[test]
