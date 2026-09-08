@@ -114,6 +114,28 @@ impl SessionManager {
         view(id.into(), available, "ended")
     }
 
+    #[cfg(test)]
+    pub(crate) async fn test_target(&self) -> String {
+        let id = "targeted".to_owned();
+        self.sessions.lock().await.insert(
+            id.clone(),
+            Session {
+                target: Some(Target {
+                    address: "0x123".into(),
+                    class: "firefox".into(),
+                }),
+                expires: Instant::now() + Duration::from_secs(30),
+                paste_pending: false,
+            },
+        );
+        id
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn test_is_armed(&self, id: &str) -> bool {
+        self.sessions.lock().await[id].paste_pending
+    }
+
     async fn remove_expired(&self) {
         self.sessions
             .lock()
@@ -245,23 +267,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_or_ended_sessions_cannot_trigger_paste() {
+        let manager = SessionManager::default();
+        let id = manager.test_target().await;
+        manager.sessions.lock().await.get_mut(&id).unwrap().expires = std::time::Instant::now();
+        assert!(manager.hidden(&id).await.is_err());
+        assert!(!manager.arm_paste(&id).await);
+        let id = manager.test_target().await;
+        assert!(manager.end(&id).await.target_available);
+        assert!(!manager.arm_paste(&id).await);
+        assert!(manager.hidden(&id).await.is_err());
+    }
+
+    #[tokio::test]
     async fn paste_is_armed_only_after_publication() {
         let manager = SessionManager::default();
         assert!(manager.validate_paste("missing").await.is_err());
         assert!(!manager.arm_paste("missing").await);
 
-        let id = "targeted".to_owned();
-        manager.sessions.lock().await.insert(
-            id.clone(),
-            super::Session {
-                target: Some(super::Target {
-                    address: "0x123".into(),
-                    class: "firefox".into(),
-                }),
-                expires: std::time::Instant::now() + std::time::Duration::from_secs(30),
-                paste_pending: false,
-            },
-        );
+        let id = manager.test_target().await;
         assert!(manager.validate_paste(&id).await.expect("valid target"));
         assert!(!manager.sessions.lock().await[&id].paste_pending);
         assert!(manager.arm_paste(&id).await);

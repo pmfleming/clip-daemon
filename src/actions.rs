@@ -672,8 +672,14 @@ const fn default_query_limit() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::complete_text;
-    use crate::model::{EntryDetails, EntryKind, EntrySummary};
+    use super::{ClipboardService, complete_text};
+    use crate::{
+        backend::ClipboardBackend,
+        fake::FakeBackend,
+        model::{EntryDetails, EntryKind, EntrySummary},
+    };
+    use serde_json::json;
+    use std::sync::Arc;
 
     fn text_details(truncated: bool) -> EntryDetails {
         EntryDetails {
@@ -692,6 +698,94 @@ mod tests {
             image: None,
             preview_truncated: truncated,
         }
+    }
+
+    #[tokio::test]
+    async fn failed_publication_never_arms_a_targeted_paste() {
+        let mut entry = text_details(false);
+        entry.entry.kind = EntryKind::Image;
+        let backend = FakeBackend::with_entries(vec![entry]).with_failed_publication();
+        let service = ClipboardService::new(Arc::new(backend));
+        let session_id = service.sessions.test_target().await;
+        for action in ["paste", "image-as-file"] {
+            let error = service.dispatch_entry("clipboard.entry.action", json!({
+                "entry_id": "entry", "revision": 1, "action": action, "session_id": session_id
+            }), 1024).await.unwrap_err();
+            assert_eq!(error.code, "operation-failed");
+            assert!(!service.sessions.test_is_armed(&session_id).await);
+        }
+    }
+
+    #[tokio::test]
+    async fn edits_report_partial_publication_and_consume_the_lease_once() {
+        let backend =
+            FakeBackend::with_entries(vec![text_details(false)]).with_failed_publication();
+        let service = ClipboardService::new(Arc::new(backend));
+        let begun = service
+            .dispatch_entry(
+                "clipboard.entry.edit.begin",
+                json!({"entry_id":"entry", "revision":1}),
+                1024,
+            )
+            .await
+            .unwrap();
+        let params = json!({"edit_id":begun["edit"]["id"], "value":"new value"});
+        let committed = service
+            .dispatch_entry("clipboard.entry.edit.commit", params.clone(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(committed["entry"]["text"], "new value");
+        assert_eq!(committed["publication"]["published"], false);
+        assert!(
+            !committed["publication"]["message"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            service
+                .dispatch_entry("clipboard.entry.edit.commit", params, 1024)
+                .await
+                .unwrap_err()
+                .code,
+            "edit-error"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_change_invalidates_an_edit_without_overwriting_it() {
+        let backend = Arc::new(FakeBackend::with_entries(vec![text_details(false)]));
+        let service = ClipboardService::new(backend.clone());
+        let begun = service
+            .dispatch_entry(
+                "clipboard.entry.edit.begin",
+                json!({"entry_id":"entry", "revision":1}),
+                1024,
+            )
+            .await
+            .unwrap();
+        backend
+            .replace("entry", 1, "text/plain", b"concurrent value")
+            .await
+            .unwrap();
+        let error = service
+            .dispatch_entry(
+                "clipboard.entry.edit.commit",
+                json!({"edit_id":begun["edit"]["id"], "value":"stale value"}),
+                1024,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "stale-entry");
+        assert_eq!(
+            backend
+                .details("entry", 1024)
+                .await
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("concurrent value")
+        );
     }
 
     #[test]

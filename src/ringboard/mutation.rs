@@ -743,6 +743,49 @@ mod tests {
         assert!(!claim_terminal_event(&operations, "operation-1"));
     }
 
+    #[tokio::test]
+    async fn annotation_cancellation_removes_files_and_emits_one_terminal_event() {
+        use crate::backend::ClipboardBackend;
+        for start_first in [false, true] {
+            let backend = super::RingboardBackend::default();
+            let mut events = backend.operation_events.subscribe();
+            let directory = tempfile::tempdir().unwrap();
+            let staged = directory.path().join("staged.png");
+            fs::write(&staged, b"fixture").unwrap();
+            let (start, ready) = tokio::sync::oneshot::channel();
+            let (started, running) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(super::complete_annotation(
+                "cancel-me".into(),
+                ready,
+                backend.operations.clone(),
+                backend.operation_events.clone(),
+                async move {
+                    let _ = started.send(());
+                    std::future::pending().await
+                },
+            ));
+            backend.operations.lock().unwrap().insert(
+                "cancel-me".into(),
+                OperationTask {
+                    handle,
+                    files: vec![staged.clone()],
+                },
+            );
+            if start_first {
+                start.send(()).unwrap();
+                running.await.unwrap();
+            }
+            assert!(backend.cancel_operation("cancel-me").await.unwrap());
+            assert!(!backend.cancel_operation("cancel-me").await.unwrap());
+            let event = events.try_recv().unwrap();
+            assert_eq!(event.status, "cancelled");
+            assert_eq!(event.id, "cancel-me");
+            assert!(events.try_recv().is_err());
+            assert!(!staged.exists());
+            assert!(backend.operations.lock().unwrap().is_empty());
+        }
+    }
+
     #[test]
     fn screenshot_commands_are_bounded() {
         let mut slow = std::process::Command::new("sleep");

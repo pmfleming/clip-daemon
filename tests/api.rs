@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use clip_daemon::{
     api::ApiService,
+    backend::{ClipboardBackend, HistoryQuery},
     fake::FakeBackend,
     model::{EntryDetails, EntryKind, EntrySummary},
 };
@@ -29,6 +30,59 @@ fn entry(id: &str, kind: EntryKind, text: Option<&str>) -> EntryDetails {
         image: None,
         preview_truncated: false,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_queries_observe_consistent_replacements_and_only_one_revision_wins() {
+    let backend = Arc::new(FakeBackend::with_entries(vec![entry(
+        "one",
+        EntryKind::Text,
+        Some("seed"),
+    )]));
+    let barrier = Arc::new(tokio::sync::Barrier::new(9));
+    let mut writers = Vec::new();
+    for index in 0..8 {
+        let backend = Arc::clone(&backend);
+        let barrier = Arc::clone(&barrier);
+        writers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            backend
+                .replace(
+                    "one",
+                    1,
+                    "text/plain",
+                    format!("replacement-{index}").as_bytes(),
+                )
+                .await
+        }));
+    }
+    barrier.wait().await;
+    for _ in 0..100 {
+        let page = backend
+            .query(HistoryQuery {
+                query: String::new(),
+                generation: 1,
+                offset: 0,
+                limit: 100,
+                collapse_self_echoes: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        let summary = &page.entries[0];
+        assert_eq!(summary.byte_size, summary.preview.len() as u64);
+        assert!((1..=2).contains(&summary.revision));
+        tokio::task::yield_now().await;
+    }
+    let mut succeeded = 0;
+    for writer in writers {
+        match writer.await.unwrap() {
+            Ok(_) => succeeded += 1,
+            Err(error) => assert_eq!(error.kind, clip_daemon::backend::BackendErrorKind::Stale),
+        }
+    }
+    assert_eq!(succeeded, 1);
+    assert_eq!(backend.revision("one").await.unwrap(), 2);
 }
 
 #[tokio::test]

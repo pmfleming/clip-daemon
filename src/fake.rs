@@ -22,6 +22,8 @@ use crate::{
 pub struct FakeBackend {
     entries: Arc<RwLock<Vec<EntryDetails>>>,
     operation_events: broadcast::Sender<OperationResult>,
+    #[cfg(test)]
+    fail_publication: bool,
 }
 
 impl Default for FakeBackend {
@@ -30,6 +32,8 @@ impl Default for FakeBackend {
         Self {
             entries: Arc::new(RwLock::new(Vec::new())),
             operation_events,
+            #[cfg(test)]
+            fail_publication: false,
         }
     }
 }
@@ -42,6 +46,12 @@ impl FakeBackend {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_failed_publication(mut self) -> Self {
+        self.fail_publication = true;
+        self
+    }
+
     fn entries(&self) -> BackendResult<std::sync::RwLockReadGuard<'_, Vec<EntryDetails>>> {
         self.entries.read().map_err(fake_unavailable)
     }
@@ -49,14 +59,16 @@ impl FakeBackend {
     fn mutate_entry<T>(
         &self,
         opaque_id: &str,
+        expected_revision: Option<u64>,
         mutate: impl FnOnce(&mut EntryDetails) -> T,
     ) -> BackendResult<T> {
         let mut entries = self.entries.write().map_err(fake_unavailable)?;
-        entries
+        let entry = entries
             .iter_mut()
             .find(|item| item.entry.id == opaque_id)
-            .map(mutate)
-            .ok_or_else(unknown_entry)
+            .ok_or_else(unknown_entry)?;
+        check_revision(expected_revision, entry.entry.revision)?;
+        Ok(mutate(entry))
     }
 
     fn with_entry<T>(
@@ -73,10 +85,7 @@ impl FakeBackend {
 
     fn validate_revision(&self, opaque_id: &str, expected: Option<u64>) -> BackendResult<()> {
         let actual = self.with_entry(opaque_id, |item| item.entry.revision)?;
-        if expected.is_some_and(|revision| revision != actual) {
-            return Err(BackendError::stale("Clipboard entry revision is stale"));
-        }
-        Ok(())
+        check_revision(expected, actual)
     }
 
     fn remove(&self, opaque_id: &str) -> BackendResult<OperationResult> {
@@ -95,7 +104,7 @@ impl FakeBackend {
     }
 
     fn favorite(&self, opaque_id: &str, favorite: bool) -> BackendResult<OperationResult> {
-        self.mutate_entry(opaque_id, |entry| entry.entry.favorite = favorite)?;
+        self.mutate_entry(opaque_id, None, |entry| entry.entry.favorite = favorite)?;
         let action = if favorite { "favorite" } else { "unfavorite" };
         completed(action, "Fake favorite updated")
     }
@@ -221,6 +230,18 @@ impl ClipboardBackend for FakeBackend {
         if mutation.require_revision(expected_revision)? {
             self.validate_revision(opaque_id, expected_revision)?;
         }
+        #[cfg(test)]
+        if self.fail_publication
+            && matches!(
+                mutation,
+                BackendMutation::Restore { .. } | BackendMutation::ImageAsFile { .. }
+            )
+        {
+            return Err(BackendError::new(
+                crate::backend::BackendErrorKind::OperationFailed,
+                "Injected publication failure",
+            ));
+        }
         match mutation {
             BackendMutation::Restore { .. } => completed("copy", "Fake operation completed"),
             BackendMutation::ImageAsFile { .. } => {
@@ -235,17 +256,19 @@ impl ClipboardBackend for FakeBackend {
     }
 
     async fn remove_many(&self, targets: &[EntryTarget]) -> BackendResult<OperationResult> {
+        let mut entries = self.entries.write().map_err(fake_unavailable)?;
         for target in targets {
-            self.validate_revision(&target.opaque_id, Some(target.expected_revision))?;
+            let entry = entries
+                .iter()
+                .find(|item| item.entry.id == target.opaque_id)
+                .ok_or_else(unknown_entry)?;
+            check_revision(Some(target.expected_revision), entry.entry.revision)?;
         }
         let ids = targets
             .iter()
             .map(|target| target.opaque_id.as_str())
             .collect::<HashSet<_>>();
-        self.entries
-            .write()
-            .map_err(fake_unavailable)?
-            .retain(|entry| !ids.contains(entry.entry.id.as_str()));
+        entries.retain(|entry| !ids.contains(entry.entry.id.as_str()));
         let count = targets.len();
         completed(
             "delete-many",
@@ -260,8 +283,7 @@ impl ClipboardBackend for FakeBackend {
         mime: &str,
         bytes: &[u8],
     ) -> BackendResult<ReplacementResult> {
-        self.validate_revision(opaque_id, Some(expected_revision))?;
-        let entry = self.mutate_entry(opaque_id, |details| {
+        let entry = self.mutate_entry(opaque_id, Some(expected_revision), |details| {
             details.entry.revision = details.entry.revision.saturating_add(1);
             details.entry.kind = classify(mime, bytes);
             details.entry.mime = mime.into();
@@ -270,6 +292,14 @@ impl ClipboardBackend for FakeBackend {
             details.text = std::str::from_utf8(bytes).ok().map(str::to_owned);
             details.clone()
         })?;
+        #[cfg(test)]
+        if self.fail_publication {
+            return Ok(ReplacementResult {
+                entry,
+                selection_published: false,
+                publication_message: "Replacement committed, but publication failed".into(),
+            });
+        }
         Ok(ReplacementResult {
             entry,
             selection_published: true,
@@ -280,6 +310,13 @@ impl ClipboardBackend for FakeBackend {
     async fn cancel_operation(&self, _operation_id: &str) -> BackendResult<bool> {
         Ok(false)
     }
+}
+
+fn check_revision(expected: Option<u64>, actual: u64) -> BackendResult<()> {
+    if expected.is_some_and(|revision| revision != actual) {
+        return Err(BackendError::stale("Clipboard entry revision is stale"));
+    }
+    Ok(())
 }
 
 fn completed(action: &str, message: &str) -> BackendResult<OperationResult> {
