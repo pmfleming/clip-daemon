@@ -34,6 +34,8 @@ use crate::{
 };
 
 mod artifacts;
+#[cfg(all(test, feature = "benchmarks"))]
+mod benchmarks;
 mod content;
 mod mutation;
 
