@@ -24,7 +24,7 @@ pub struct WaylandSelectionPublisher;
 
 impl SelectionPublisher for WaylandSelectionPublisher {
     fn publish(&self, mime: &str, bytes: Vec<u8>) -> BackendResult<()> {
-        clipboard_options(true)
+        clipboard_options(!supports_text_aliases(mime, &bytes))
             .copy(
                 Source::Bytes(bytes.into_boxed_slice()),
                 MimeType::Specific(mime.to_owned()),
@@ -62,6 +62,12 @@ impl SelectionPublisher for WaylandSelectionPublisher {
             ])
             .map_err(|error| selection_error(error.to_string()))
     }
+}
+
+// Preserve the exact offer, but make UTF-8 plain text consumable by GTK and
+// other clients that request UTF8_STRING or text/plain;charset=utf-8.
+fn supports_text_aliases(mime: &str, bytes: &[u8]) -> bool {
+    matches!(mime, "text/plain" | "text/plain;charset=utf-8") && std::str::from_utf8(bytes).is_ok()
 }
 
 fn clipboard_options(omit_text_aliases: bool) -> Options {
@@ -281,6 +287,22 @@ mod tests {
             values[4].1,
             b"file:///tmp/one.txt\r\nfile:///tmp/two.txt\r\n"
         );
+    }
+
+    #[test]
+    fn text_aliases_require_utf8_plain_text() {
+        for mime in ["text/plain", "text/plain;charset=utf-8"] {
+            assert!(super::supports_text_aliases(mime, b"plain text"));
+            assert!(!super::supports_text_aliases(mime, &[0xff]));
+        }
+        for mime in [
+            "text/html",
+            "text/uri-list",
+            "text/plain;charset=iso-8859-1",
+            "image/png",
+        ] {
+            assert!(!super::supports_text_aliases(mime, b"plain text"));
+        }
     }
 
     #[test]
