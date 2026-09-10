@@ -43,7 +43,7 @@ Phase 3 adds copy and compositor-aware paste sessions, terminal/GUI shortcuts af
 
 `publish` reads bounded content from stdin and sends it over D-Bus to the running daemon. The daemon enforces the configured entry-size limit, validates the MIME type, and remains the Wayland selection owner. Valid UTF-8 plain text retains its exact offer and also exposes standard text aliases for GTK and other desktop consumers; binary/image/file-list offers do not gain text aliases. This supports short-lived producers without `wl-copy`; for example, standalone Satty can use `copy-command = "clip-daemon publish --mime image/png"`.
 
-The default image-editor adapter uses Satty. The annotation pipeline itself is editor-neutral: an editor receives private `{input}` and `{output}` paths, blocks until it finishes, and either writes a PNG to `{output}` or leaves it absent to cancel. A different editor can be selected with a shell-free JSON argv template:
+The default image-editor adapter uses Satty. The Nix package and development shell use a patched Satty (`.#imageEditor`) with toolbars above and below the canvas rather than overlaid on the image, so fit-to-window keeps the entire image visible. This changes only the editor layout, not the saved image dimensions. The annotation pipeline itself is editor-neutral: an editor receives private `{input}` and `{output}` paths, blocks until it finishes, and either writes a PNG to `{output}` or leaves it absent to cancel. A different editor can be selected with a shell-free JSON argv template:
 
 ```sh
 export CLIP_DAEMON_IMAGE_EDITOR_COMMAND='["image-tool","--input","{input}","--output","{output}"]'

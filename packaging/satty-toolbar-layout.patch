@@ -1,0 +1,22 @@
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -217,12 +217,14 @@ impl Component for App {
+                 sender.input(AppInput::Realized);
+             },
+ 
+-            gtk::Overlay {
+-                add_overlay = model.tools_toolbar.widget(),
+-
+-                add_overlay = model.style_toolbar.widget(),
++            // Reserve toolbar space so fit-to-window never hides image pixels
++            // behind the controls. Hidden toolbars release their allocation.
++            gtk::Box {
++                set_orientation: gtk::Orientation::Vertical,
+ 
++                model.tools_toolbar.widget(),
+                 model.sketch_board.widget(),
++                model.style_toolbar.widget(),
+             }
+         }
+     }

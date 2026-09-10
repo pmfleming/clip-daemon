@@ -15,6 +15,9 @@
     {
       packages = forAllSystems (system: pkgs:
         let
+          satty = pkgs.satty.overrideAttrs (old: {
+            patches = (old.patches or [ ]) ++ [ ./packaging/satty-toolbar-layout.patch ];
+          });
           clipDaemon = pkgs.rustPlatform.buildRustPackage {
             pname = "clip-daemon";
             version = "0.1.0";
@@ -42,7 +45,7 @@
             '';
             postFixup = ''
               wrapProgram $out/bin/clip-daemon \
-                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.grim pkgs.hyprland pkgs.libnotify pkgs.satty pkgs.systemd pkgs.xdg-utils ]}
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.grim pkgs.hyprland pkgs.libnotify satty pkgs.systemd pkgs.xdg-utils ]}
             '';
             meta = {
               description = "Wayland clipboard policy and clip-api daemon for Shelllist";
@@ -52,6 +55,7 @@
           };
         in {
           default = clipDaemon;
+          imageEditor = satty;
           ringboardQualification = pkgs.writeShellApplication {
             name = "clip-daemon-ringboard-qualification";
             runtimeInputs = [ pkgs.jq pkgs.ringboard-wayland pkgs.wayland-utils ];
@@ -70,7 +74,7 @@
 
       devShells = forAllSystems (system: pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo cargo-audit cargo-machete cargo-llvm-cov clippy dbus gobject-introspection grim gtk3 hyprland jq just llvmPackages.llvm pkg-config (python3.withPackages (ps: [ ps.pygobject3 ])) ringboard-wayland rust-analyzer rustc rustfmt satty wayland-utils wl-clipboard ];
+          packages = with pkgs; [ cargo cargo-audit cargo-machete cargo-llvm-cov clippy dbus gobject-introspection grim gtk3 hyprland jq just llvmPackages.llvm pkg-config (python3.withPackages (ps: [ ps.pygobject3 ])) ringboard-wayland rust-analyzer rustc rustfmt self.packages.${system}.imageEditor wayland-utils wl-clipboard ];
           GI_TYPELIB_PATH = pkgs.lib.makeSearchPath "lib/girepository-1.0" [ pkgs.gtk3 pkgs.glib pkgs.pango pkgs.gdk-pixbuf pkgs.at-spi2-core pkgs.harfbuzz ];
           LLVM_COV = "${pkgs.llvmPackages.llvm}/bin/llvm-cov";
           LLVM_PROFDATA = "${pkgs.llvmPackages.llvm}/bin/llvm-profdata";
