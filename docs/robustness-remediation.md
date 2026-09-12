@@ -29,3 +29,14 @@ Validation: full main/favorite rings retain every row when editing their oldest
 and newest entries. The original ring order is preserved. A stock-server test
 verifies rejection leaves the original untouched. Rust tests and strict Clippy
 pass. No production Ringboard service was replaced or restarted.
+
+## 3 — complete generated-file references
+
+Ownership references are collected independently of echo matching and previews.
+Every URI line is inspected, including those after the preview prefix and the
+100-file details limit. Multiple references are retained. Oversized/uninspectable
+lines conservatively retain registered files instead of authorizing deletion.
+
+Validation: unit coverage and a real-backend regression retain two referenced
+files beyond 100 long URI lines while deleting only a third unreferenced file.
+Rust tests and strict Clippy pass.

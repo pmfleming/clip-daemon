@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 
 BINARY = Path(__file__).resolve().parents[1] / "target/debug/clip-daemon"
 BUS = "org.laufan.ClipDaemon"
@@ -72,6 +73,12 @@ class Desktop:
         self.children.append(child)
         return child
 
+    def restart_daemon(self):
+        self.daemon.terminate()
+        self.daemon.wait(timeout=5)
+        self.daemon = self.start(str(BINARY), "daemon")
+        wait_for(lambda: BUS.encode() in run("busctl", "--user", "list", "--acquired"))
+
     def close(self):
         for child in reversed(self.children):
             child.terminate()
@@ -128,7 +135,26 @@ def legacy_replacement(_desktop):
     assert [e["preview"] for e in history()["entries"]] == ["original"]
 
 
-CASES = {"wraparound": wraparound, "replacement": replacement, "legacy-replacement": legacy_replacement}
+def artifact_references(desktop):
+    directory = Path(os.environ["HOME"]) / "Pictures/Screenshots/clipboard-history"
+    directory.mkdir(parents=True)
+    paths = [directory / f"clipboard-{uuid.uuid4()}.png" for _ in range(3)]
+    for path in paths:
+        path.write_bytes(b"registered fixture")
+    manifest = Path(os.environ["XDG_STATE_HOME"]) / "clip-daemon/generated-files.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps({"records": [{"path": str(path), "source_entry_id": "source",
+        "image_identity": "fixture", "created_at": 0} for path in paths]}))
+    # Neither preview truncation nor the 100-file UI limit may lose references.
+    prefix = "file:///missing/" + "x" * 700 + "\r\n"
+    add(prefix * 101 + "\r\n".join(path.as_uri() for path in paths[:2]) + "\r\n", mime="text/uri-list")
+    desktop.restart_daemon()
+    history()
+    assert [path.exists() for path in paths] == [True, True, False]
+
+
+CASES = {"wraparound": wraparound, "replacement": replacement,
+         "legacy-replacement": legacy_replacement, "artifact-references": artifact_references}
 
 
 def isolated(case):

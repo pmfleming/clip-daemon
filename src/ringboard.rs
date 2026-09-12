@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{Read, Seek, SeekFrom},
+    io::{BufReader, Read, Seek, SeekFrom},
     os::unix::fs::MetadataExt,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
@@ -73,7 +73,7 @@ struct SummaryCache {
 struct ResolvedEntry {
     summary: EntrySummary,
     proof: [u8; 32],
-    generated_path: Option<PathBuf>,
+    generated_paths: HashSet<PathBuf>,
     echo_source_id: Option<String>,
 }
 
@@ -192,7 +192,7 @@ impl CachedProjection {
             artifact_references: self
                 .candidates
                 .iter()
-                .filter_map(|candidate| candidate.resolved.generated_path.clone())
+                .flat_map(|candidate| candidate.resolved.generated_paths.iter().cloned())
                 .collect(),
             complete: self.complete,
             ..QueryProjection::default()
@@ -348,23 +348,21 @@ impl RingboardBackend {
         let content = ResolvedContent::resolve(&stored_mime, &bytes, MAX_WAYLAND_SELECTION_BYTES);
         let fingerprint = entry_fingerprint(entry.id(), byte_size, content.mime(), &content_digest);
         let id = opaque_id(&fingerprint);
-        let (artifact, inline_echo_source) = {
-            let registry = self.artifacts.lock().map_err(|_| lock_error())?;
-            let artifact = content
+        let (generated_paths, echo_source_id, inline_echo_source) = {
+            let registry = self.artifact_registry()?;
+            loaded
+                .seek(SeekFrom::Start(0))
+                .map_err(|_| invalid_entry("Could not inspect artifact references"))?;
+            let generated_paths = registry.references_in(BufReader::new(&mut *loaded))?;
+            let echo_source_id = content
                 .local_image()
-                .and_then(|source| registry.match_local_image(source))
-                .or_else(|| {
-                    registry.match_file_uris(content.files().iter().map(|file| file.uri.as_str()))
-                });
+                .and_then(|source| registry.match_local_image(source));
             let inline_echo_source =
                 matches!(content.image(), Some(content::ResolvedImage::Inline { .. }))
                     .then(|| registry.match_inline_echo(content.mime(), &bytes, &id))
                     .flatten();
-            (artifact, inline_echo_source)
+            (generated_paths, echo_source_id, inline_echo_source)
         };
-        let (generated_path, echo_source_id) = artifact
-            .map(|artifact| (Some(artifact.path), artifact.source_entry_id))
-            .unwrap_or_default();
         Ok(ResolvedEntry {
             summary: EntrySummary {
                 revision: entry_revision(&fingerprint),
@@ -377,7 +375,7 @@ impl RingboardBackend {
                 preview: bounded_preview(&bytes, INSPECTION_LIMIT),
             },
             proof: ipc::content_proof(&content_digest, &stored_mime),
-            generated_path,
+            generated_paths,
             echo_source_id: echo_source_id.or(inline_echo_source),
         })
     }
@@ -411,9 +409,7 @@ impl RingboardBackend {
         let (database, mut reader) = Self::open()?;
         let mut references = HashSet::new();
         for entry in database.favorites().chain(database.main()) {
-            if let Some(path) = self.summarize(entry, &mut reader)?.generated_path {
-                references.insert(path);
-            }
+            references.extend(self.summarize(entry, &mut reader)?.generated_paths);
         }
         Ok(references)
     }
@@ -1070,7 +1066,10 @@ mod tests {
                     preview: "image".into(),
                 },
                 proof: [0; 32],
-                generated_path: generated.then(|| "/generated/image.png".into()),
+                generated_paths: generated
+                    .then(|| "/generated/image.png".into())
+                    .into_iter()
+                    .collect(),
                 echo_source_id: generated.then(|| "source".into()),
             },
         }

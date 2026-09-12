@@ -36,7 +36,7 @@ fn fixture(size: usize) -> CachedProjection {
                         ),
                     },
                     proof: [0; 32],
-                    generated_path: None,
+                    generated_paths: Default::default(),
                     echo_source_id: None,
                 },
             })

@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     fs::OpenOptions,
-    io::Write,
+    io::{BufRead, Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -16,11 +16,6 @@ use uuid::Uuid;
 use crate::backend::{BackendError, BackendErrorKind, BackendResult, MAX_WAYLAND_SELECTION_BYTES};
 
 use super::content::{LocalImageSource, image_identity};
-
-pub(super) struct ArtifactMatch {
-    pub path: PathBuf,
-    pub source_entry_id: Option<String>,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ArtifactRecord {
@@ -176,27 +171,46 @@ impl ArtifactRegistry {
         (record.source_entry_id != entry_id).then(|| record.source_entry_id.clone())
     }
 
-    pub fn match_local_image(&self, source: &LocalImageSource) -> Option<ArtifactMatch> {
+    pub fn match_local_image(&self, source: &LocalImageSource) -> Option<String> {
         let record = self.records.get(&source.path)?;
-        let source_entry_id = read_registered_image(source)
+        read_registered_image(source)
             .filter(|identity| identity == &record.image_identity)
-            .map(|_| record.source_entry_id.clone());
-        Some(ArtifactMatch {
-            path: source.path.clone(),
-            source_entry_id,
-        })
+            .map(|_| record.source_entry_id.clone())
     }
 
-    pub fn match_file_uris<'a>(
-        &self,
-        uris: impl Iterator<Item = &'a str>,
-    ) -> Option<ArtifactMatch> {
-        uris.filter_map(|uri| Url::parse(uri).ok()?.to_file_path().ok())
-            .find(|path| self.records.contains_key(path))
-            .map(|path| ArtifactMatch {
-                path,
-                source_entry_id: None,
-            })
+    /// Ownership references are not UI previews: inspect every URI, not only
+    /// the first match, first 100 files, or first preview-sized prefix.
+    pub fn references_in(&self, mut source: impl BufRead) -> BackendResult<HashSet<PathBuf>> {
+        if self.records.is_empty() {
+            return Ok(HashSet::new());
+        }
+        const MAX_LINE_BYTES: u64 = 32 * 1024;
+        let mut references = HashSet::new();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let length = source
+                .by_ref()
+                .take(MAX_LINE_BYTES)
+                .read_until(b'\n', &mut line)
+                .map_err(artifact_error)?;
+            if length == 0 {
+                break;
+            }
+            if length as u64 == MAX_LINE_BYTES && !line.ends_with(b"\n") {
+                // An uninspectable line must never authorize deletion. Keep all
+                // registered files until the ambiguous history entry is gone.
+                return Ok(self.records.keys().cloned().collect());
+            }
+            let path = std::str::from_utf8(&line)
+                .ok()
+                .and_then(|line| Url::parse(line.trim()).ok())
+                .and_then(|uri| uri.to_file_path().ok());
+            if let Some(path) = path.filter(|path| self.records.contains_key(path)) {
+                references.insert(path);
+            }
+        }
+        Ok(references)
     }
 
     pub fn reconcile(&mut self, referenced: &HashSet<PathBuf>) -> BackendResult<usize> {
@@ -364,6 +378,39 @@ mod tests {
             "large-echo",
         );
         assert_eq!(matched, Some("large-replacement".into()));
+    }
+
+    #[test]
+    fn all_uri_references_are_retained_beyond_preview_and_file_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry = ArtifactRegistry::load(Some(directory.path().into()), None);
+        let paths: Vec<_> = (0..3)
+            .map(|_| {
+                directory
+                    .path()
+                    .join(format!("clipboard-{}.png", uuid::Uuid::new_v4()))
+            })
+            .collect();
+        for path in &paths {
+            std::fs::write(path, b"image").unwrap();
+            registry
+                .register(path, "source", "image/png", b"image")
+                .unwrap();
+            registry.records.get_mut(path).unwrap().created_at = 0;
+        }
+        registry.clear_active_selection();
+        let mut payload = "# ignored comment\n".repeat(5000);
+        for path in &paths[..2] {
+            payload.push_str(url::Url::from_file_path(path).unwrap().as_str());
+            payload.push_str("\r\n");
+        }
+        let referenced = registry.references_in(payload.as_bytes()).unwrap();
+        assert_eq!(referenced.len(), 2);
+        assert_eq!(registry.reconcile(&referenced).unwrap(), 1);
+        assert!(paths[0].exists() && paths[1].exists());
+        assert!(!paths[2].exists());
+        let uninspectable = vec![b'x'; 40_000];
+        assert_eq!(registry.references_in(&uninspectable[..]).unwrap().len(), 2);
     }
 
     #[test]
