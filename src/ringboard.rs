@@ -14,7 +14,7 @@ use tokio::{
 };
 
 use async_trait::async_trait;
-use clipboard_history_client_sdk::{DatabaseReader, Entry, EntryReader, Kind, LoadedEntry};
+use clipboard_history_client_sdk::{DatabaseReader, Entry, EntryReader, LoadedEntry};
 use clipboard_history_core::{dirs::data_dir, protocol::RingKind};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -65,19 +65,7 @@ struct RevisionState {
 #[derive(Default)]
 struct SummaryCache {
     token: Option<u64>,
-    entries: HashMap<u64, CachedSummary>,
     projection: Option<CachedProjection>,
-}
-
-struct CachedSummary {
-    signature: EntrySignature,
-    resolved: Option<ResolvedEntry>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct EntrySignature {
-    kind: Kind,
-    file: Option<RingFileState>,
 }
 
 #[derive(Clone)]
@@ -162,7 +150,6 @@ impl QueryProjection {
 impl CachedProjection {
     fn load(
         backend: &RingboardBackend,
-        cache: &mut SummaryCache,
         database: &DatabaseReader,
         reader: &mut EntryReader,
     ) -> BackendResult<Self> {
@@ -173,7 +160,7 @@ impl CachedProjection {
             complete: true,
         };
         for entry in database.favorites().rev().chain(main) {
-            match backend.cached_summary(cache, entry, reader)? {
+            match backend.read_summary(entry, reader)? {
                 Some(resolved) => projection.candidates.push(QueryCandidate {
                     raw_id: entry.id(),
                     resolved,
@@ -312,12 +299,9 @@ impl RingboardBackend {
         let entry = database
             .get_raw(binding.raw_id)
             .map_err(|_| BackendError::stale("Clipboard entry is stale or missing"))?;
-        let summary = {
-            let mut cache = self.summaries.lock().map_err(|_| lock_error())?;
-            self.cached_summary(&mut cache, entry, &mut reader)?
-                .ok_or_else(|| invalid_entry("Clipboard entry is unreadable"))?
-                .summary
-        };
+        // Storage slots (including bucket index and length) can be reused.
+        // Never authorize an action against a cached content fingerprint.
+        let summary = self.summarize(entry, &mut reader)?.summary;
         self.verify_selection(opaque_id, expected_revision, binding, &summary)?;
         Ok((entry, reader, summary))
     }
@@ -386,18 +370,11 @@ impl RingboardBackend {
         })
     }
 
-    fn cached_summary(
+    fn read_summary(
         &self,
-        cache: &mut SummaryCache,
         entry: Entry,
         reader: &mut EntryReader,
     ) -> BackendResult<Option<ResolvedEntry>> {
-        let signature = entry_signature(entry, reader)?;
-        if let Some(cached) = cache.entries.get(&entry.id())
-            && cached.signature == signature
-        {
-            return Ok(cached.resolved.clone());
-        }
         let summary = match catch_unwind(AssertUnwindSafe(|| self.summarize(entry, reader))) {
             Ok(Ok(summary)) => Some(summary),
             Ok(Err(error))
@@ -415,13 +392,6 @@ impl RingboardBackend {
                 None
             }
         };
-        cache.entries.insert(
-            entry.id(),
-            CachedSummary {
-                signature,
-                resolved: summary.clone(),
-            },
-        );
         Ok(summary)
     }
 
@@ -576,7 +546,6 @@ impl RingboardBackend {
         self.ids.lock().map_err(|_| lock_error())?.clear();
         let mut cache = self.summaries.lock().map_err(|_| lock_error())?;
         cache.token = None;
-        cache.entries.clear();
         cache.projection = None;
         Ok(())
     }
@@ -645,9 +614,18 @@ fn collect_query_projection(
     if let Some(projection) = &cache.projection {
         return Ok(projection.project(query));
     }
-    let projection = CachedProjection::load(backend, &mut cache, database, reader)?;
+    let projection = CachedProjection::load(backend, database, reader)?;
+    if history_token(database)? != token {
+        cache.projection = None;
+        return Err(BackendError::stale(
+            "History changed while it was being read; retry the query",
+        ));
+    }
     let result = projection.project(query);
-    cache.projection = Some(projection);
+    // Retry unreadable entries on the next query rather than caching an outage.
+    if projection.complete {
+        cache.projection = Some(projection);
+    }
     Ok(result)
 }
 
@@ -954,17 +932,6 @@ fn load_entry(
         .metadata()
         .map_err(|_| invalid_entry("Could not read clipboard entry metadata"))?;
     Ok((loaded, metadata))
-}
-
-fn entry_signature(entry: Entry, reader: &mut EntryReader) -> BackendResult<EntrySignature> {
-    let kind = entry.kind();
-    let file = if kind == Kind::File {
-        let (_, metadata) = load_entry(entry, reader)?;
-        Some(RingFileState::from_metadata(&metadata))
-    } else {
-        None
-    };
-    Ok(EntrySignature { kind, file })
 }
 
 fn encode_file_uris(paths: &[PathBuf]) -> BackendResult<Vec<u8>> {
