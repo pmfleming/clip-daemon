@@ -122,6 +122,7 @@ async fn emit_event(
 
 pub async fn run(backend: Arc<dyn ClipboardBackend>) -> Result<()> {
     let api = Arc::new(ApiService::new(backend));
+    api.initialize().await;
     let event_revision = Arc::new(AtomicU64::new(0));
     let (history_events, _) = tokio::sync::broadcast::channel(32);
     tokio::spawn(subscription::observe_history(

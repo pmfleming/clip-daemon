@@ -6,7 +6,7 @@ use std::{
     num::NonZeroU32,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    sync::Mutex as StdMutex,
+    sync::{Arc, Mutex as StdMutex},
 };
 
 use clipboard_history_client_sdk::config;
@@ -14,12 +14,24 @@ use clipboard_history_core::dirs::data_dir;
 use serde::{Deserialize, Serialize};
 use shelllist_daemon_core::{XdgRoot, resolve_xdg_path};
 use tokio::{
-    process::Command,
     sync::Mutex as AsyncMutex,
     task::spawn_blocking,
     time::{Duration, sleep},
 };
 use uuid::Uuid;
+
+mod services;
+use services::{ServiceControl, Systemd};
+
+#[derive(Debug, Serialize)]
+pub struct CaptureState {
+    pub desired_paused: bool,
+    pub desired_private_mode: bool,
+    pub paused: Option<bool>,
+    pub private_mode: bool,
+    pub verified: bool,
+    pub error: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -76,11 +88,14 @@ pub struct SettingsManager {
     state: StdMutex<SettingsState>,
     path: Option<PathBuf>,
     transaction: AsyncMutex<()>,
+    services: Arc<dyn ServiceControl>,
 }
 
 struct SettingsState {
     value: ClipboardSettings,
     load_error: Option<String>,
+    capture_verified: bool,
+    capture_error: Option<String>,
 }
 
 impl Default for SettingsManager {
@@ -91,9 +106,15 @@ impl Default for SettingsManager {
             Err(error) => (ClipboardSettings::default(), Some(error)),
         };
         Self {
-            state: StdMutex::new(SettingsState { value, load_error }),
+            state: StdMutex::new(SettingsState {
+                value,
+                load_error,
+                capture_verified: false,
+                capture_error: Some("Capture state has not been verified".into()),
+            }),
             path,
             transaction: AsyncMutex::new(()),
+            services: Arc::new(Systemd),
         }
     }
 }
@@ -103,7 +124,24 @@ const SETTINGS_SAVED: &str = "Clipboard settings were saved";
 const CAPTURE_SAVED: &str = "Capture preference was saved";
 
 impl SettingsManager {
+    /// Legacy booleans never assert privacy unless service state is verified.
     pub fn get(&self) -> Result<ClipboardSettings, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "Clipboard settings are unavailable")?;
+        if let Some(error) = &state.load_error {
+            return Err(error.clone());
+        }
+        let mut settings = state.value.clone();
+        if !state.capture_verified {
+            settings.capture_paused = false;
+            settings.private_mode = false;
+        }
+        Ok(settings)
+    }
+
+    fn preferences(&self) -> Result<ClipboardSettings, String> {
         let state = self
             .state
             .lock()
@@ -116,21 +154,26 @@ impl SettingsManager {
 
     pub async fn update(&self, update: SettingsUpdate) -> Result<ClipboardSettings, String> {
         let _transaction = self.transaction.lock().await;
-        let current = self.get()?;
+        let current = self.preferences()?;
         let updated = update.apply(&current)?;
         if updated == current {
-            return Ok(current);
+            return self.get();
         }
         let restart_required = retention_changed(&current, &updated);
         let updated = self
             .save(updated, persist_config_pair, SETTINGS_SAVED)
             .await?;
         if restart_required {
-            restart_capture(&updated)
-                .await
+            let _ = self.record_capture(Err("Capture restart is not yet verified".into()));
+            let result = async {
+                restart_capture(self.services.as_ref(), &updated).await?;
+                self.verify_capture(updated.capture_paused).await
+            }
+            .await;
+            self.record_capture(result)
                 .map_err(|error| format!("{SETTINGS_SAVED}, but {error}"))?;
         }
-        Ok(updated)
+        self.get()
     }
 
     async fn save(
@@ -155,6 +198,11 @@ impl SettingsManager {
             .state
             .lock()
             .map_err(|_| "Clipboard settings are unavailable")?;
+        if state.value.capture_paused != value.capture_paused
+            || state.value.private_mode != value.private_mode
+        {
+            state.capture_verified = false;
+        }
         state.value = value;
         state.load_error = None;
         Ok(state.value.clone())
@@ -166,19 +214,76 @@ impl SettingsManager {
         private: bool,
     ) -> Result<ClipboardSettings, String> {
         let _transaction = self.transaction.lock().await;
-        let mut updated = self.get()?;
-        let private_mode = paused && private;
-        if (updated.capture_paused, updated.private_mode) == (paused, private_mode) {
-            return Ok(updated);
-        }
+        let mut updated = self.preferences()?;
         updated.capture_paused = paused;
-        updated.private_mode = private_mode;
+        updated.private_mode = paused && private;
         let updated = self.save(updated, persist, CAPTURE_SAVED).await?;
-        let action = if paused { "stop" } else { "start" };
-        control_units(action, &["ringboard-wayland.service"])
-            .await
-            .map_err(|error| format!("{CAPTURE_SAVED}, but {error}"))?;
-        Ok(updated)
+        // Idempotent control is intentional: a prior failure or external restart
+        // must never turn a repeated request into a false success.
+        self.apply_capture(&updated).await?;
+        self.get()
+    }
+
+    pub fn capture_state(&self) -> Result<CaptureState, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "Capture state is unavailable")?;
+        Ok(CaptureState {
+            desired_paused: state.value.capture_paused,
+            desired_private_mode: state.value.private_mode,
+            paused: state.capture_verified.then_some(state.value.capture_paused),
+            private_mode: state.capture_verified && state.value.private_mode,
+            verified: state.capture_verified,
+            error: state.capture_error.clone(),
+        })
+    }
+
+    fn record_capture(&self, result: Result<(), String>) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Capture state is unavailable")?;
+        state.capture_verified = result.is_ok();
+        state.capture_error = result.as_ref().err().cloned();
+        result
+    }
+
+    async fn verify_capture(&self, desired: bool) -> Result<(), String> {
+        let actual = self.services.capture_paused().await?;
+        (actual == desired)
+            .then_some(())
+            .ok_or_else(|| "Capture service does not match the saved preference".into())
+    }
+
+    async fn apply_capture(&self, updated: &ClipboardSettings) -> Result<(), String> {
+        let _ = self.record_capture(Err("Capture transition is not yet verified".into()));
+        let action = if updated.capture_paused {
+            "stop"
+        } else {
+            "start"
+        };
+        let result = async {
+            self.services
+                .control(action, &["ringboard-wayland.service"])
+                .await?;
+            self.verify_capture(updated.capture_paused).await
+        }
+        .await;
+        self.record_capture(result)
+    }
+
+    pub async fn reconcile_capture(&self) -> Result<(), String> {
+        let _transaction = self.transaction.lock().await;
+        self.apply_capture(&self.preferences()?).await
+    }
+
+    pub async fn refresh_capture(&self) -> Result<(), String> {
+        let _transaction = self.transaction.lock().await;
+        self.record_capture(
+            self.verify_capture(self.preferences()?.capture_paused)
+                .await,
+        )
     }
 }
 
@@ -200,28 +305,22 @@ fn retention_changed(current: &ClipboardSettings, updated: &ClipboardSettings) -
         || updated.max_entry_bytes != current.max_entry_bytes
 }
 
-async fn restart_capture(settings: &ClipboardSettings) -> Result<(), String> {
-    control_units("restart", &["ringboard-server.service"]).await?;
+async fn restart_capture(
+    services: &dyn ServiceControl,
+    settings: &ClipboardSettings,
+) -> Result<(), String> {
+    services
+        .control("restart", &["ringboard-server.service"])
+        .await?;
     sleep(Duration::from_millis(200)).await;
     let capture_action = if settings.capture_paused {
         "stop"
     } else {
         "restart"
     };
-    control_units(capture_action, &["ringboard-wayland.service"]).await
-}
-
-async fn control_units(action: &str, units: &[&str]) -> Result<(), String> {
-    let status = Command::new("systemctl")
-        .args(["--user", action])
-        .args(units)
-        .status()
+    services
+        .control(capture_action, &["ringboard-wayland.service"])
         .await
-        .map_err(|_| "Could not control Ringboard services")?;
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| "Ringboard service rejected the request".into())
 }
 
 fn encoded_ringboard_config(value: &ClipboardSettings) -> Result<(PathBuf, Vec<u8>), String> {
@@ -401,9 +500,12 @@ mod tests {
             state: std::sync::Mutex::new(SettingsState {
                 value: ClipboardSettings::default(),
                 load_error: None,
+                capture_verified: false,
+                capture_error: None,
             }),
             path,
             transaction: Default::default(),
+            services: std::sync::Arc::new(super::Systemd),
         }
     }
 
@@ -414,6 +516,51 @@ mod tests {
             ..Default::default()
         };
         assert!(manager(None).update(update).await.is_err());
+    }
+
+    #[derive(Default)]
+    struct MockServices {
+        attempts: std::sync::atomic::AtomicUsize,
+        fail: std::sync::atomic::AtomicBool,
+        paused: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl super::ServiceControl for MockServices {
+        async fn control(&self, action: &str, _: &[&str]) -> Result<(), String> {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.attempts.fetch_add(1, SeqCst);
+            if self.fail.load(SeqCst) {
+                return Err("injected failure".into());
+            }
+            self.paused.store(action == "stop", SeqCst);
+            Ok(())
+        }
+        async fn capture_paused(&self) -> Result<bool, String> {
+            Ok(self.paused.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_pause_retries_and_never_asserts_unverified_privacy() {
+        use std::sync::{Arc, atomic::Ordering::SeqCst};
+        let services = Arc::new(MockServices::default());
+        let mut manager = manager(None);
+        manager.services = services.clone();
+        services.fail.store(true, SeqCst);
+        assert!(manager.set_paused(true, true).await.is_err());
+        assert!(!manager.get().unwrap().private_mode);
+        assert!(manager.capture_state().unwrap().desired_private_mode);
+        assert_eq!(manager.capture_state().unwrap().paused, None);
+        services.fail.store(false, SeqCst);
+        assert!(manager.set_paused(true, true).await.unwrap().private_mode);
+        assert_eq!(services.attempts.load(SeqCst), 2);
+        // Detect an external capture restart instead of retaining a privacy claim.
+        services.paused.store(false, SeqCst);
+        assert!(manager.refresh_capture().await.is_err());
+        assert!(!manager.get().unwrap().private_mode);
+        manager.reconcile_capture().await.unwrap();
+        assert!(manager.get().unwrap().private_mode);
     }
 
     #[test]

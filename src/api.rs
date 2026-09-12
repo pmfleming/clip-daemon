@@ -45,6 +45,12 @@ impl ApiService {
         }
     }
 
+    pub(crate) async fn initialize(&self) {
+        if let Err(error) = self.settings.reconcile_capture().await {
+            tracing::warn!(%error, "Capture preference could not be verified; privacy is not asserted");
+        }
+    }
+
     pub(crate) async fn change_token(&self) -> Result<u64, Value> {
         self.actions
             .change_token()
@@ -165,7 +171,7 @@ impl ApiService {
             "clipboard.capture.setPaused" | "clipboard.capture.screenshot" => {
                 self.dispatch_capture(method, params).await
             }
-            "clipboard.settings.get" => self.get_settings(),
+            "clipboard.settings.get" => self.get_settings().await,
             "clipboard.settings.update" => self.update_settings(decode(params)?).await,
             "clipboard.selection.publishText" => {
                 self.actions
@@ -209,9 +215,11 @@ impl ApiService {
             .map_err(settings_error)
     }
 
-    fn get_settings(&self) -> Result<Value, ApiError> {
+    async fn get_settings(&self) -> Result<Value, ApiError> {
+        let _ = self.settings.refresh_capture().await;
         let settings = self.settings.get().map_err(settings_error)?;
-        Ok(json!({ "settings": settings }))
+        let capture = self.settings.capture_state().map_err(settings_error)?;
+        Ok(json!({ "settings": settings, "capture": capture }))
     }
 
     async fn update_settings(&self, update: SettingsUpdate) -> Result<Value, ApiError> {

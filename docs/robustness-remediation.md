@@ -40,3 +40,17 @@ lines conservatively retain registered files instead of authorizing deletion.
 Validation: unit coverage and a real-backend regression retain two referenced
 files beyond 100 long URI lines while deleting only a third unreferenced file.
 Rust tests and strict Clippy pass.
+
+## 4 — verified privacy transitions
+
+Saved intent and effective capture state are separate. API legacy pause/private
+booleans are never asserted when service state is unknown; `settings.get` also
+returns desired state, verification and errors. Every pause/resume request
+retries idempotent service control and verifies ActiveState. Startup reconciles
+saved intent; settings reads detect external capture restarts. Service commands
+have deadlines and kill-on-drop. A failure preserves intent for a later retry,
+not an unverified privacy claim.
+
+Validation: deterministic injected failures plus isolated D-Bus tests cover two
+failed attempts, successful retry, daemon restart and an external service-state
+change. Rust tests and strict Clippy pass.
