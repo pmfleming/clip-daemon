@@ -86,13 +86,13 @@ impl RequestedStreams {
 impl SubscriptionTask {
     async fn run(self) {
         let connection = self.destination.connection().clone();
-        for stream in &self.streams {
-            emit_event(&self.destination, stream, "subscribed", &self.id, None).await;
-        }
+        // Register receivers before acknowledging the subscription. Each history
+        // subscriber also gets its own fresh baseline, even if polling is active.
         let history = self.requested.watches_clipboard().then(|| {
             receive_history(
                 self.destination.clone(),
                 self.history_events.subscribe(),
+                Arc::clone(&self.api_service),
                 self.id.clone(),
                 self.requested,
             )
@@ -112,6 +112,9 @@ impl SubscriptionTask {
             }
             .run(self.api_service.lifecycle_events())
         });
+        for stream in &self.streams {
+            emit_event(&self.destination, stream, "subscribed", &self.id, None).await;
+        }
         tokio::select! {
             () = await_optional(history) => {}
             () = await_optional(operations) => {}
@@ -246,9 +249,17 @@ async fn observe_history_tick(
 async fn receive_history(
     emitter: SignalEmitter<'static>,
     mut events: tokio::sync::broadcast::Receiver<HistoryUpdate>,
+    api_service: Arc<ApiService>,
     subscription_id: String,
     requested: RequestedStreams,
 ) {
+    let initial = match api_service.change_token().await {
+        Ok(token) => HistoryUpdate::Changed(json!({ "data": {
+            "change": "reset", "reason": "initial", "history_revision": token
+        } })),
+        Err(error) => HistoryUpdate::Unavailable(error),
+    };
+    emit_update(&emitter, &subscription_id, requested, initial).await;
     loop {
         match events.recv().await {
             Ok(update) => emit_update(&emitter, &subscription_id, requested, update).await,

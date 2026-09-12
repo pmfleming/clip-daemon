@@ -6,6 +6,8 @@ or control the user's services, clipboard or Wayland compositor.
 """
 import json
 import os
+import queue
+import threading
 from pathlib import Path
 import subprocess
 import sys
@@ -192,9 +194,29 @@ else:
     assert not call("clipboard.settings.get")["settings"]["private_mode"]
 
 
+def subscription_baselines(desktop):
+    for index in range(2):
+        messages = queue.Queue()
+        client = subprocess.Popen([str(BINARY), "client"], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=desktop.log, text=True)
+        desktop.children.append(client)
+        threading.Thread(target=lambda p=client, q=messages: [q.put(json.loads(line)) for line in p.stdout], daemon=True).start()
+        client.stdin.write(json.dumps({"op": "subscribe", "id": str(index), "streams": [
+            "clipboard.history.changed", "clipboard.current.changed"]}) + "\n")
+        client.stdin.flush()
+        received = set()
+        deadline = time.monotonic() + 5
+        while len(received) < 2:
+            message = messages.get(timeout=max(0.01, deadline - time.monotonic()))
+            event = message.get("event", {})
+            if event.get("data", {}).get("reason") == "initial":
+                received.add(event["stream"])
+        assert received == {"clipboard.history.changed", "clipboard.current.changed"}
+
+
 CASES = {"wraparound": wraparound, "replacement": replacement,
          "legacy-replacement": legacy_replacement, "artifact-references": artifact_references,
-         "privacy-retry": privacy_retry}
+         "privacy-retry": privacy_retry, "subscription-baselines": subscription_baselines}
 
 
 def isolated(case):

@@ -69,3 +69,13 @@ Validation: a deterministic real `spawn_blocking` test holds a commit at a
 barrier, verifies cancellation is refused and files remain, then verifies cleanup
 waits and receives exactly one completed event. Pre-start/running-editor
 cancellation tests still pass. Rust tests and strict Clippy pass.
+
+## 6 — per-subscriber history baselines
+
+Receivers are attached before the subscribed acknowledgement, and each history/
+current subscriber receives a freshly sampled initial reset (or unavailable
+state). This is independent of the shared poller's baseline and closes the
+query-to-subscribe race for additional frontends.
+
+Validation: two simultaneously connected JSONL clients each receive initial
+history and current resets against real Ringboard. Rust tests and Clippy pass.
