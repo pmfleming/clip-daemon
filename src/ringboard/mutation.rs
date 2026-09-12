@@ -648,10 +648,9 @@ fn target_ring(favorite: bool) -> RingKind {
 }
 
 fn valid_edited_image(path: &Path, max_bytes: u64) -> bool {
-    if !path
-        .metadata()
-        .is_ok_and(|metadata| metadata.len() <= max_bytes.min(MAX_THUMBNAIL_BYTES))
-    {
+    if !path.symlink_metadata().is_ok_and(|metadata| {
+        metadata.is_file() && metadata.len() <= max_bytes.min(MAX_THUMBNAIL_BYTES)
+    }) {
         return false;
     }
     let Some(mut reader) = ImageReader::open(path)
@@ -660,6 +659,9 @@ fn valid_edited_image(path: &Path, max_bytes: u64) -> bool {
     else {
         return false;
     };
+    if reader.format() != Some(image::ImageFormat::Png) {
+        return false;
+    }
     reader.limits(super::content::image_decode_limits());
     reader.decode().is_ok()
 }
@@ -882,5 +884,22 @@ mod tests {
 
         assert!(valid_edited_image(&valid, super::MAX_THUMBNAIL_BYTES));
         assert!(!valid_edited_image(&malformed, super::MAX_THUMBNAIL_BYTES));
+        for format in [
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::Gif,
+            image::ImageFormat::Tiff,
+        ] {
+            let disguised = directory.path().join("not-really-png.png");
+            image::RgbImage::new(2, 2)
+                .save_with_format(&disguised, format)
+                .unwrap();
+            assert!(
+                !valid_edited_image(&disguised, super::MAX_THUMBNAIL_BYTES),
+                "{format:?}"
+            );
+        }
+        let link = directory.path().join("symlink.png");
+        std::os::unix::fs::symlink(&valid, &link).unwrap();
+        assert!(!valid_edited_image(&link, super::MAX_THUMBNAIL_BYTES));
     }
 }

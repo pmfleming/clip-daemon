@@ -90,3 +90,13 @@ records remain intact.
 Validation: differing image suffixes and truncated prefixes do not match in unit
 tests. Two valid PNGs with identical first 64 KiB and different final pixels both
 remain visible in the real-backend regression. Rust tests and Clippy pass.
+
+## 8 — exact PNG editor contract
+
+Annotation/screenshot output must be a non-symlink regular file whose detected
+format is PNG and whose full decode passes the existing limits. A filename
+ending in `.png` is not treated as format validation.
+
+Validation: PNG succeeds; JPEG/GIF/TIFF disguised as PNG, symlinks and truncated
+PNG fail. A real adapter returning GIF to its PNG output path emits failure and
+leaves history unchanged. Rust tests and strict Clippy pass.

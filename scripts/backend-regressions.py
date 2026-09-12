@@ -95,6 +95,28 @@ class Desktop:
         self.log.close()
 
 
+class Client:
+    def __init__(self, desktop):
+        self.messages = queue.Queue()
+        self.process = subprocess.Popen([str(BINARY), "client"], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=desktop.log, text=True)
+        desktop.children.append(self.process)
+        threading.Thread(target=lambda: [self.messages.put(json.loads(line)) for line in self.process.stdout], daemon=True).start()
+
+    def send(self, request):
+        self.process.stdin.write(json.dumps(request) + "\n")
+        self.process.stdin.flush()
+
+    def until(self, predicate, timeout=10):
+        deadline = time.monotonic() + timeout
+        while True:
+            message = self.messages.get(timeout=max(0.01, deadline - time.monotonic()))
+            if predicate(message):
+                return message
+            if time.monotonic() >= deadline:
+                raise TimeoutError("expected JSONL message was not received")
+
+
 def wraparound(_desktop):
     for favorite in (False, True):
         add("entry-0000", favorite)
@@ -238,9 +260,29 @@ def echo_identity(desktop):
     assert len(history()["entries"]) == 2, "distinct image was collapsed"
 
 
+def png_contract(desktop):
+    import base64
+    gif = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
+    add(gif, mime="image/gif")
+    original = history()["current"]
+    os.environ["CLIP_DAEMON_IMAGE_EDITOR_COMMAND"] = '["cp","{input}","{output}"]'
+    desktop.restart_daemon()
+    history()  # establish opaque IDs in the restarted daemon
+    client = Client(desktop)
+    client.send({"op": "subscribe", "id": "watch", "streams": ["clipboard.operation"]})
+    client.until(lambda m: m.get("id") == "watch")
+    client.send({"op": "call", "id": "edit", "method": "clipboard.entry.action", "params": {
+        "entry_id": original["id"], "revision": original["revision"], "action": "annotate"}})
+    response = client.until(lambda m: m.get("id") == "edit")["response"]
+    assert response["ok"], response
+    terminal = client.until(lambda m: m.get("event", {}).get("event") == "failed")
+    assert "invalid image" in terminal["event"]["data"]["operation"]["message"], terminal
+    assert history()["current"]["id"] == original["id"]
+
+
 CASES = {"wraparound": wraparound, "replacement": replacement,
          "legacy-replacement": legacy_replacement, "artifact-references": artifact_references,
-         "privacy-retry": privacy_retry, "subscription-baselines": subscription_baselines, "echo-identity": echo_identity}
+         "privacy-retry": privacy_retry, "subscription-baselines": subscription_baselines, "echo-identity": echo_identity, "png-contract": png_contract}
 
 
 def isolated(case):
