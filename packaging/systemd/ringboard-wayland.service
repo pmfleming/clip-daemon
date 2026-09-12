@@ -1,0 +1,18 @@
+[Unit]
+Description=Policy-enabled Ringboard Wayland capture
+After=ringboard-server.service graphical-session-pre.target
+Requires=ringboard-server.service
+PartOf=graphical-session.target ringboard-server.service
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=simple
+ExecCondition=@out@/bin/clip-daemon capture-allowed
+ExecStart=@ringboard@/bin/ringboard-wayland
+UMask=0077
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=5s
+
+[Install]
+WantedBy=graphical-session.target

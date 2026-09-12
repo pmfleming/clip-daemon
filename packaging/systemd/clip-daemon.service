@@ -1,13 +1,16 @@
 [Unit]
 Description=Shelllist clipboard policy service
 Documentation=https://github.com/pmfleming/clip-daemon
-After=graphical-session.target ringboard-server.service ringboard-wayland.service
+After=graphical-session-pre.target ringboard-server.service ringboard-wayland.service
 PartOf=graphical-session.target
+Wants=ringboard-server.service ringboard-wayland.service
 
 [Service]
 Type=dbus
 BusName=org.laufan.ClipDaemon
 ExecStart=@out@/bin/clip-daemon daemon
+UMask=0077
+TimeoutStopSec=30s
 StateDirectory=clip-daemon
 StateDirectoryMode=0700
 CacheDirectory=clip-daemon

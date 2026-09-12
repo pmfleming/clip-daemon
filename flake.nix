@@ -3,7 +3,7 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   inputs.daemonFramework = {
-    url = "git+file:../daemon-framework?ref=main";
+    url = "github:pmfleming/daemon-framework/c90883428ed83baa8e451dec5b598ad4e3141d25";
     inputs.nixpkgs.follows = "nixpkgs";
   };
 
@@ -15,6 +15,7 @@
     {
       packages = forAllSystems (system: pkgs:
         let
+          ringboard = import ./packaging/ringboard.nix { inherit pkgs; };
           satty = pkgs.satty.overrideAttrs (old: {
             patches = (old.patches or [ ]) ++ [ ./packaging/satty-toolbar-layout.patch ];
           });
@@ -32,13 +33,18 @@
             # Only the pinned Ringboard crates need core_io_borrowed_buf.
             RUSTC_BOOTSTRAP = "clipboard_history_core,clipboard_history_client_sdk";
             postInstall = ''
-              install -Dm644 ${./packaging/systemd/clip-daemon.service} $out/share/systemd/user/clip-daemon.service
+              for unit in ${./packaging/systemd}/*.service; do
+                install -Dm644 "$unit" "$out/share/systemd/user/$(basename "$unit")"
+              done
+              substituteInPlace $out/share/systemd/user/*.service \
+                --replace-fail @out@ $out
+              substituteInPlace $out/share/systemd/user/ringboard-{server,wayland}.service \
+                --replace-fail @ringboard@ ${ringboard}
               install -Dm644 ${./packaging/dbus/org.laufan.ClipDaemon.service} \
                 $out/share/dbus-1/services/org.laufan.ClipDaemon.service
               install -Dm644 ${./integrations/yazi/yank-to-clip-daemon.yazi/main.lua} \
                 $out/share/yazi/plugins/yank-to-clip-daemon.yazi/main.lua
               substituteInPlace \
-                $out/share/systemd/user/clip-daemon.service \
                 $out/share/dbus-1/services/org.laufan.ClipDaemon.service \
                 $out/share/yazi/plugins/yank-to-clip-daemon.yazi/main.lua \
                 --replace-fail @out@ $out
@@ -51,11 +57,12 @@
               description = "Wayland clipboard policy and clip-api daemon for Shelllist";
               mainProgram = "clip-daemon";
               platforms = pkgs.lib.platforms.linux;
+              license = pkgs.lib.licenses.mit;
             };
           };
         in {
           default = clipDaemon;
-          ringboard = import ./packaging/ringboard.nix { inherit pkgs; };
+          inherit ringboard;
           imageEditor = satty;
           ringboardQualification = pkgs.writeShellApplication {
             name = "clip-daemon-ringboard-qualification";

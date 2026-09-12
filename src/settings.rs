@@ -177,6 +177,11 @@ impl SettingsManager {
         self.get()
     }
 
+    /// ExecCondition reads persisted intent, never the unverified legacy view.
+    pub fn capture_allowed(&self) -> Result<bool, String> {
+        Ok(!self.preferences()?.capture_paused)
+    }
+
     /// Run before starting Ringboard (also used by the packaged service).
     pub fn prepare_engine(&self) -> Result<(), String> {
         persist_config_pair(self.path.as_deref(), &self.preferences()?)
@@ -650,6 +655,7 @@ mod tests {
         assert!(manager.set_paused(true, true).await.is_err());
         assert!(!manager.get().unwrap().private_mode);
         assert!(manager.capture_state().unwrap().desired_private_mode);
+        assert!(!manager.capture_allowed().unwrap());
         assert_eq!(manager.capture_state().unwrap().paused, None);
         services.fail.store(false, SeqCst);
         assert!(manager.set_paused(true, true).await.unwrap().private_mode);
@@ -660,6 +666,8 @@ mod tests {
         assert!(!manager.get().unwrap().private_mode);
         manager.reconcile_capture().await.unwrap();
         assert!(manager.get().unwrap().private_mode);
+        manager.set_paused(false, false).await.unwrap();
+        assert!(manager.capture_allowed().unwrap());
     }
 
     #[test]

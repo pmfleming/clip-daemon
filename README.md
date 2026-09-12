@@ -2,6 +2,12 @@
 
 Rust clipboard policy and `clip-api` facade for the Shelllist clipboard surface. Ringboard owns capture, persistent history, favorites, and retention; this daemon owns the stable UI boundary, Wayland selection publication, paste targeting, and product policy.
 
+## Installation
+
+See [`docs/installation.md`](docs/installation.md) for a standalone Nix build,
+packaged server/watcher units, first-start privacy ordering, and isolated package
+verification. No sibling checkout is needed to build the Nix package.
+
 ## Local Rust environment
 
 ```sh
@@ -11,6 +17,7 @@ nix develop
 just check                 # locked tests, Clippy, unused dependencies, RustSec
 just quality               # full RQLens evidence and verification
 just live-acceptance       # disposable nested desktop; never wipes normal history
+just backend-regressions   # real-server storage/concurrency/admission regressions
 just benchmark-history     # synthetic release projection comparison
 just hardware-acceptance   # remaining manual hardware gates
 ```
@@ -23,6 +30,7 @@ The tested minimum toolchain is Rust **1.95.0**, pinned in `rust-toolchain.toml`
 
 ```sh
 clip-daemon configure-engine # before starting Ringboard; validate/apply native configuration
+clip-daemon capture-allowed  # systemd ExecCondition; exits 1 when capture must not start
 clip-daemon daemon
 clip-daemon client
 clip-daemon publish --mime image/png < image.png

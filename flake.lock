@@ -9,16 +9,16 @@
       "locked": {
         "lastModified": 1788384005,
         "narHash": "sha256-b+tVRRctw4KIo69/c6sxshBsKmgRrVcOMGVzuwf5gPo=",
-        "ref": "main",
+        "owner": "pmfleming",
+        "repo": "daemon-framework",
         "rev": "c90883428ed83baa8e451dec5b598ad4e3141d25",
-        "revCount": 28,
-        "type": "git",
-        "url": "file:../daemon-framework"
+        "type": "github"
       },
       "original": {
-        "ref": "main",
-        "type": "git",
-        "url": "file:../daemon-framework"
+        "owner": "pmfleming",
+        "repo": "daemon-framework",
+        "rev": "c90883428ed83baa8e451dec5b598ad4e3141d25",
+        "type": "github"
       }
     },
     "nixpkgs": {

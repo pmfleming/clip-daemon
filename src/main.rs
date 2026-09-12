@@ -32,6 +32,8 @@ enum Command {
     },
     /// Persist validated native settings before starting the Ringboard server.
     ConfigureEngine,
+    /// systemd ExecCondition: fail closed unless persisted intent allows capture.
+    CaptureAllowed,
     /// Check whether the pinned Ringboard database is readable.
     ProbeRingboard,
     /// Print stable protocol metadata and fixtures.
@@ -68,6 +70,14 @@ async fn run(command: Command) -> Result<()> {
         Command::ConfigureEngine => clip_daemon::settings::SettingsManager::default()
             .prepare_engine()
             .map_err(anyhow::Error::msg),
+        Command::CaptureAllowed => {
+            let settings = clip_daemon::settings::SettingsManager::default();
+            anyhow::ensure!(
+                settings.capture_allowed().map_err(anyhow::Error::msg)?,
+                "Capture is disabled by persisted preference"
+            );
+            Ok(())
+        }
         Command::ProbeRingboard => probe_ringboard().await,
         Command::Debug { command } => print_debug(command),
     }

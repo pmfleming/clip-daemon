@@ -1,0 +1,17 @@
+[Unit]
+Description=Policy-enabled Ringboard history engine
+After=graphical-session-pre.target
+PartOf=graphical-session.target
+Wants=ringboard-wayland.service
+
+[Service]
+Type=notify
+ExecStartPre=@out@/bin/clip-daemon configure-engine
+ExecStart=@ringboard@/bin/ringboard-server
+UMask=0077
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=graphical-session.target

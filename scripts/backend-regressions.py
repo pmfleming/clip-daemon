@@ -386,8 +386,14 @@ def admission_limit(_desktop):
     assert status["retention"]["effective"]["max_entry_bytes"] == 65536, status
     before = history()
     # Legacy SDK Add must be rejected before it evicts a full-ring slot.
-    output = add(b"z" * 65537, mime="application/octet-stream")
-    assert int(output.split()[-1]) == (1 << 64) - 1, output
+    def rejected_add(value):
+        result = subprocess.run(["ringboard", "add", "--mime-type", "application/octet-stream"],
+            input=value, capture_output=True, timeout=15)
+        if result.returncode == 0:  # stock diagnostic CLI sees the reserved ID
+            assert int(result.stdout.split()[-1]) == (1 << 64) - 1, result
+        else:  # packaged CLI explicitly reports the policy rejection
+            assert b"capture size policy" in result.stderr, result.stderr
+    rejected_add(b"z" * 65537)
     assert history() == before
     source = before["current"]
     lease = call("clipboard.entry.edit.begin", {"entry_id": source["id"], "revision": source["revision"]})["edit"]
@@ -395,8 +401,7 @@ def admission_limit(_desktop):
     assert history() == before
     limit = Path(os.environ["XDG_DATA_HOME"]) / "clipboard-history/clip-daemon-max-bytes"
     limit.write_text("invalid")
-    output = add(b"small", mime="application/octet-stream")
-    assert int(output.split()[-1]) == (1 << 64) - 1
+    rejected_add(b"small")
     assert history() == before
     limit.write_text("65536\n")
     add(b"valid after rejection")

@@ -167,3 +167,19 @@ successful normal capture. The producer, payloads and desktop are synthetic.
 Limits: memory-backed buffers can be swapped by the OS; this is not a no-swap
 security guarantee. Unmarked password fields cannot be identified through
 Wayland data control. Existing stored entries are not retroactively erased.
+
+## Gap 13 — reproducible packaging and privacy-safe service startup
+
+Pinned the framework to a public Git revision (Nix builds no longer require a
+local sibling), corrected patched Ringboard vendoring, and built both packages
+in the Nix sandbox. The daemon ships absolute-path server/watcher units with
+engine configuration before readiness and a fail-closed persisted-intent
+ExecCondition before capture. Dependencies, installation, conflict migration and
+upgrade steps are documented in `docs/installation.md`.
+
+Validation: packaged Ringboard passes all 11 policy-backend regressions. The
+sandboxed daemon build passes 38 unit tests plus seven integration tests. A
+clean-HOME package smoke test verifies installed unit syntax, private first-boot
+configuration, paused/malformed startup rejection, installed D-Bus activation and
+synchronized live limits. No production units were started. Full login/systemd
+VM qualification remains distinct from this smoke test.
