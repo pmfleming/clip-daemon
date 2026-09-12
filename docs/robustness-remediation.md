@@ -183,3 +183,18 @@ clean-HOME package smoke test verifies installed unit syntax, private first-boot
 configuration, paused/malformed startup rejection, installed D-Bus activation and
 synchronized live limits. No production units were started. Full login/systemd
 VM qualification remains distinct from this smoke test.
+
+## Gap 14 — real Shelllist layer-shell and terminal paste acceptance
+
+Added real Ghostty and actual packaged Shelllist/Quickshell clients to the
+isolated desktop harness. It exercises the real picker/controller, Enter action,
+hide animation/session handshake, GTK Ctrl+V and Ghostty Ctrl+Shift+V. With no
+remaining target windows, paste safely degrades to retained clipboard content
+for manual paste. All non-clipboard Shelllist daemon executables are stubbed.
+
+Validation: **all 17 checks pass**, including both actual layer-shell target
+types. Without explicit Shelllist inputs, its two checks are visibly NOT RUN;
+the default 15 checks still include the real terminal and missing-target case.
+Store/client inputs are recorded with results. Physical keyboard, login/session
+and production-service qualification remain manual; no such records were forged
+or automatically marked passed.

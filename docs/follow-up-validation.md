@@ -1,5 +1,9 @@
 # Follow-up validation
 
+Historical measurements below predate the robustness remediation. Current package,
+backend and nested-desktop results are in [`robustness-remediation.md`](robustness-remediation.md)
+and [`qualification-results.md`](qualification-results.md).
+
 ## Step 3 — deterministic failure and concurrency coverage
 
 Added tests for:

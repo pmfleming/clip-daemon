@@ -2,7 +2,8 @@
 """Real Wayland/Ringboard acceptance in a disposable nested desktop.
 
 Requires Hyprland (Lua configuration), ringboard-server/wayland, wl-paste,
-Satty, busctl, dbus-run-session, and Python GTK3 introspection for the paste sink.
+Satty, Ghostty, busctl, dbus-run-session, and Python GTK3 introspection for the paste sink.
+Optional real Shelllist checks: SHELLLIST_QML_ROOT, SHELLLIST_SEARCH, QUICKSHELL.
 Never connects the tested daemon to the user's history or session bus.
 """
 import json
@@ -188,7 +189,7 @@ def acceptance(root):
         wait_for(lambda: next((e for e in history(value)["entries"] if not e["favorite"]), None))
         passed("favorite-round-trip")
 
-        start("paste-sink", sys.executable, __file__, "--paste-sink", str(root / "pasted"))
+        sink_process = start("paste-sink", sys.executable, __file__, "--paste-sink", str(root / "pasted"))
         sink = wait_for(lambda: next((c for c in clients() if c["title"] == "clip-daemon acceptance sink"), None))
         assert run("hyprctl", "dispatch", f"hl.dsp.focus({{ window = 'address:{sink['address']}' }})").strip() == b"ok"
         wait_for(lambda: json.loads(run("hyprctl", "-j", "activewindow")).get("address") == sink["address"])
@@ -205,6 +206,12 @@ def acceptance(root):
         except TimeoutError:
             results.append({"check": "hyprland-targeted-paste", "result": "fail", "detail": "shortcut reached GTK but text was not pasted; see paste-sink.log"})
             print("FAIL hyprland-targeted-paste", flush=True)
+
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("desktop_clients", PROJECT / "scripts/desktop-clients.py")
+        desktop_clients = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(desktop_clients)
+        desktop_clients.check(root, start, passed, sink, sink_process, globals())
 
         image = png()
         run(str(BINARY), "publish", "--mime", "image/png", input=image)
@@ -290,11 +297,20 @@ def acceptance(root):
                     child.wait()
         for log in logs:
             log.close()
-        if (root / "pasted").exists():
-            (root / "pasted.log").write_bytes((root / "pasted").read_bytes())
+        for name in ("pasted", "terminal-pasted"):
+            if (root / name).exists():
+                (root / f"{name}.log").write_bytes((root / name).read_bytes())
         report = PROJECT / "target/live-acceptance"
         report.mkdir(exist_ok=True, mode=0o700)
         (report / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+        (report / "clients.json").write_text(json.dumps({
+            "shelllist_qml_root": os.environ.get("SHELLLIST_QML_ROOT"),
+            "shelllist_search": os.environ.get("SHELLLIST_SEARCH"),
+            "quickshell": os.environ.get("QUICKSHELL", "quickshell"),
+            "ghostty": os.environ.get("GHOSTTY", "ghostty"),
+            "ringboard_server": os.environ.get("RINGBOARD_SERVER", "ringboard-server"),
+            "ringboard_wayland": os.environ.get("RINGBOARD_WAYLAND", "ringboard-wayland"),
+        }, indent=2) + "\n")
         for log in root.glob("*.log"):
             (report / log.name).write_bytes(log.read_bytes())
 

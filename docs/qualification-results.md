@@ -1,6 +1,8 @@
 # Ringboard qualification results
 
-Status: protocol probe rerun 2026-07-25; content/action hardware matrix tracked by `just hardware-acceptance`
+Historical production probe: 2026-07-25. Physical hardware records remain tracked
+by `just hardware-acceptance`; see the remediation section below for current
+nested-desktop qualification.
 
 | Gate | Result | Notes |
 |---|---|---|
@@ -11,7 +13,7 @@ Status: protocol probe rerun 2026-07-25; content/action hardware matrix tracked 
 | File MIME priority | pending | |
 | Layer-shell focus and auto-paste targets | pending | |
 | Sensitive selections excluded | pending | |
-| Pre-write maximum entry size | pending | Ringboard 0.16.2 config exposes entry counts; size cap still requires verification/patch |
+| Pre-write maximum entry size | pending | Patched capture admission now passes isolated tests; production deployment/hardware record still pending |
 | Clipboard survives source exit | pending | Do not remove `wl-clip-persist` yet |
 
 The 2026-07-25 probe also confirmed `/run/user/1000` and a readable clipboard-history database. It was intentionally read-only, so MIME/action, sensitive-data, focus, size-limit, and source-exit gates remain pending a hardware run.
@@ -28,4 +30,37 @@ All 11 checks pass: isolated protocols and empty database, text capture/copy aft
 
 The first run exposed a real GTK paste failure: Ringboard normalizes captured text to `text/plain`, but GTK requests UTF-8 text aliases. Publication now retains the original offer and adds standard aliases only for valid UTF-8 `text/plain` / `text/plain;charset=utf-8`. Images, file lists, non-UTF-8 text, and other charsets remain exact-MIME-only. A unit regression test and the live GTK paste test cover this fix. The full Rust suite has 33 passing tests; strict Clippy passes.
 
-This does not certify the actual Shelllist layer-shell picker, terminal-specific Ctrl+Shift+V, sensitive-source exclusion, or Ringboard's pre-capture size enforcement. Those original hardware-matrix rows remain pending; no unrelated gate is marked passed.
+That historical run did not cover Shelllist, terminals, or capture admission.
+
+## Remediation qualification
+
+**All 17 checks pass** with the packaged policy-enabled Ringboard, real Ghostty,
+and actual Shelllist 0.2.0 / Quickshell 0.3.0 in the disposable nested Hyprland.
+Added checks cover terminal Ctrl+Shift+V, actual Shelllist layer-shell selection
+and hiding followed by paste into both GTK and Ghostty, safe copy-only behavior
+with no target, sensitive-marker rejection, and pre-persistence oversized-offer
+rejection. No synthetic replacement of the Shelllist picker/controller is used;
+non-clipboard daemons are stubbed so their host services cannot be touched.
+
+To repeat the full matrix, set the paths for the Shelllist version to qualify:
+
+```sh
+export SHELLLIST_QML_ROOT=/path/to/shelllist-config/share/shelllist
+export SHELLLIST_SEARCH=/path/to/shelllist-search/bin/shelllist-search
+# QUICKSHELL and GHOSTTY may override the development-shell executables.
+just live-acceptance
+```
+
+Without Shelllist inputs the runner explicitly prints NOT RUN for those two
+checks; the other **15** checks still execute. Client/package paths are recorded
+in `target/live-acceptance/clients.json` alongside results and synthetic logs.
+
+The patched engine also passes 11 isolated storage/policy regression cases. Both
+Nix packages build; clean-HOME installed-unit/D-Bus smoke tests pass. See
+`docs/robustness-remediation.md` and `docs/installation.md` for scope.
+
+These are real clients on a nested desktop, **not physical keyboard/login or
+production-service acceptance**. Original manual hardware records are not
+rewritten, and no production watcher, history, binding or clipboard owner was
+changed. Unmarked sensitive sources, OS swapping and power-loss durability remain
+explicit limitations rather than certified guarantees.
