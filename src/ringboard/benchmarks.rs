@@ -35,6 +35,7 @@ fn fixture(size: usize) -> CachedProjection {
                             "x".repeat(256)
                         ),
                     },
+                    proof: [0; 32],
                     generated_path: None,
                     echo_source_id: None,
                 },

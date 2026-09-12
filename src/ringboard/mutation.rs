@@ -16,11 +16,11 @@ use std::{
 
 use clipboard_history_client_sdk::{
     Entry, EntryReader,
-    api::{AddRequest, MoveToFrontRequest, RemoveRequest, SwapRequest, connect_to_server},
+    api::{MoveToFrontRequest, RemoveRequest, connect_to_server},
 };
 use clipboard_history_core::{
     dirs::socket_file,
-    protocol::{AddResponse, MimeType, MoveToFrontResponse, RingKind},
+    protocol::{MoveToFrontResponse, RingKind},
 };
 use image::ImageReader;
 use rustix::net::SocketAddrUnix;
@@ -251,8 +251,9 @@ impl RingboardBackend {
         path: &Path,
         mime: &str,
     ) -> BackendResult<u64> {
-        let (entry, _, summary) = self.selected(opaque_id, expected_revision)?;
-        replace_from_file(entry.id(), target_ring(summary.favorite), path, mime)?;
+        let (entry, _, resolved) = self.selected_proven(opaque_id, expected_revision)?;
+        let file = File::open(path).map_err(operation_error)?;
+        super::ipc::replace(entry.id(), &resolved.proof, mime, &file)?;
         self.clear_identity_state()?;
         Ok(entry.id())
     }
@@ -496,24 +497,6 @@ fn publish_annotation(
         .publish_file("image/png", output, max_bytes)?;
     backend.artifact_registry()?.clear_active_selection();
     Ok(())
-}
-
-fn replace_from_file(raw_id: u64, ring: RingKind, path: &Path, mime: &str) -> BackendResult<()> {
-    let server = server()?;
-    let replacement = add_file(&server, path, mime, ring)?;
-    let swap = SwapRequest::response(&server, raw_id, replacement).map_err(operation_error)?;
-    if swap.error1.is_some() || swap.error2.is_some() {
-        return Err(operation_error("Ringboard rejected the replacement swap"));
-    }
-    remove_raw(server, replacement)
-}
-
-fn add_file(server: impl AsFd, path: &Path, mime: &str, ring: RingKind) -> BackendResult<u64> {
-    let file = File::open(path).map_err(operation_error)?;
-    let mime = MimeType::from(mime).map_err(operation_error)?;
-    let AddResponse::Success { id } =
-        AddRequest::response_add_unchecked(server, ring, &mime, file).map_err(operation_error)?;
-    Ok(id)
 }
 
 fn remove_raw(server: impl AsFd, id: u64) -> BackendResult<()> {

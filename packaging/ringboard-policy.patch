@@ -1,0 +1,73 @@
+--- a/server/Cargo.toml
++++ b/server/Cargo.toml
+@@ -11,6 +11,7 @@
+ 
+ [dependencies]
+ arrayvec = "0.7.6"
++sha2 = "0.10.9"
+ bitcode = { version = "0.6.9", features = ["arrayvec"] }
+ bitvec = "1.0.1"
+ env_logger = { version = "0.11.10", default-features = false }
+--- a/server/src/requests.rs
++++ b/server/src/requests.rs
+@@ -17,7 +17,7 @@
+ pub fn connect(payload: &[u8], send_bufs: &mut SendMsgBufs) -> (bool, PendingBufAllocation) {
+     debug!("Establishing client/server protocol connection.");
+     let version = payload[0];
+-    let valid = version == protocol::VERSION;
++    let valid = version == protocol::VERSION || version == 0xc1;
+     if !valid {
+         warn!(
+             "Protocol version mismatch: expected {} but got {version}.",
+@@ -28,7 +28,7 @@
+     let response = send_bufs.init_buf(
+         |_| (),
+         |buf| {
+-            buf.push(protocol::VERSION);
++            buf.push(if version == 0xc1 { 0xc1 } else { protocol::VERSION });
+         },
+     );
+ 
+@@ -42,6 +42,21 @@
+     allocator: &mut Allocator,
+     sequence_number: &mut u64,
+ ) -> Result<Option<PendingBufAllocation>, CliError> {
++    if request_data.starts_with(b"CDP1") {
++        let mut fds = Vec::new();
++        for message in unsafe { AncillaryDrain::parse(control_data) } {
++            if let RecvAncillaryMessage::ScmRights(received) = message {
++                fds.extend(received);
++            }
++        }
++        let status = if fds.len() == 1 {
++            allocator.policy_request(request_data, fds.pop())
++        } else { 2 };
++        return Ok(Some(send_bufs.init_buf(|_| (), |buf| {
++            buf.extend_from_slice(b"CDR1");
++            buf.push(status);
++        })));
++    }
+     if request_data.len() < size_of::<Request>() {
+         warn!("Dropping invalid request (too short).");
+         return Ok(None);
+--- a/server/src/allocator.rs
++++ b/server/src/allocator.rs
+@@ -41,6 +41,8 @@
+ 
+ use crate::CliError;
+ 
++include!("policy_allocator.rs");
++
+ #[derive(Debug)]
+ struct RingWriter {
+     ring: File,
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -811,6 +811,7 @@
+  "log",
+  "rustix 1.1.4",
+  "sd-notify",
++ "sha2",
+  "smallvec 2.0.0-alpha.12",
+  "thiserror 2.0.18",
+  "tracy-client",

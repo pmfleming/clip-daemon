@@ -57,7 +57,7 @@ class Desktop:
         self.log = (root / "services.log").open("w")
         run("ringboard", "configure", "server", "--max-main-entries", str(capacity),
             "--max-favorite-entries", str(capacity))
-        self.start("ringboard-server")
+        self.start(os.environ.get("RINGBOARD_SERVER", "ringboard-server"))
         wait_for(lambda: Path(os.environ["RINGBOARD_SOCK"]).is_socket())
         self.daemon = self.start(str(BINARY), "daemon")
         wait_for(lambda: BUS.encode() in run("busctl", "--user", "list", "--acquired"))
@@ -102,7 +102,33 @@ def wraparound(_desktop):
             assert details["entry"]["text"] == entry["preview"]
 
 
-CASES = {"wraparound": wraparound}
+def replacement(desktop):
+    for favorite in (False, True):
+        add("oldest", favorite)
+        add("newest", favorite)
+        for original in ("oldest", "newest"):
+            rows = [e for e in history()["entries"] if e["favorite"] == favorite]
+            entry = next(e for e in rows if e["preview"] == original)
+            lease = call("clipboard.entry.edit.begin", {"entry_id": entry["id"], "revision": entry["revision"]})["edit"]
+            committed = call("clipboard.entry.edit.commit", {"edit_id": lease["id"], "value": original + " edited"})
+            assert committed["entry"]["text"] == original + " edited"
+            after = [e for e in history()["entries"] if e["favorite"] == favorite]
+            assert len(after) == 2, after
+            assert [e["preview"] for e in after] == [
+                e["preview"] + (" edited" if e["id"] == entry["id"] else "") for e in rows
+            ], after
+
+
+def legacy_replacement(_desktop):
+    add("original")
+    entry = history()["current"]
+    lease = call("clipboard.entry.edit.begin", {"entry_id": entry["id"], "revision": entry["revision"]})["edit"]
+    result = call("clipboard.entry.edit.commit", {"edit_id": lease["id"], "value": "replacement"}, ok=False)
+    assert "policy package" in result["error"]["message"], result
+    assert [e["preview"] for e in history()["entries"]] == ["original"]
+
+
+CASES = {"wraparound": wraparound, "replacement": replacement, "legacy-replacement": legacy_replacement}
 
 
 def isolated(case):
@@ -131,5 +157,6 @@ if __name__ == "__main__":
         finally:
             desktop.close()
     else:
-        for case in sys.argv[1:] or CASES:
+        cases = sys.argv[1:] or [name for name in CASES if (name != "legacy-replacement" if os.environ.get("RINGBOARD_SERVER") else name != "replacement")]
+        for case in cases:
             isolated(case)

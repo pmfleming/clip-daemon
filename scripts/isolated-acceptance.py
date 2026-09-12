@@ -126,7 +126,7 @@ def acceptance(root):
         protocols = run("wayland-info", stderr=subprocess.DEVNULL)
         assert b"ext_data_control_manager_v1" in protocols
         passed("isolated-wayland-protocols")
-        start("ringboard", "ringboard-server")
+        start("ringboard", os.environ.get("RINGBOARD_SERVER", "ringboard-server"))
         wait_for(lambda: Path(os.environ["RINGBOARD_SOCK"]).is_socket())
         start("capture", "ringboard-wayland")
         daemon = start("daemon", str(BINARY), "daemon")

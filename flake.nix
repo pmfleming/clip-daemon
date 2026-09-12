@@ -55,10 +55,11 @@
           };
         in {
           default = clipDaemon;
+          ringboard = import ./packaging/ringboard.nix { inherit pkgs; };
           imageEditor = satty;
           ringboardQualification = pkgs.writeShellApplication {
             name = "clip-daemon-ringboard-qualification";
-            runtimeInputs = [ pkgs.jq pkgs.ringboard-wayland pkgs.wayland-utils ];
+            runtimeInputs = [ pkgs.jq self.packages.${system}.ringboard pkgs.wayland-utils ];
             text = builtins.readFile ./scripts/qualify-ringboard.sh;
           };
         });
@@ -74,7 +75,7 @@
 
       devShells = forAllSystems (system: pkgs: {
         default = pkgs.mkShell {
-          packages = with pkgs; [ cargo cargo-audit cargo-machete cargo-llvm-cov clippy dbus gobject-introspection grim gtk3 hyprland jq just llvmPackages.llvm pkg-config (python3.withPackages (ps: [ ps.pygobject3 ])) ringboard-wayland rust-analyzer rustc rustfmt self.packages.${system}.imageEditor wayland-utils wl-clipboard ];
+          packages = with pkgs; [ cargo cargo-audit cargo-machete cargo-llvm-cov clippy dbus gobject-introspection grim gtk3 hyprland jq just llvmPackages.llvm pkg-config (python3.withPackages (ps: [ ps.pygobject3 ])) self.packages.${system}.ringboard rust-analyzer rustc rustfmt self.packages.${system}.imageEditor wayland-utils wl-clipboard ];
           GI_TYPELIB_PATH = pkgs.lib.makeSearchPath "lib/girepository-1.0" [ pkgs.gtk3 pkgs.glib pkgs.pango pkgs.gdk-pixbuf pkgs.at-spi2-core pkgs.harfbuzz ];
           LLVM_COV = "${pkgs.llvmPackages.llvm}/bin/llvm-cov";
           LLVM_PROFDATA = "${pkgs.llvmPackages.llvm}/bin/llvm-profdata";

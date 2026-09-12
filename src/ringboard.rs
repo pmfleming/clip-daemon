@@ -38,6 +38,7 @@ mod artifacts;
 #[cfg(all(test, feature = "benchmarks"))]
 mod benchmarks;
 mod content;
+mod ipc;
 mod mutation;
 
 use artifacts::ArtifactRegistry;
@@ -71,6 +72,7 @@ struct SummaryCache {
 #[derive(Clone)]
 struct ResolvedEntry {
     summary: EntrySummary,
+    proof: [u8; 32],
     generated_path: Option<PathBuf>,
     echo_source_id: Option<String>,
 }
@@ -294,6 +296,15 @@ impl RingboardBackend {
         opaque_id: &str,
         expected_revision: Option<u64>,
     ) -> BackendResult<(Entry, EntryReader, EntrySummary)> {
+        self.selected_proven(opaque_id, expected_revision)
+            .map(|(entry, reader, resolved)| (entry, reader, resolved.summary))
+    }
+
+    fn selected_proven(
+        &self,
+        opaque_id: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<(Entry, EntryReader, ResolvedEntry)> {
         let binding = self.resolve(opaque_id)?;
         let (database, mut reader) = Self::open()?;
         let entry = database
@@ -301,9 +312,9 @@ impl RingboardBackend {
             .map_err(|_| BackendError::stale("Clipboard entry is stale or missing"))?;
         // Storage slots (including bucket index and length) can be reused.
         // Never authorize an action against a cached content fingerprint.
-        let summary = self.summarize(entry, &mut reader)?.summary;
-        self.verify_selection(opaque_id, expected_revision, binding, &summary)?;
-        Ok((entry, reader, summary))
+        let resolved = self.summarize(entry, &mut reader)?;
+        self.verify_selection(opaque_id, expected_revision, binding, &resolved.summary)?;
+        Ok((entry, reader, resolved))
     }
 
     fn verify_selection(
@@ -365,6 +376,7 @@ impl RingboardBackend {
                 current: false,
                 preview: bounded_preview(&bytes, INSPECTION_LIMIT),
             },
+            proof: ipc::content_proof(&content_digest, &stored_mime),
             generated_path,
             echo_source_id: echo_source_id.or(inline_echo_source),
         })
@@ -1057,6 +1069,7 @@ mod tests {
                     current: false,
                     preview: "image".into(),
                 },
+                proof: [0; 32],
                 generated_path: generated.then(|| "/generated/image.png".into()),
                 echo_source_id: generated.then(|| "source".into()),
             },
