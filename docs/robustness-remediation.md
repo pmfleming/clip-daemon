@@ -147,3 +147,23 @@ boundary and across a newline. Repeated queries agree, eviction invalidates cach
 hits, oversized queries fail validation, and malformed UTF-8 fails safely. Rust
 tests and strict Clippy pass. Historical projection-only benchmark results do not
 measure this new full-text scan.
+
+## Gap 12 — capture-side admission and sensitive-marker qualification
+
+The patched watcher stages all offers in bounded memfds, not disk scratch files,
+and discards oversized offers before sending them to Ringboard. Both watcher and
+server use the same atomically written byte-policy file; malformed policy fails
+closed. The server independently snapshots/admit-checks every Add before freeing
+a retention slot or writing disk data, and replacements obey the configured
+limit too. The effective ceiling is min(configured bytes, 64 MiB). Legacy Add
+rejections return an impossible ID; the packaged CLI/watcher handle it explicitly.
+
+Validation: oversized Add into a full ring, malformed policy, edit-size enforcement
+and recovery preserve history in backend regressions. **All 13** nested-desktop
+checks pass, including a multi-MIME password-manager-hinted offer rejected before
+capture and an oversized binary offer rejected before persistence, followed by
+successful normal capture. The producer, payloads and desktop are synthetic.
+
+Limits: memory-backed buffers can be swapped by the OS; this is not a no-swap
+security guarantee. Unmarked password fields cannot be identified through
+Wayland data control. Existing stored entries are not retroactively erased.

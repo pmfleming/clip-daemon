@@ -345,7 +345,14 @@ fn validated_update<T: Copy + PartialOrd>(
 }
 
 fn limits_match(limits: &crate::ringboard::ipc::EngineLimits, desired: &ClipboardSettings) -> bool {
-    limits.max_entries == desired.max_entries && limits.max_favorites == desired.max_favorites
+    limits.max_entries == desired.max_entries
+        && limits.max_favorites == desired.max_favorites
+        && limits.max_entry_bytes
+            == Some(
+                desired
+                    .max_entry_bytes
+                    .min(crate::backend::MAX_WAYLAND_SELECTION_BYTES),
+            )
 }
 
 async fn restart_capture(
@@ -426,6 +433,20 @@ fn import_native_settings() -> Result<ClipboardSettings, String> {
         value.max_entries = native.max_entries.main.get();
         value.max_favorites = native.max_entries.favorites.get();
     }
+    let limit_path = data_dir().join("clip-daemon-max-bytes");
+    if limit_path
+        .try_exists()
+        .map_err(|_| "Native capture limit is unreadable")?
+    {
+        let bytes = fs::read(limit_path).map_err(|_| "Native capture limit is unreadable")?;
+        if bytes.len() > 32 {
+            return Err("Native capture limit is invalid".into());
+        }
+        value.max_entry_bytes = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .ok_or("Native capture limit is invalid")?;
+    }
     validate_loaded_settings(value)
 }
 
@@ -434,7 +455,12 @@ const RINGBOARD: &str = "Ringboard settings";
 
 fn persist_config_pair(path: Option<&Path>, value: &ClipboardSettings) -> Result<(), String> {
     let (ringboard_path, ringboard_bytes) = encoded_ringboard_config(value)?;
-    let mut writes = vec![stage_config(&ringboard_path, &ringboard_bytes, RINGBOARD)?];
+    let limit_path = data_dir().join("clip-daemon-max-bytes");
+    let limit = format!("{}\n", value.max_entry_bytes);
+    let mut writes = vec![
+        stage_config(&ringboard_path, &ringboard_bytes, RINGBOARD)?,
+        stage_config(&limit_path, limit.as_bytes(), "Ringboard capture limit")?,
+    ];
     if let Some(path) = path {
         let bytes = serde_json::to_vec_pretty(value)
             .map_err(|_| "Clipboard settings could not be encoded")?;

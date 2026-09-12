@@ -126,9 +126,17 @@ def acceptance(root):
         protocols = run("wayland-info", stderr=subprocess.DEVNULL)
         assert b"ext_data_control_manager_v1" in protocols
         passed("isolated-wayland-protocols")
+        # Apply a deliberately small, shared capture/publication limit before
+        # either engine starts; every fixture below fits except the rejection test.
+        run(str(BINARY), "configure-engine")
+        settings_path = root / "state/clip-daemon/settings.json"
+        settings = json.loads(settings_path.read_text())
+        settings["max_entry_bytes"] = 65536
+        settings_path.write_text(json.dumps(settings))
+        run(str(BINARY), "configure-engine")
         start("ringboard", os.environ.get("RINGBOARD_SERVER", "ringboard-server"))
         wait_for(lambda: Path(os.environ["RINGBOARD_SOCK"]).is_socket())
-        start("capture", "ringboard-wayland")
+        capture = start("capture", os.environ.get("RINGBOARD_WAYLAND", "ringboard-wayland"), env=dict(os.environ, RUST_LOG="info"))
         daemon = start("daemon", str(BINARY), "daemon")
         wait_for(lambda: BUS.encode() in run("busctl", "--user", "list", "--acquired"))
         owner = json.loads(run("busctl", "--user", "--json=short", "call", "org.freedesktop.DBus",
@@ -232,6 +240,31 @@ def acceptance(root):
         assert run("wl-paste", "--no-newline", "--type", "text/uri-list").decode() == expected
         assert run("wl-paste", "--no-newline", "--type", "x-special/gnome-copied-files").decode() == "cut\n" + expected
         passed("multi-file-mime-round-trip")
+
+        def synthetic_offer(name, payload, *args):
+            producer = start(name, str(PROJECT / "target/debug/examples/acceptance-offer"), *args, stdin=subprocess.PIPE)
+            producer.stdin.write(payload)
+            producer.stdin.close()
+            return producer
+
+        capture_log = root / "capture.log"
+        baseline = len(capture_log.read_text())
+        secret = b"clip-sensitive-synthetic-fixture"
+        synthetic_offer("sensitive-offer", secret, "--sensitive")
+        wait_for(lambda: b"x-kde-passwordManagerHint" in run("wl-paste", "--list-types"))
+        wait_for(lambda: "No usable mimes" in capture_log.read_text()[baseline:])
+        assert not history(secret.decode())["entries"]
+        assert capture.poll() is None
+        passed("sensitive-marker-before-capture")
+
+        baseline = len(capture_log.read_text())
+        synthetic_offer("oversized-offer", b"clip-oversized-fixture" + b"x" * 65536,
+                        "--mime", "application/octet-stream")
+        wait_for(lambda: "Dropping oversized clipboard offer before persistence" in capture_log.read_text()[baseline:])
+        assert not history("clip-oversized-fixture")["entries"]
+        assert capture.poll() is None
+        text("capture-resumes-after-policy-rejection")
+        passed("oversized-offer-before-persistence")
 
         first, second = text("clip-delete-one"), text("clip-delete-two")
         targets = [{"entry_id": e["id"], "revision": e["revision"]} for e in (first, second)]

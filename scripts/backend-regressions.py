@@ -378,9 +378,34 @@ def full_text_search(_desktop):
     assert not call("clipboard.history.query", {"query": "late-needle"})["history"]["entries"]
 
 
+def admission_limit(_desktop):
+    for value in ("keep-one", "keep-two"):
+        add(value)
+    call("clipboard.settings.update", {"max_entry_bytes": 65536})
+    status = call("clipboard.settings.get")
+    assert status["retention"]["effective"]["max_entry_bytes"] == 65536, status
+    before = history()
+    # Legacy SDK Add must be rejected before it evicts a full-ring slot.
+    output = add(b"z" * 65537, mime="application/octet-stream")
+    assert int(output.split()[-1]) == (1 << 64) - 1, output
+    assert history() == before
+    source = before["current"]
+    lease = call("clipboard.entry.edit.begin", {"entry_id": source["id"], "revision": source["revision"]})["edit"]
+    call("clipboard.entry.edit.commit", {"edit_id": lease["id"], "value": "a" * 65537}, ok=False)
+    assert history() == before
+    limit = Path(os.environ["XDG_DATA_HOME"]) / "clipboard-history/clip-daemon-max-bytes"
+    limit.write_text("invalid")
+    output = add(b"small", mime="application/octet-stream")
+    assert int(output.split()[-1]) == (1 << 64) - 1
+    assert history() == before
+    limit.write_text("65536\n")
+    add(b"valid after rejection")
+    assert history()["current"]["preview"] == "valid after rejection"
+
+
 CASES = {"wraparound": wraparound, "replacement": replacement,
          "legacy-replacement": legacy_replacement, "artifact-references": artifact_references,
-         "privacy-retry": privacy_retry, "subscription-baselines": subscription_baselines, "echo-identity": echo_identity, "png-contract": png_contract, "concurrent-mutations": concurrent_mutations, "retention-recovery": retention_recovery, "full-text-search": full_text_search}
+         "privacy-retry": privacy_retry, "subscription-baselines": subscription_baselines, "echo-identity": echo_identity, "png-contract": png_contract, "concurrent-mutations": concurrent_mutations, "retention-recovery": retention_recovery, "full-text-search": full_text_search, "admission-limit": admission_limit}
 
 
 def isolated(case):
@@ -409,7 +434,7 @@ if __name__ == "__main__":
         finally:
             desktop.close()
     else:
-        needs_policy = {"replacement", "concurrent-mutations", "retention-recovery"}
+        needs_policy = {"replacement", "concurrent-mutations", "retention-recovery", "admission-limit"}
         cases = sys.argv[1:] or [name for name in CASES if (name != "legacy-replacement" if os.environ.get("RINGBOARD_SERVER") else name not in needs_policy)]
         for case in cases:
             isolated(case)

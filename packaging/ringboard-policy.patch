@@ -58,15 +58,198 @@
          return Ok(None);
 --- a/server/src/allocator.rs
 +++ b/server/src/allocator.rs
-@@ -41,6 +41,8 @@
+@@ -41,6 +41,10 @@
  
  use crate::CliError;
  
 +include!("policy_allocator.rs");
++#[path = "capture_limit.rs"]
++mod capture_limit;
 +
  #[derive(Debug)]
  struct RingWriter {
      ring: File,
+@@ -509,6 +513,16 @@
+         to: RingKind,
+         mime_type: &MimeType,
+     ) -> Result<AddResponse, CliError> {
++        // Admission happens before freeing a retained slot or writing scratchpad
++        // data. Old protocol clients receive a reserved, impossible entry ID.
++        let fd = match self.policy_admit(fd) {
++            Ok(Some(fd)) => fd,
++            Ok(None) => return Ok(AddResponse::Success { id: u64::MAX }),
++            Err(error) => {
++                log::warn!("Clipboard admission rejected: {error}");
++                return Ok(AddResponse::Success { id: u64::MAX });
++            }
++        };
+         let id = self.add_internal(to, |head, data| data.alloc(fd, mime_type, to, head))?;
+         Ok(AddResponse::Success {
+             id: composite_id(to, id),
+--- a/wayland/src/main.rs
++++ b/wayland/src/main.rs
+@@ -26,9 +26,9 @@
+     api::{AddRequest, MoveToFrontRequest, PasteCommand, connect_to_server},
+     config,
+     core::{
+-        Error, IoErr, create_tmp_file,
++        Error, IoErr,
+         dirs::{paste_socket_file, socket_file},
+-        init_unix_server, is_plaintext_mime,
++        init_unix_server,
+         protocol::{
+             AddResponse, IdNotFoundError, MimeType, MoveToFrontResponse, Response, RingKind,
+         },
+@@ -44,7 +44,7 @@
+ use rustc_hash::FxHasher;
+ use rustix::{
+     event::epoll,
+-    fs::{CWD, MemfdFlags, Mode, OFlags, memfd_create},
++    fs::{MemfdFlags, memfd_create},
+     io::Errno,
+     net::{RecvFlags, SendFlags, SocketAddrUnix, SocketType},
+     pipe::{SpliceFlags, pipe, splice},
+@@ -465,6 +465,8 @@
+     }
+ }
+ 
++mod capture_limit;
++
+ const IN_TRANSFER_BUFFERS: usize = 4;
+ 
+ #[derive(Default, Debug)]
+@@ -480,6 +482,7 @@
+     read: OwnedFd,
+     data: OwnedFd,
+     len: u64,
++    max_bytes: u64,
+ 
+     mime: MimeType,
+ }
+@@ -542,7 +545,7 @@
+ 
+     fn start_transfer_(
+         &mut self,
+-        tmp_file_unsupported: &mut bool,
++        _tmp_file_unsupported: &mut bool,
+         epoll: impl AsFd,
+         idx: usize,
+     ) -> Result<(), CliError> {
+@@ -555,20 +558,17 @@
+         info!("Starting transfer for peer {idx} of mime {mime:?}.");
+         let mime_type = MimeType::from(&mime).unwrap();
+ 
+-        let data = if is_plaintext_mime(&mime) {
+-            memfd_create(c"ringboard_wayland_copy", MemfdFlags::empty())
+-                .map_io_err(|| "Failed to create copy file.")?
+-        } else {
+-            create_tmp_file(
+-                tmp_file_unsupported,
+-                CWD,
+-                c".",
+-                c".ringboard-wayland-scratchpad",
+-                OFlags::RDWR,
+-                Mode::empty(),
+-            )
+-            .map_io_err(|| "Failed to create copy temp file.")?
++        let max_bytes = match capture_limit::load(&ringboard_sdk::core::dirs::data_dir().join("clip-daemon-max-bytes")) {
++            Ok(limit) => limit,
++            Err(error) => {
++                warn!("Capture policy unavailable; rejecting offer: {error}");
++                self.reset(idx);
++                return Ok(());
++            }
+         };
++        // No disk staging until the complete offer has passed admission.
++        let data = memfd_create(c"ringboard_wayland_copy", MemfdFlags::CLOEXEC)
++            .map_io_err(|| "Failed to create memory-only copy buffer.")?;
+ 
+         let (read, write) = pipe().map_io_err(|| "Failed to create pipe.")?;
+         self.offers[idx]
+@@ -587,6 +587,7 @@
+             read,
+             data,
+             len: 0,
++            max_bytes,
+             mime: mime_type,
+         });
+ 
+@@ -601,10 +602,19 @@
+         deduplicator: &mut CopyDeduplication,
+         idx: usize,
+     ) -> Result<(), CliError> {
++        let current_limit = match capture_limit::load(&ringboard_sdk::core::dirs::data_dir().join("clip-daemon-max-bytes")) {
++            Ok(limit) => limit,
++            Err(error) => {
++                warn!("Capture policy unavailable; discarding transfer: {error}");
++                self.reset(idx);
++                return Ok(());
++            }
++        };
+         let Some(Transfer {
+             read,
+             data,
+             len,
++            max_bytes,
+             mime,
+         }) = &mut self.transfers[idx]
+         else {
+@@ -612,13 +622,18 @@
+             return Ok(());
+         };
+ 
++        *max_bytes = (*max_bytes).min(current_limit);
++        if *len > *max_bytes {
++            self.reset(idx);
++            return Ok(());
++        }
+         {
+             let log_bytes_received = |count| trace!("Received {count} bytes from peer {idx}.");
+ 
+             let mut total = 0;
+             loop {
+                 match {
+-                    let max_remaining = usize::MAX / 2 - usize::try_from(*len).unwrap();
++                    let max_remaining = usize::try_from(max_bytes.saturating_add(1) - *len).unwrap();
+                     splice(
+                         &read,
+                         None,
+@@ -644,6 +659,11 @@
+                             break;
+                         }
+                         total += count;
++                        if *len > *max_bytes {
++                            warn!("Dropping oversized clipboard offer before persistence");
++                            self.reset(idx);
++                            return Ok(());
++                        }
+                     }
+                 }
+             }
+@@ -677,7 +697,7 @@
+ 
+         let AddResponse::Success { id } =
+             AddRequest::response_add_unchecked(&server, RingKind::Main, mime, data)?;
+-        deduplicator.remember(data_hash, id);
++        if id != u64::MAX { deduplicator.remember(data_hash, id); }
+         info!("Transfer for peer {idx} on mime {mime:?} complete.");
+         self.reset(idx);
+ 
+--- a/cli/src/main.rs
++++ b/cli/src/main.rs
+@@ -1072,6 +1072,12 @@
+         )?
+     };
+ 
++    if id == u64::MAX {
++        return Err(CoreError::Io {
++            error: io::Error::other("Clipboard data was rejected by the capture size policy"),
++            context: "No clipboard history entry was added".into(),
++        }.into());
++    }
+     println!("Entry added: {id}");
+ 
+     if copy {
 --- a/Cargo.lock
 +++ b/Cargo.lock
 @@ -811,6 +811,7 @@

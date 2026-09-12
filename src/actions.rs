@@ -89,7 +89,9 @@ impl ClipboardService {
         match method {
             "clipboard.entry.action" => self.action(decode(params)?, max_entry_bytes).await,
             "clipboard.entry.edit.begin" => self.begin_edit(decode(params)?).await,
-            "clipboard.entry.edit.commit" => self.commit_edit(decode(params)?).await,
+            "clipboard.entry.edit.commit" => {
+                self.commit_edit(decode(params)?, max_entry_bytes).await
+            }
             "clipboard.entry.edit.cancel" => self.cancel_edit(decode(params)?).await,
             _ => Err(ApiError::unsupported("Unsupported entry method")),
         }
@@ -353,7 +355,11 @@ impl ClipboardService {
         Ok(json!({ "edit": view }))
     }
 
-    async fn commit_edit(&self, params: EditCommitParams) -> Result<Value, ApiError> {
+    async fn commit_edit(
+        &self,
+        params: EditCommitParams,
+        max_entry_bytes: u64,
+    ) -> Result<Value, ApiError> {
         let lease = self
             .edits
             .lock()
@@ -363,7 +369,7 @@ impl ClipboardService {
         if lease.expires <= Instant::now() {
             return Err(edit_error("Edit session expired"));
         }
-        if params.value.len() > MAX_EDIT_BYTES {
+        if params.value.len() as u64 > (MAX_EDIT_BYTES as u64).min(max_entry_bytes) {
             return Err(edit_error("Edited text exceeds the configured limit"));
         }
         let current_revision = self.backend.revision(&lease.entry_id).await?;

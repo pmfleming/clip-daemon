@@ -6,7 +6,8 @@ impl Allocator {
         response[..4].copy_from_slice(b"CDS1");
         response[4..8].copy_from_slice(&self.rings[RingKind::Main].ring.capacity().to_le_bytes());
         response[8..12].copy_from_slice(&self.rings[RingKind::Favorites].ring.capacity().to_le_bytes());
-        // Zero explicitly means capture-side byte enforcement is unsupported.
+        let limit = capture_limit::load(&ringboard_core::dirs::data_dir().join("clip-daemon-max-bytes")).unwrap_or(0);
+        response[12..20].copy_from_slice(&limit.to_le_bytes());
         response
     }
 
@@ -109,7 +110,25 @@ impl Allocator {
         Ok(proof.finalize().into())
     }
 
+    fn policy_admit(&self, fd: OwnedFd) -> Result<Option<OwnedFd>, CliError> {
+        let limit = capture_limit::load(&ringboard_core::dirs::data_dir().join("clip-daemon-max-bytes"))
+            .map_io_err(|| "Read capture byte limit")?;
+        let input = File::from(fd);
+        let metadata = input.metadata().map_io_err(|| "Inspect incoming clipboard data")?;
+        if !metadata.is_file() || metadata.len() > limit { return Ok(None); }
+        let mut snapshot = File::from(rustix::fs::memfd_create(c"ringboard-admission", rustix::fs::MemfdFlags::CLOEXEC)
+            .map_io_err(|| "Create memory-only clipboard admission buffer")?);
+        let size = io::copy(&mut input.take(limit + 1), &mut snapshot)
+            .map_io_err(|| "Read bounded clipboard admission data")?;
+        if size > limit { return Ok(None); }
+        snapshot.seek(SeekFrom::Start(0)).map_io_err(|| "Rewind clipboard admission data")?;
+        Ok(Some(snapshot.into()))
+    }
+
     fn policy_replace(&mut self, id: u64, fd: OwnedFd, mime: &MimeType) -> Result<(), CliError> {
+        let fd = self.policy_admit(fd)?.ok_or_else(|| CliError::Internal {
+            context: "Replacement exceeds the configured limit or is not a regular file".into(),
+        })?;
         let (ring, index, previous) = self.get_entry(id).map_err(|_| CliError::Internal {
             context: "Stale policy replacement".into(),
         })?;
@@ -124,17 +143,8 @@ impl Allocator {
         let _ = self.data.free_direct(ring, staging); // retry prior orphan cleanup
         self.data.scratchpad.set_len(0).map_io_err(|| "Reset replacement staging")?;
         self.data.scratchpad.seek(SeekFrom::Start(0)).map_io_err(|| "Rewind replacement staging")?;
-        let mut input = File::from(fd);
-        if !input.metadata().map_io_err(|| "Inspect replacement")?.is_file() {
-            return Err(CliError::Internal { context: "Replacement must be a regular file".into() });
-        }
-        const LIMIT: u64 = 64 * 1024 * 1024;
-        let size = io::copy(&mut std::io::Read::by_ref(&mut input).take(LIMIT + 1), &mut self.data.scratchpad)
-            .map_io_err(|| "Stage policy replacement")?;
-        if size > LIMIT {
-            self.data.scratchpad.seek(SeekFrom::Start(0)).map_io_err(|| "Reset oversized staging")?;
-            return Err(CliError::Internal { context: "Replacement exceeds the policy limit".into() });
-        }
+        let size = io::copy(&mut File::from(fd), &mut self.data.scratchpad)
+            .map_io_err(|| "Stage admitted policy replacement")?;
         self.data.scratchpad.set_len(size).map_io_err(|| "Size replacement staging")?;
         self.data.scratchpad.sync_all().map_io_err(|| "Sync replacement staging")?;
         self.data.alloc_direct(size, mime, ring, staging)?;

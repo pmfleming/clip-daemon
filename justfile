@@ -28,8 +28,13 @@ quality:
     ../rust-quality-lens/target/debug/rqlens check --config rqlens.toml --fail-on partial --fail-on test-failure --fail-on practice-failure
 
 live-acceptance:
+    cargo build --locked --examples
     cargo build --locked
     python3 scripts/isolated-acceptance.py
+
+backend-regressions:
+    cargo build --locked
+    RINGBOARD_SERVER="$(command -v ringboard-server)" python3 scripts/backend-regressions.py
 
 benchmark-history:
     python3 scripts/benchmark-history.py

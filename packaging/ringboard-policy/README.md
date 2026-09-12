@@ -43,6 +43,20 @@ of database-wide power-loss ACID transactions. Ringboard's existing durability
 and recovery model still applies. Staging/sync and install errors are reported;
 failed old-file cleanup is logged for retry.
 
+## Capture admission
+
+`clip-daemon-max-bytes` in the Ringboard data directory is an atomic decimal
+configuration shared by server and watcher. Missing configuration defaults to
+16 MiB; malformed values reject admission. The hard ceiling is 64 MiB.
+
+The watcher uses bounded memory-backed staging for every MIME, drops oversized
+transfers before persistence, and preserves upstream password-manager-hint
+exclusion. The server snapshots each Add in bounded memory **before** eviction
+or disk staging, protecting against direct clients as well. A rejected legacy
+Add returns reserved ID `u64::MAX`; packaged CLI/watcher paths handle this rather
+than claiming a retained entry exists. Memory-backed buffers may be swapped by
+the OS; no no-swap guarantee is made.
+
 Validation: `RINGBOARD_SERVER=/path/to/patched/ringboard-server python3
 scripts/backend-regressions.py replacement wraparound`; the legacy rejection
 case runs against an unpatched server. `concurrent-mutations` sends eight

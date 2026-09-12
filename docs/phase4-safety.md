@@ -37,7 +37,7 @@ actions, matching the trust level of processes that can already read the user's 
 
 Ringboard 0.16.2 rejects offers carrying `x-kde-passwordManagerHint` and ignores Chromium internal MIME types before persistence. `clip-daemon` does not claim source-window or password-field detection because the Wayland data-control protocol does not reliably identify the offer owner.
 
-Ringboard 0.16.2 has no configurable pre-write byte limit. `max_entry_bytes` is therefore a validated, persisted desired limit, not a claim that an arbitrary Wayland producer is stopped before Ringboard writes. Closing this gap requires the pre-write Ringboard patch identified in the architecture decision; the daemon still bounds reads, details, thumbnails, edited images, and materialized transfers.
+The packaged Ringboard policy patch closes the stock 0.16.2 pre-write byte-limit gap. Watcher transfers use bounded memory-backed files and reject oversized offers before persistence. Server admission independently checks every Add before disk staging or retention eviction. Both enforce `min(max_entry_bytes, 64 MiB)` from the same atomic policy file; malformed policy fails closed. `settings.get.retention.effective` reports the live server limit. Stock Ringboard does not provide this guarantee and is not a supported mutation engine. Memory-backed files remain subject to OS swapping; existing history is not retroactively erased.
 
 Hyprland targets are revalidated by the compositor when the post-hide shortcut is sent. If the target disappeared, the item remains selected and a copy-only notification is shown. Unsupported compositors remain copy-only. Terminal classes are configurable only in code at this phase and use `Ctrl+Shift+V`; other targets use `Ctrl+V`.
 
