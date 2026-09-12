@@ -363,9 +363,24 @@ def retention_recovery(desktop):
     assert result.returncode != 0
 
 
+def full_text_search(_desktop):
+    value = "x" * (16 * 1024 - 1) + "ÉCOLE\nİstanbul" + "y" * 90_000 + "late-needle"
+    add(value)
+    add("other text")
+    for query in ["école\ni̇stanbul", "late-needle"]:
+        page = call("clipboard.history.query", {"query": query, "limit": 1})["history"]
+        assert len(page["entries"]) == 1 and page["entries"][0]["byte_size"] == len(value.encode()), page
+        again = call("clipboard.history.query", {"query": query, "limit": 1})["history"]
+        assert again == page, "cached search differs"
+    assert not call("clipboard.history.query", {"query": "absent"})["history"]["entries"]
+    call("clipboard.history.query", {"query": "x" * 4097}, ok=False)
+    add("new capture")  # evicts the matching entry; cached hits must be invalidated
+    assert not call("clipboard.history.query", {"query": "late-needle"})["history"]["entries"]
+
+
 CASES = {"wraparound": wraparound, "replacement": replacement,
          "legacy-replacement": legacy_replacement, "artifact-references": artifact_references,
-         "privacy-retry": privacy_retry, "subscription-baselines": subscription_baselines, "echo-identity": echo_identity, "png-contract": png_contract, "concurrent-mutations": concurrent_mutations, "retention-recovery": retention_recovery}
+         "privacy-retry": privacy_retry, "subscription-baselines": subscription_baselines, "echo-identity": echo_identity, "png-contract": png_contract, "concurrent-mutations": concurrent_mutations, "retention-recovery": retention_recovery, "full-text-search": full_text_search}
 
 
 def isolated(case):

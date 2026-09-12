@@ -126,6 +126,9 @@ impl ClipboardService {
         params: QueryParams,
         collapse_self_echoes: bool,
     ) -> Result<Value, ApiError> {
+        if params.query.len() > crate::backend::MAX_QUERY_BYTES {
+            return Err(ApiError::validation("Search query exceeds 4096 bytes"));
+        }
         if !(1..=MAX_QUERY_LIMIT).contains(&params.limit) {
             return Err(ApiError::validation("limit must be between 1 and 200"));
         }

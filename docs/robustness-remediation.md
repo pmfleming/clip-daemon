@@ -132,3 +132,18 @@ than reported as applied. Missing byte enforcement is explicitly reported as
 Validation: real-server tests cover native limit adoption, two failed restart
 attempts with desired/effective mismatch, subsequent server restart/recovery, and
 rejection of invalid persisted limits. Rust tests and strict Clippy pass.
+
+## Gap 11 — complete text search
+
+Nonempty searches inspect complete textual entries using a streaming Unicode
+lowercase matcher with bounded buffers, including matches spanning read/UTF-8
+boundaries. Previews and MIME matching remain available. Queries are limited to
+4096 bytes; one search-result set is cached per history token for pagination.
+No full clipboard-text index is persisted or retained in memory. Inline image
+and unknown binary payloads are not decoded as searchable text.
+
+Validation: a 100+ KiB real entry matches beyond the preview, across a multibyte
+boundary and across a newline. Repeated queries agree, eviction invalidates cached
+hits, oversized queries fail validation, and malformed UTF-8 fails safely. Rust
+tests and strict Clippy pass. Historical projection-only benchmark results do not
+measure this new full-text scan.

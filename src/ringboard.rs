@@ -41,6 +41,7 @@ mod content;
 pub(crate) mod ipc;
 mod mutation;
 mod operation;
+mod search;
 use operation::OperationControl;
 
 use artifacts::ArtifactRegistry;
@@ -72,6 +73,7 @@ struct RevisionState {
 struct SummaryCache {
     token: Option<u64>,
     projection: Option<CachedProjection>,
+    search: Option<(String, HashSet<u64>)>,
 }
 
 #[derive(Clone)]
@@ -92,6 +94,7 @@ impl SummaryCache {
     fn select_token(&mut self, token: u64) {
         if self.token != Some(token) {
             self.projection = None;
+            self.search = None;
         }
         self.token = Some(token);
     }
@@ -179,7 +182,16 @@ impl CachedProjection {
         Ok(projection)
     }
 
+    #[cfg(test)]
     fn project(&self, query: &HistoryQuery) -> QueryProjection {
+        self.project_matches(query, None)
+    }
+
+    fn project_matches(
+        &self,
+        query: &HistoryQuery,
+        full_matches: Option<&HashSet<u64>>,
+    ) -> QueryProjection {
         let ids = self
             .candidates
             .iter()
@@ -213,8 +225,13 @@ impl CachedProjection {
                     .is_none()
             })
             .inspect(|candidate| projection.push(candidate, current_id))
+            .filter(|candidate| {
+                full_matches.map_or_else(
+                    || matches_query(&candidate.resolved.summary, &needle),
+                    |matches| matches.contains(&candidate.raw_id),
+                )
+            })
             .map(|candidate| &candidate.resolved.summary)
-            .filter(|summary| matches_query(summary, &needle))
             .collect();
         projection.matched = matches.len();
         projection.entries = matches
@@ -440,6 +457,9 @@ impl RingboardBackend {
     }
 
     fn query_sync(&self, query: HistoryQuery) -> BackendResult<HistoryPage> {
+        if query.query.len() > crate::backend::MAX_QUERY_BYTES {
+            return Err(invalid_data("Search query exceeds 4096 bytes"));
+        }
         let (database, mut reader) = Self::open()?;
         let token = history_token(&database)?;
         let projection = collect_query_projection(self, &database, &mut reader, &query, token)?;
@@ -565,6 +585,7 @@ impl RingboardBackend {
         let mut cache = self.summaries.lock().map_err(|_| lock_error())?;
         cache.token = None;
         cache.projection = None;
+        cache.search = None;
         Ok(())
     }
 
@@ -629,22 +650,68 @@ fn collect_query_projection(
 ) -> BackendResult<QueryProjection> {
     let mut cache = backend.summaries.lock().map_err(|_| lock_error())?;
     cache.select_token(token);
-    if let Some(projection) = &cache.projection {
-        return Ok(projection.project(query));
+    let result = project_query(backend, &mut cache, database, reader, query, token);
+    if !result.as_ref().is_ok_and(|projection| projection.complete) {
+        *cache = SummaryCache::default();
     }
-    let projection = CachedProjection::load(backend, database, reader)?;
+    result
+}
+
+fn project_query(
+    backend: &RingboardBackend,
+    cache: &mut SummaryCache,
+    database: &DatabaseReader,
+    reader: &mut EntryReader,
+    query: &HistoryQuery,
+    token: u64,
+) -> BackendResult<QueryProjection> {
+    if cache.projection.is_none() {
+        cache.projection = Some(CachedProjection::load(backend, database, reader)?);
+    }
+    let projection = cache.projection.as_ref().ok_or_else(lock_error)?;
+    let needle = search::fold(query.query.trim());
+    if !needle.is_empty()
+        && cache
+            .search
+            .as_ref()
+            .is_none_or(|(previous, _)| previous != &needle)
+    {
+        let matcher = search::Matcher::new(&needle);
+        let mut matches = HashSet::new();
+        for candidate in &projection.candidates {
+            let summary = &candidate.resolved.summary;
+            if matches_query(summary, &needle) {
+                matches.insert(candidate.raw_id);
+                continue;
+            }
+            if summary.mime.starts_with("image/") || summary.kind == crate::model::EntryKind::Binary
+            {
+                continue;
+            }
+            let entry = database
+                .get_raw(candidate.raw_id)
+                .map_err(|_| BackendError::stale("History changed during search"))?;
+            let mut file = entry
+                .to_file(reader)
+                .map_err(|_| invalid_entry("Could not search clipboard entry"))?;
+            if matcher
+                .contains(&mut *file)
+                .map_err(|_| invalid_entry("Could not search clipboard entry"))?
+            {
+                matches.insert(candidate.raw_id);
+            }
+        }
+        cache.search = Some((needle.clone(), matches));
+    }
     if history_token(database)? != token {
-        cache.projection = None;
         return Err(BackendError::stale(
             "History changed while it was being read; retry the query",
         ));
     }
-    let result = projection.project(query);
-    // Retry unreadable entries on the next query rather than caching an outage.
-    if projection.complete {
-        cache.projection = Some(projection);
-    }
-    Ok(result)
+    let matches = (!needle.is_empty())
+        .then(|| cache.search.as_ref().map(|(_, matches)| matches))
+        .flatten();
+    Ok(projection.project_matches(query, matches))
 }
 
 fn finalize_query(

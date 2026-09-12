@@ -8,6 +8,7 @@ use crate::model::{
 };
 
 pub const MAX_QUERY_LIMIT: usize = 200;
+pub const MAX_QUERY_BYTES: usize = 4096;
 pub const MAX_WAYLAND_SELECTION_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
