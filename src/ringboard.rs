@@ -369,7 +369,7 @@ impl RingboardBackend {
                 .and_then(|source| registry.match_local_image(source));
             let inline_echo_source =
                 matches!(content.image(), Some(content::ResolvedImage::Inline { .. }))
-                    .then(|| registry.match_inline_echo(content.mime(), &bytes, &id))
+                    .then(|| registry.match_inline_echo(content.mime(), &content_digest, &id))
                     .flatten();
             (generated_paths, echo_source_id, inline_echo_source)
         };
@@ -997,13 +997,18 @@ fn operation_failed(message: &'static str) -> BackendError {
     BackendError::new(BackendErrorKind::OperationFailed, message)
 }
 
+fn content_hasher() -> Sha256 {
+    let mut hash = Sha256::new();
+    hash.update(b"clip-daemon:entry-content:v1:");
+    hash
+}
+
 fn inspect_entry(source: &mut impl Read, expected_size: u64) -> BackendResult<(Vec<u8>, [u8; 32])> {
     let preview_capacity = usize::try_from(expected_size)
         .unwrap_or(usize::MAX)
         .min(INSPECTION_LIMIT);
     let mut preview = Vec::with_capacity(preview_capacity);
-    let mut hasher = Sha256::new();
-    hasher.update(b"clip-daemon:entry-content:v1:");
+    let mut hasher = content_hasher();
     let read_error = |_| invalid_entry("Could not read clipboard entry");
     source
         .by_ref()

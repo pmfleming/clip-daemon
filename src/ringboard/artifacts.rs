@@ -9,6 +9,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use shelllist_daemon_core::{XdgRoot, resolve_xdg_root};
 use url::Url;
 use uuid::Uuid;
@@ -28,6 +29,8 @@ struct ArtifactRecord {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct InlineEchoRecord {
+    #[serde(default)]
+    identity_version: u8,
     source_entry_id: String,
     image_identity: String,
     #[serde(default)]
@@ -82,6 +85,7 @@ impl ArtifactRegistry {
         let inline_echoes = manifest
             .inline_echoes
             .into_iter()
+            .filter(|record| record.identity_version == 2)
             .map(|record| (record.image_identity.clone(), record))
             .collect();
         Self {
@@ -143,10 +147,13 @@ impl ArtifactRegistry {
         mime: &str,
         bytes: &[u8],
     ) -> BackendResult<()> {
-        let identity = inline_image_identity(mime, bytes);
+        let mut content = super::content_hasher();
+        content.update(bytes);
+        let identity = inline_image_identity(mime, &content.finalize().into());
         self.inline_echoes.insert(
             identity.clone(),
             InlineEchoRecord {
+                identity_version: 2,
                 source_entry_id: source_entry_id.to_owned(),
                 image_identity: identity,
                 created_at: unix_time(),
@@ -164,10 +171,15 @@ impl ArtifactRegistry {
         self.persist()
     }
 
-    pub fn match_inline_echo(&self, mime: &str, bytes: &[u8], entry_id: &str) -> Option<String> {
+    pub fn match_inline_echo(
+        &self,
+        mime: &str,
+        digest: &[u8; 32],
+        entry_id: &str,
+    ) -> Option<String> {
         let record = self
             .inline_echoes
-            .get(&inline_image_identity(mime, bytes))?;
+            .get(&inline_image_identity(mime, digest))?;
         (record.source_entry_id != entry_id).then(|| record.source_entry_id.clone())
     }
 
@@ -292,8 +304,13 @@ fn remove_artifact(root: Option<&Path>, path: &Path) -> Option<bool> {
     }
 }
 
-fn inline_image_identity(mime: &str, bytes: &[u8]) -> String {
-    image_identity(mime, &bytes[..bytes.len().min(super::INSPECTION_LIMIT)])
+fn inline_image_identity(mime: &str, digest: &[u8; 32]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"clip-daemon:inline-echo:v2:");
+    hash.update(mime.as_bytes());
+    hash.update([0]);
+    hash.update(digest);
+    hex::encode(hash.finalize())
 }
 
 fn read_registered_image(source: &LocalImageSource) -> Option<String> {
@@ -359,8 +376,14 @@ mod tests {
             .register_inline_echo("replacement", "image/png", b"edited-image")
             .unwrap();
 
+        use sha2::Digest;
+        let digest = |bytes: &[u8]| {
+            let mut hash = super::super::content_hasher();
+            hash.update(bytes);
+            <[u8; 32]>::from(hash.finalize())
+        };
         let echo = |registry: &ArtifactRegistry, entry| {
-            registry.match_inline_echo("image/png", b"edited-image", entry)
+            registry.match_inline_echo("image/png", &digest(b"edited-image"), entry)
         };
         assert_eq!(echo(&registry, "captured-echo"), Some("replacement".into()));
         assert_eq!(echo(&registry, "replacement"), None);
@@ -372,12 +395,26 @@ mod tests {
         registry
             .register_inline_echo("large-replacement", "image/png", &large)
             .unwrap();
-        let matched = registry.match_inline_echo(
-            "image/png",
-            &large[..super::super::INSPECTION_LIMIT],
-            "large-echo",
+        assert_eq!(
+            registry.match_inline_echo("image/png", &digest(&large), "large-echo"),
+            Some("large-replacement".into())
         );
-        assert_eq!(matched, Some("large-replacement".into()));
+        let mut different = large.clone();
+        *different.last_mut().unwrap() = 8;
+        assert!(
+            registry
+                .match_inline_echo("image/png", &digest(&different), "distinct")
+                .is_none()
+        );
+        assert!(
+            registry
+                .match_inline_echo(
+                    "image/png",
+                    &digest(&large[..super::super::INSPECTION_LIMIT]),
+                    "prefix"
+                )
+                .is_none()
+        );
     }
 
     #[test]

@@ -5,6 +5,9 @@ Requires ringboard, ringboard-server, busctl and dbus-run-session. Does not use
 or control the user's services, clipboard or Wayland compositor.
 """
 import json
+import hashlib
+import struct
+import zlib
 import os
 import queue
 import threading
@@ -214,9 +217,30 @@ def subscription_baselines(desktop):
         assert received == {"clipboard.history.changed", "clipboard.current.changed"}
 
 
+def echo_identity(desktop):
+    def image(last_row):
+        def chunk(kind, data):
+            return struct.pack("!I", len(data)) + kind + data + struct.pack("!I", zlib.crc32(kind + data))
+        pixels = (b"\0" + b"\xff\0\0" * 256) * 127 + b"\0" + last_row * 256
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack("!2I5B", 256, 128, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(pixels, level=0)) + chunk(b"IEND", b""))
+    original, distinct = image(b"\xff\0\0"), image(b"\0\0\xff")
+    assert original[:65536] == distinct[:65536] and original != distinct
+    add(original, mime="image/png")
+    source = history()["current"]["id"]
+    content = hashlib.sha256(b"clip-daemon:entry-content:v1:" + original).digest()
+    identity = hashlib.sha256(b"clip-daemon:inline-echo:v2:image/png\0" + content).hexdigest()
+    manifest = Path(os.environ["XDG_STATE_HOME"]) / "clip-daemon/generated-files.json"
+    manifest.write_text(json.dumps({"records": [], "inline_echoes": [{"identity_version": 2,
+        "source_entry_id": source, "image_identity": identity, "created_at": int(time.time())}]}))
+    add(distinct, mime="image/png")
+    desktop.restart_daemon()
+    assert len(history()["entries"]) == 2, "distinct image was collapsed"
+
+
 CASES = {"wraparound": wraparound, "replacement": replacement,
          "legacy-replacement": legacy_replacement, "artifact-references": artifact_references,
-         "privacy-retry": privacy_retry, "subscription-baselines": subscription_baselines}
+         "privacy-retry": privacy_retry, "subscription-baselines": subscription_baselines, "echo-identity": echo_identity}
 
 
 def isolated(case):

@@ -79,3 +79,14 @@ query-to-subscribe race for additional frontends.
 
 Validation: two simultaneously connected JSONL clients each receive initial
 history and current resets against real Ringboard. Rust tests and Clippy pass.
+
+## 7 — full-content annotation echo identity
+
+Echo matching reuses the complete streamed content digest, not its preview.
+Persisted echo records carry identity version 2; weak legacy records are discarded
+rather than guessed or migrated from incomplete data. Generated-file ownership
+records remain intact.
+
+Validation: differing image suffixes and truncated prefixes do not match in unit
+tests. Two valid PNGs with identical first 64 KiB and different final pixels both
+remain visible in the real-backend regression. Rust tests and Clippy pass.
