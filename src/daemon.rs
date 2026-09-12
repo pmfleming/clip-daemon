@@ -91,7 +91,7 @@ impl ClipDaemon {
         }
         api::error(
             "request-not-found",
-            format!("No active subscription or operation named {request_id}"),
+            format!("No cancellable subscription or operation named {request_id}; an operation may already be committing"),
         )
         .to_string()
     }

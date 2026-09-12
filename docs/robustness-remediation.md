@@ -54,3 +54,18 @@ not an unverified privacy claim.
 Validation: deterministic injected failures plus isolated D-Bus tests cover two
 failed attempts, successful retry, daemon restart and an external service-state
 change. Rust tests and strict Clippy pass.
+
+## 5 — cancellation/commit boundary and cleanup barrier
+
+Annotation control has mutually exclusive editing, committing and cancelled
+states. Cancellation can win only before the blocking commit begins; once it
+begins, the operation keeps its files and reports the actual completion/failure.
+Cleanup and wipe block new annotation launches, cancel editors with terminal
+events, and wait for committing jobs before touching history or caches. Backend
+jobs are serialized against daemon-local queries/mutations to prevent cleanup
+and identity installation from interleaving.
+
+Validation: a deterministic real `spawn_blocking` test holds a commit at a
+barrier, verifies cancellation is refused and files remain, then verifies cleanup
+waits and receives exactly one completed event. Pre-start/running-editor
+cancellation tests still pass. Rust tests and strict Clippy pass.

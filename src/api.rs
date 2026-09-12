@@ -76,7 +76,9 @@ impl ApiService {
             return false;
         }
         let cancelled = self.actions.cancel(operation_id).await;
-        owners.remove(operation_id);
+        if cancelled {
+            owners.remove(operation_id);
+        }
         cancelled
     }
 

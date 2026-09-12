@@ -30,14 +30,14 @@ use uuid::Uuid;
 
 use crate::{
     backend::{
-        BackendError, BackendErrorKind, BackendResult, EntryTarget, MAX_WAYLAND_SELECTION_BYTES,
-        ScreenshotRegion,
+        BackendError, BackendErrorKind, BackendResult, ClipboardBackend, EntryTarget,
+        MAX_WAYLAND_SELECTION_BYTES, ScreenshotRegion,
     },
     model::{EntryKind, OperationResult},
 };
 
 use super::{
-    MAX_THUMBNAIL_BYTES, OperationTask, RingboardBackend,
+    MAX_THUMBNAIL_BYTES, OperationControl, OperationTask, RingboardBackend,
     content::{Publication, ResolvedContent, ResolvedImage},
     invalid_entry, run_blocking,
 };
@@ -70,6 +70,7 @@ async fn complete_annotation(
     ready: oneshot::Receiver<()>,
     operations: Arc<Mutex<HashMap<String, OperationTask>>>,
     events: broadcast::Sender<OperationResult>,
+    control: Arc<OperationControl>,
     run: impl Future<Output = BackendResult<OperationCompletion>>,
 ) {
     let result = if ready.await.is_ok() {
@@ -78,6 +79,7 @@ async fn complete_annotation(
         Err(operation_error("Clipboard operation could not start"))
     };
     if !claim_terminal_event(&operations, &id) {
+        control.finish();
         return;
     }
     let event = match result {
@@ -85,6 +87,7 @@ async fn complete_annotation(
         Err(error) => OperationResult::with_id(id, "annotate", "failed", &error.to_string()),
     };
     let _ = events.send(event);
+    control.finish();
 }
 
 fn claim_terminal_event(
@@ -190,12 +193,14 @@ impl RingboardBackend {
         operation.status = "started".into();
         let operation_id = operation.id.clone();
         let (start, ready) = oneshot::channel();
+        let control = Arc::new(OperationControl::default());
         let handle = tokio::spawn(complete_annotation(
             operation_id.clone(),
             ready,
             Arc::clone(&self.operations),
             self.operation_events.clone(),
-            run_annotation(self.clone(), staged),
+            Arc::clone(&control),
+            run_annotation(self.clone(), staged, Arc::clone(&control)),
         ));
         let mut active = match self.operations.lock() {
             Ok(active) => active,
@@ -205,12 +210,19 @@ impl RingboardBackend {
                 return Err(operation_error("Clipboard operation state is unavailable"));
             }
         };
-        active.insert(operation_id, OperationTask { handle, files });
+        active.insert(
+            operation_id,
+            OperationTask {
+                control,
+                handle,
+                files,
+            },
+        );
         drop(active);
+        let _ = self.operation_events.send(operation.clone());
         start
             .send(())
             .map_err(|_| operation_error("Annotation task could not be started"))?;
-        let _ = self.operation_events.send(operation.clone());
         Ok(operation)
     }
 
@@ -339,6 +351,24 @@ impl RingboardBackend {
         ))
     }
 
+    pub(super) async fn stop_operations(&self) -> BackendResult<()> {
+        let active: Vec<_> = self
+            .operations
+            .lock()
+            .map_err(|_| super::lock_error())?
+            .iter()
+            .map(|(id, task)| (id.clone(), Arc::clone(&task.control)))
+            .collect();
+        for (id, control) in active {
+            if !self.cancel_operation(&id).await? {
+                // Never hold the backend transaction lock while waiting: the
+                // committing job needs it to complete and release staged files.
+                control.wait().await;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn wipe_entries(&self) -> BackendResult<OperationResult> {
         remove_all_entries()?;
         cleanup_backend(self)?;
@@ -349,23 +379,11 @@ impl RingboardBackend {
 }
 
 fn cleanup_backend(backend: &RingboardBackend) -> BackendResult<usize> {
-    stop_operations(backend)?;
     super::content::clear_cache()?;
     let runtime = runtime_directory("clip-daemon")?;
     fs::remove_dir_all(runtime).map_err(operation_error)?;
     let references = backend.generated_artifact_references()?;
     backend.artifact_registry()?.reconcile(&references)
-}
-
-fn stop_operations(backend: &RingboardBackend) -> BackendResult<()> {
-    let mut operations = backend
-        .operations
-        .lock()
-        .map_err(|_| operation_error("Clipboard operation state is unavailable"))?;
-    operations
-        .drain()
-        .for_each(|(_, operation)| operation.handle.abort());
-    Ok(())
 }
 
 fn remove_all_entries() -> BackendResult<()> {
@@ -412,6 +430,7 @@ fn capture_and_publish(
 async fn run_annotation(
     backend: RingboardBackend,
     staged: AnnotationStage,
+    control: Arc<OperationControl>,
 ) -> BackendResult<OperationCompletion> {
     let AnnotationStage {
         input,
@@ -429,7 +448,14 @@ async fn run_annotation(
         .map_err(operation_error)
     {
         Ok(()) if output.is_file() => {
+            if !control.begin_commit() {
+                return Err(operation_error("Image edit was cancelled before commit"));
+            }
             run_blocking(move || {
+                let _transaction = backend
+                    .transaction
+                    .lock()
+                    .map_err(|_| super::lock_error())?;
                 apply_annotation(&backend, &opaque_id, revision, &output, max_bytes)
             })
             .await
@@ -717,6 +743,7 @@ mod tests {
         let operations = std::sync::Mutex::new(std::collections::HashMap::from([(
             "operation-1".to_owned(),
             OperationTask {
+                control: Default::default(),
                 handle: tokio::spawn(async {}),
                 files: Vec::new(),
             },
@@ -737,11 +764,13 @@ mod tests {
             fs::write(&staged, b"fixture").unwrap();
             let (start, ready) = tokio::sync::oneshot::channel();
             let (started, running) = tokio::sync::oneshot::channel();
+            let control = std::sync::Arc::new(super::OperationControl::default());
             let handle = tokio::spawn(super::complete_annotation(
                 "cancel-me".into(),
                 ready,
                 backend.operations.clone(),
                 backend.operation_events.clone(),
+                control.clone(),
                 async move {
                     let _ = started.send(());
                     std::future::pending().await
@@ -750,6 +779,7 @@ mod tests {
             backend.operations.lock().unwrap().insert(
                 "cancel-me".into(),
                 OperationTask {
+                    control,
                     handle,
                     files: vec![staged.clone()],
                 },
@@ -767,6 +797,66 @@ mod tests {
             assert!(!staged.exists());
             assert!(backend.operations.lock().unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_waits_for_a_blocking_commit_and_keeps_its_real_outcome() {
+        use std::sync::Arc;
+        let backend = super::RingboardBackend::default();
+        let mut events = backend.operation_events.subscribe();
+        let directory = tempfile::tempdir().unwrap();
+        let staged = directory.path().join("staged.png");
+        fs::write(&staged, b"fixture").unwrap();
+        let control = Arc::new(super::OperationControl::default());
+        assert!(control.begin_commit());
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (entered, running) = tokio::sync::oneshot::channel();
+        let (start, ready) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(super::complete_annotation(
+            "committing".into(),
+            ready,
+            backend.operations.clone(),
+            backend.operation_events.clone(),
+            control.clone(),
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let _ = entered.send(());
+                    blocked.recv().unwrap();
+                })
+                .await
+                .unwrap();
+                Ok(super::OperationCompletion {
+                    message: "Committed",
+                    warning: None,
+                })
+            },
+        ));
+        backend.operations.lock().unwrap().insert(
+            "committing".into(),
+            OperationTask {
+                control,
+                handle,
+                files: vec![staged.clone()],
+            },
+        );
+        start.send(()).unwrap();
+        running.await.unwrap();
+        assert!(
+            !super::ClipboardBackend::cancel_operation(&backend, "committing")
+                .await
+                .unwrap()
+        );
+        assert!(staged.exists());
+        assert!(events.try_recv().is_err());
+        let other = backend.clone();
+        let cleanup = tokio::spawn(async move { other.stop_operations().await });
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!cleanup.is_finished());
+        release.send(()).unwrap();
+        cleanup.await.unwrap().unwrap();
+        assert_eq!(events.try_recv().unwrap().status, "completed");
+        assert!(events.try_recv().is_err());
+        assert!(!staged.exists());
     }
 
     #[test]

@@ -40,6 +40,8 @@ mod benchmarks;
 mod content;
 mod ipc;
 mod mutation;
+mod operation;
+use operation::OperationControl;
 
 use artifacts::ArtifactRegistry;
 use content::{
@@ -53,7 +55,10 @@ const MAX_FILES: usize = 100;
 macro_rules! run_backend {
     ($source:expr, $method:ident($($argument:expr),* $(,)?)) => {{
         let backend = $source.clone();
-        run_blocking(move || backend.$method($($argument),*)).await
+        run_blocking(move || {
+            let _transaction = backend.transaction.lock().map_err(|_| lock_error())?;
+            backend.$method($($argument),*)
+        }).await
     }};
 }
 
@@ -93,6 +98,7 @@ impl SummaryCache {
 }
 
 struct OperationTask {
+    control: Arc<OperationControl>,
     handle: JoinHandle<()>,
     files: Vec<PathBuf>,
 }
@@ -227,6 +233,8 @@ impl CachedProjection {
 
 #[derive(Clone)]
 pub struct RingboardBackend {
+    transaction: Arc<Mutex<()>>,
+    operation_gate: Arc<tokio::sync::Mutex<()>>,
     ids: Arc<Mutex<HashMap<String, IdentityBinding>>>,
     revision: Arc<Mutex<RevisionState>>,
     summaries: Arc<Mutex<SummaryCache>>,
@@ -241,6 +249,8 @@ impl Default for RingboardBackend {
     fn default() -> Self {
         let (operation_events, _) = broadcast::channel(64);
         Self {
+            transaction: Arc::new(Mutex::new(())),
+            operation_gate: Arc::new(tokio::sync::Mutex::new(())),
             ids: Arc::new(Mutex::new(HashMap::new())),
             revision: Arc::new(Mutex::new(RevisionState::default())),
             summaries: Arc::new(Mutex::new(SummaryCache::default())),
@@ -741,6 +751,11 @@ impl ClipboardBackend for RingboardBackend {
         mutation: BackendMutation,
     ) -> BackendResult<OperationResult> {
         mutation.require_revision(expected_revision)?;
+        // Exclude new annotation launches while cleanup/wipe drains old jobs.
+        let _gate = self.operation_gate.lock().await;
+        if matches!(mutation, BackendMutation::Wipe | BackendMutation::Cleanup) {
+            self.stop_operations().await?;
+        }
         if let BackendMutation::Annotate { max_bytes } = mutation {
             let opaque_id = opaque_id.to_owned();
             let staged = run_backend!(
@@ -775,28 +790,33 @@ impl ClipboardBackend for RingboardBackend {
     }
 
     async fn cancel_operation(&self, operation_id: &str) -> BackendResult<bool> {
-        let operation = self
-            .operations
-            .lock()
-            .map_err(|_| lock_error())?
-            .remove(operation_id);
+        let operation = {
+            let mut operations = self.operations.lock().map_err(|_| lock_error())?;
+            if !operations
+                .get(operation_id)
+                .is_some_and(|operation| operation.control.cancel())
+            {
+                // A committing job cannot be aborted. It retains its files and
+                // emits its real committed/failed outcome; callers may wait.
+                return Ok(false);
+            }
+            operations.remove(operation_id)
+        };
         let Some(mut operation) = operation else {
             return Ok(false);
         };
-        let was_running = !operation.handle.is_finished();
         operation.handle.abort();
         let _ = (&mut operation.handle).await;
-        let operation_id = operation_id.to_owned();
+        let control = Arc::clone(&operation.control);
         drop(operation);
-        if was_running {
-            let _ = self.operation_events.send(OperationResult::with_id(
-                operation_id,
-                "annotate",
-                "cancelled",
-                "Image edit cancelled",
-            ));
-        }
-        Ok(was_running)
+        let _ = self.operation_events.send(OperationResult::with_id(
+            operation_id.to_owned(),
+            "annotate",
+            "cancelled",
+            "Image edit cancelled",
+        ));
+        control.finish();
+        Ok(true)
     }
 }
 
