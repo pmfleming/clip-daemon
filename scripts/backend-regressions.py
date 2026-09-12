@@ -17,6 +17,9 @@ import sys
 import tempfile
 import time
 import uuid
+import array
+import socket
+from concurrent.futures import ThreadPoolExecutor
 
 BINARY = Path(__file__).resolve().parents[1] / "target/debug/clip-daemon"
 BUS = "org.laufan.ClipDaemon"
@@ -280,9 +283,55 @@ def png_contract(desktop):
     assert history()["current"]["id"] == original["id"]
 
 
+def content_proof(value, mime=b""):
+    content = hashlib.sha256(b"clip-daemon:entry-content:v1:" + value).digest()
+    return hashlib.sha256(b"clip-daemon:proof:v1:" + content + mime).digest()
+
+
+def policy_request(op, raw_id, proof, value=None, barrier=None):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
+        connection.settimeout(10)
+        connection.connect(os.environ["RINGBOARD_SOCK"])
+        connection.send(b"\xc1")
+        assert connection.recv(1) == b"\xc1", "patched policy server required"
+        mime = b"text/plain" if op == 1 else b""
+        packet = b"CDP1" + bytes([op]) + struct.pack("<Q", raw_id) + proof + bytes([len(mime)]) + mime
+        if barrier:
+            barrier.wait(timeout=10)
+        if value is None:
+            connection.send(packet)
+        else:
+            with tempfile.TemporaryFile() as file:
+                file.write(value)
+                file.seek(0)
+                connection.sendmsg([packet], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [file.fileno()]))])
+        response = connection.recv(5)
+        assert response[:4] == b"CDR1", response
+        return response[4]
+
+
+def concurrent_mutations(_desktop):
+    raw = int(add("original").split()[-1])
+    proof = content_proof(b"original")
+    barrier = threading.Barrier(8)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda i: policy_request(1, raw, proof, f"writer-{i}".encode(), barrier), range(8)))
+    assert results.count(0) == 1 and results.count(1) == 7, results
+    assert history()["current"]["preview"].startswith("writer-")
+    second = int(add("another").split()[-1])
+    targets = struct.pack("<I", 2) + struct.pack("<Q", second) + content_proof(b"another") + struct.pack("<Q", raw) + proof
+    assert policy_request(6, 0, bytes(32), targets) == 1
+    assert len(history()["entries"]) == 2, "stale bulk selection partially deleted history"
+    assert policy_request(2, raw, proof) == 1
+    assert policy_request(3, second, content_proof(b"another")) == 0
+    assert any(e["favorite"] for e in history()["entries"])
+    assert policy_request(5, 0, bytes(32)) == 0
+    assert not history()["entries"]
+
+
 CASES = {"wraparound": wraparound, "replacement": replacement,
          "legacy-replacement": legacy_replacement, "artifact-references": artifact_references,
-         "privacy-retry": privacy_retry, "subscription-baselines": subscription_baselines, "echo-identity": echo_identity, "png-contract": png_contract}
+         "privacy-retry": privacy_retry, "subscription-baselines": subscription_baselines, "echo-identity": echo_identity, "png-contract": png_contract, "concurrent-mutations": concurrent_mutations}
 
 
 def isolated(case):
@@ -311,6 +360,7 @@ if __name__ == "__main__":
         finally:
             desktop.close()
     else:
-        cases = sys.argv[1:] or [name for name in CASES if (name != "legacy-replacement" if os.environ.get("RINGBOARD_SERVER") else name != "replacement")]
+        needs_policy = {"replacement", "concurrent-mutations"}
+        cases = sys.argv[1:] or [name for name in CASES if (name != "legacy-replacement" if os.environ.get("RINGBOARD_SERVER") else name not in needs_policy)]
         for case in cases:
             isolated(case)

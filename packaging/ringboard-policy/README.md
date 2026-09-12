@@ -10,9 +10,14 @@ instead. An unpatched server returns version 0 and closes the connection; the
 daemon refuses to send any mutating request in that case. Never send extension
 packets to a server without a successful policy handshake.
 
-Packets: `CDP1`, operation byte (1 = compare-and-replace), raw entry ID (u64 LE),
+Packets: `CDP1`, operation byte (1 = compare-and-replace, 2 = compare-and-remove,
+3/4 = compare-and-favorite/unfavorite, 5 = wipe, 6 = validated bulk delete), raw entry ID (u64 LE),
 32-byte expected content proof, MIME length (u8, maximum 96), MIME bytes. Replace
-also passes one regular file descriptor using SCM_RIGHTS. Replies are `CDR1`
+also passes one regular file descriptor using SCM_RIGHTS. Bulk delete passes a
+regular file containing u32 LE count followed by that many (u64 LE ID, 32-byte
+proof) pairs; 1–5000 unique targets are validated before any removal. Wipe and
+bulk delete execute in a single reactor turn, so other requests cannot interleave.
+Disk-I/O failures are still reported as potentially partial outcomes. Replies are `CDR1`
 plus status: 0 committed, 1 stale/missing, 2 rejected/error. IPC waits are bounded.
 A lost reply is an uncertain outcome: refresh history before retrying.
 
@@ -35,5 +40,8 @@ failed old-file cleanup is logged for retry.
 
 Validation: `RINGBOARD_SERVER=/path/to/patched/ringboard-server python3
 scripts/backend-regressions.py replacement wraparound`; the legacy rejection
-case runs against an unpatched server. The replacement test covers the oldest
+case runs against an unpatched server. `concurrent-mutations` sends eight
+simultaneous requests over independent sockets and verifies one winner and seven
+stale failures, plus no partial deletion for an externally stale bulk target.
+The replacement test covers the oldest
 and newest entries in full main/favorite rings and preserves row order/count.

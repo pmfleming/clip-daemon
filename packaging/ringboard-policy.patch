@@ -28,7 +28,7 @@
          },
      );
  
-@@ -42,6 +42,21 @@
+@@ -42,6 +42,22 @@
      allocator: &mut Allocator,
      sequence_number: &mut u64,
  ) -> Result<Option<PendingBufAllocation>, CliError> {
@@ -39,7 +39,8 @@
 +                fds.extend(received);
 +            }
 +        }
-+        let status = if fds.len() == 1 {
++        let needs_file = request_data.get(4).is_some_and(|op| matches!(op, 1 | 6));
++        let status = if fds.len() == usize::from(needs_file) {
 +            allocator.policy_request(request_data, fds.pop())
 +        } else { 2 };
 +        return Ok(Some(send_bufs.init_buf(|_| (), |buf| {

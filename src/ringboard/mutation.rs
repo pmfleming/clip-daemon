@@ -4,26 +4,15 @@ use std::{
     fs::{self, File, OpenOptions},
     future::Future,
     io::{Read, Write},
-    os::{
-        fd::{AsFd, OwnedFd},
-        unix::fs::{OpenOptionsExt, PermissionsExt},
-    },
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command as StdCommand,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
-use clipboard_history_client_sdk::{
-    Entry, EntryReader,
-    api::{MoveToFrontRequest, RemoveRequest, connect_to_server},
-};
-use clipboard_history_core::{
-    dirs::socket_file,
-    protocol::{MoveToFrontResponse, RingKind},
-};
+use clipboard_history_client_sdk::{Entry, EntryReader};
 use image::ImageReader;
-use rustix::net::SocketAddrUnix;
 use tokio::sync::{broadcast, oneshot};
 use url::Url;
 use uuid::Uuid;
@@ -292,9 +281,8 @@ impl RingboardBackend {
         opaque_id: &str,
         expected_revision: Option<u64>,
     ) -> BackendResult<OperationResult> {
-        let server = server()?;
-        let (entry, _, _) = self.selected(opaque_id, expected_revision)?;
-        remove_raw(server, entry.id())?;
+        let (entry, _, resolved) = self.selected_proven(opaque_id, expected_revision)?;
+        super::ipc::remove(entry.id(), &resolved.proof)?;
         self.clear_identity_state()?;
         Ok(completed("delete", "Clipboard entry deleted"))
     }
@@ -302,17 +290,14 @@ impl RingboardBackend {
     pub(super) fn remove_entries(&self, targets: &[EntryTarget]) -> BackendResult<OperationResult> {
         // Resolve and validate the complete selection before mutating history so
         // a stale row cannot turn a bulk request into an avoidable partial delete.
-        let raw_ids = targets
+        let proven = targets
             .iter()
             .map(|target| {
-                self.selected(&target.opaque_id, Some(target.expected_revision))
-                    .map(|(entry, _, _)| entry.id())
+                self.selected_proven(&target.opaque_id, Some(target.expected_revision))
+                    .map(|(entry, _, resolved)| (entry.id(), resolved.proof))
             })
             .collect::<BackendResult<Vec<_>>>()?;
-        let server = server()?;
-        for raw_id in raw_ids {
-            remove_raw(&server, raw_id)?;
-        }
+        super::ipc::remove_many(&proven)?;
         self.clear_identity_state()?;
         let count = targets.len();
         Ok(completed(
@@ -330,14 +315,8 @@ impl RingboardBackend {
         expected_revision: Option<u64>,
         favorite: bool,
     ) -> BackendResult<OperationResult> {
-        let server = server()?;
-        let (entry, _, _) = self.selected(opaque_id, expected_revision)?;
-        let target = target_ring(favorite);
-        let response = MoveToFrontRequest::response(server, entry.id(), Some(target))
-            .map_err(operation_error)?;
-        if matches!(response, MoveToFrontResponse::Error(_)) {
-            return Err(operation_error("Ringboard rejected the favorite change"));
-        }
+        let (entry, _, resolved) = self.selected_proven(opaque_id, expected_revision)?;
+        super::ipc::favorite(entry.id(), &resolved.proof, favorite)?;
         self.clear_identity_state()?;
         let action = if favorite { "favorite" } else { "unfavorite" };
         Ok(OperationResult::completed(action, "Favorite state updated"))
@@ -370,7 +349,7 @@ impl RingboardBackend {
     }
 
     pub(super) fn wipe_entries(&self) -> BackendResult<OperationResult> {
-        remove_all_entries()?;
+        super::ipc::wipe()?;
         cleanup_backend(self)?;
         self.artifact_registry()?.clear_all()?;
         self.clear_identity_state()?;
@@ -384,17 +363,6 @@ fn cleanup_backend(backend: &RingboardBackend) -> BackendResult<usize> {
     fs::remove_dir_all(runtime).map_err(operation_error)?;
     let references = backend.generated_artifact_references()?;
     backend.artifact_registry()?.reconcile(&references)
-}
-
-fn remove_all_entries() -> BackendResult<()> {
-    let (database, _) = RingboardBackend::open()?;
-    let ids = database
-        .favorites()
-        .chain(database.main())
-        .map(|entry| entry.id())
-        .collect::<Vec<_>>();
-    let server = server()?;
-    ids.into_iter().try_for_each(|id| remove_raw(&server, id))
 }
 
 fn capture_and_publish(
@@ -525,20 +493,6 @@ fn publish_annotation(
     Ok(())
 }
 
-fn remove_raw(server: impl AsFd, id: u64) -> BackendResult<()> {
-    let response = RemoveRequest::response(server, id).map_err(operation_error)?;
-    response
-        .error
-        .is_none()
-        .then_some(())
-        .ok_or_else(|| operation_error("Ringboard rejected removal"))
-}
-
-fn server() -> BackendResult<OwnedFd> {
-    let address = SocketAddrUnix::new(socket_file()).map_err(operation_error)?;
-    connect_to_server(&address).map_err(operation_error)
-}
-
 fn selected_bytes(
     backend: &RingboardBackend,
     opaque_id: &str,
@@ -637,14 +591,6 @@ fn selection_size_error(size: u64, limit: u64) -> BackendError {
         BackendErrorKind::InvalidData,
         format!("Clipboard entry is {size} bytes; Wayland publishing is limited to {limit} bytes"),
     )
-}
-
-fn target_ring(favorite: bool) -> RingKind {
-    if favorite {
-        RingKind::Favorites
-    } else {
-        RingKind::Main
-    }
 }
 
 fn valid_edited_image(path: &Path, max_bytes: u64) -> bool {

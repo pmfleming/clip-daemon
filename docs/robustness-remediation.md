@@ -100,3 +100,17 @@ ending in `.png` is not treated as format validation.
 Validation: PNG succeeds; JPEG/GIF/TIFF disguised as PNG, symlinks and truncated
 PNG fail. A real adapter returning GIF to its PNG output path emits failure and
 leaves history unchanged. Rust tests and strict Clippy pass.
+
+## Gap 9 — real-backend concurrent mutations
+
+Extended server-side proof validation to delete and favorite changes. Bulk delete
+validates every unique proof before removing anything, and wipe runs in one
+reactor turn. All facade history mutations now require the negotiated package;
+there is no unsafe fallback to stock multi-request IPC. Capture/other clients
+cannot interleave these operations. This is concurrency atomicity, not a promise
+that a disk failure or power loss can never produce a partial outcome.
+
+Validation: eight independent sockets race replacements against the same proof:
+exactly one commits and seven receive stale status. A mixed valid/stale bulk
+selection deletes nothing. Stale removal, favorite and wipe paths pass against
+the real patched server. Full-ring regressions, Rust tests and Clippy pass.

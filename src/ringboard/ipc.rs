@@ -1,6 +1,11 @@
 //! Negotiated Ringboard policy extension. Legacy servers fail the handshake
 //! before any mutation is sent. See packaging/ringboard-policy/README.md.
-use std::{fs::File, io::IoSlice, os::fd::AsFd, time::Duration};
+use std::{
+    fs::File,
+    io::{IoSlice, Seek, Write},
+    os::fd::AsFd,
+    time::Duration,
+};
 
 use clipboard_history_core::dirs::socket_file;
 use rustix::net::{
@@ -21,6 +26,47 @@ pub(super) fn content_proof(digest: &[u8; 32], stored_mime: &str) -> [u8; 32] {
 }
 
 pub(super) fn replace(id: u64, proof: &[u8; 32], mime: &str, file: &File) -> BackendResult<()> {
+    request(1, id, proof, mime, Some(file))
+}
+
+pub(super) fn remove(id: u64, proof: &[u8; 32]) -> BackendResult<()> {
+    request(2, id, proof, "", None)
+}
+
+pub(super) fn favorite(id: u64, proof: &[u8; 32], value: bool) -> BackendResult<()> {
+    request(if value { 3 } else { 4 }, id, proof, "", None)
+}
+
+pub(super) fn wipe() -> BackendResult<()> {
+    request(5, 0, &[0; 32], "", None)
+}
+
+pub(super) fn remove_many(targets: &[(u64, [u8; 32])]) -> BackendResult<()> {
+    if targets.is_empty() || targets.len() > 5000 {
+        return Err(ipc_error("Invalid deletion count"));
+    }
+    let mut file = File::from(
+        rustix::fs::memfd_create(c"clip-delete-targets", rustix::fs::MemfdFlags::CLOEXEC)
+            .map_err(ipc_error)?,
+    );
+    file.write_all(&(targets.len() as u32).to_le_bytes())
+        .map_err(ipc_error)?;
+    for (id, proof) in targets {
+        file.write_all(&id.to_le_bytes())
+            .and_then(|()| file.write_all(proof))
+            .map_err(ipc_error)?;
+    }
+    file.rewind().map_err(ipc_error)?;
+    request(6, 0, &[0; 32], "", Some(&file))
+}
+
+fn request(
+    op: u8,
+    id: u64,
+    proof: &[u8; 32],
+    mime: &str,
+    file: Option<&File>,
+) -> BackendResult<()> {
     let mime_len = u8::try_from(mime.len())
         .ok()
         .filter(|length| *length <= 96)
@@ -45,20 +91,20 @@ pub(super) fn replace(id: u64, proof: &[u8; 32], mime: &str, file: &File) -> Bac
     let (_, length) = recv(&socket, &mut version, RecvFlags::empty()).map_err(ipc_error)?;
     if length != 1 || version != [0xc1] {
         return Err(BackendError::unavailable(
-            "Safe replacement requires the clip-daemon Ringboard policy package; no history was changed",
+            "Safe mutations require the clip-daemon Ringboard policy package; no history was changed",
         ));
     }
     let mut request = Vec::from(&b"CDP1"[..]);
-    request.push(1); // compare-and-replace
+    request.push(op);
     request.extend_from_slice(&id.to_le_bytes());
     request.extend_from_slice(proof);
     request.push(mime_len);
     request.extend_from_slice(mime.as_bytes());
     let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut ancillary = SendAncillaryBuffer::new(&mut space);
-    let fds = [file.as_fd()];
-    if !ancillary.push(SendAncillaryMessage::ScmRights(&fds)) {
-        return Err(ipc_error("Could not attach replacement file"));
+    let fds: Vec<_> = file.into_iter().map(AsFd::as_fd).collect();
+    if !fds.is_empty() && !ancillary.push(SendAncillaryMessage::ScmRights(&fds)) {
+        return Err(ipc_error("Could not attach policy file"));
     }
     sendmsg(
         &socket,
@@ -77,10 +123,10 @@ pub(super) fn replace(id: u64, proof: &[u8; 32], mime: &str, file: &File) -> Bac
     match response[4] {
         0 => Ok(()),
         1 => Err(BackendError::stale(
-            "Clipboard content changed before the replacement",
+            "Clipboard content changed before the mutation",
         )),
         _ => Err(ipc_error(
-            "Ringboard rejected the replacement; refresh history before retrying",
+            "Ringboard rejected the mutation; refresh history before retrying",
         )),
     }
 }
