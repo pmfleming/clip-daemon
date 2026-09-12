@@ -114,3 +114,21 @@ Validation: eight independent sockets race replacements against the same proof:
 exactly one commits and seven receive stale status. A mixed valid/stale bulk
 selection deletes nothing. Stale removal, favorite and wipe paths pass against
 the real patched server. Full-ring regressions, Rust tests and Clippy pass.
+
+## Gap 10 — initial and effective retention configuration
+
+On first use, existing native Ringboard count limits are adopted instead of
+silently replacing a user's retention policy. Fresh installations use the
+advertised defaults. `configure-engine` validates and persists both configurations
+before server startup; daemon startup reconciles saved intent. Persisted JSON is
+range-validated, not merely deserialized.
+
+The server exposes its actual active limits through a read-only policy request.
+`settings.get` reports desired/effective retention and synchronization separately.
+Even a no-op update checks effective state, so a failed restart is retried rather
+than reported as applied. Missing byte enforcement is explicitly reported as
+`max_entry_bytes: null` until the capture-policy step.
+
+Validation: real-server tests cover native limit adoption, two failed restart
+attempts with desired/effective mismatch, subsequent server restart/recovery, and
+rejection of invalid persisted limits. Rust tests and strict Clippy pass.

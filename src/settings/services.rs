@@ -7,6 +7,12 @@ use tokio::process::Command;
 pub(super) trait ServiceControl: Send + Sync {
     async fn control(&self, action: &str, units: &[&str]) -> Result<(), String>;
     async fn capture_paused(&self) -> Result<bool, String>;
+    async fn limits(&self) -> Result<crate::ringboard::ipc::EngineLimits, String> {
+        tokio::task::spawn_blocking(crate::ringboard::ipc::limits)
+            .await
+            .map_err(|_| "Engine status task failed".to_owned())?
+            .map_err(|error| error.to_string())
+    }
 }
 
 pub(super) struct Systemd;

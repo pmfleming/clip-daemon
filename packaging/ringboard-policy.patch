@@ -28,7 +28,7 @@
          },
      );
  
-@@ -42,6 +42,22 @@
+@@ -42,6 +42,27 @@
      allocator: &mut Allocator,
      sequence_number: &mut u64,
  ) -> Result<Option<PendingBufAllocation>, CliError> {
@@ -38,6 +38,11 @@
 +            if let RecvAncillaryMessage::ScmRights(received) = message {
 +                fds.extend(received);
 +            }
++        }
++        if request_data.len() == 46 && request_data[4] == 7 && fds.is_empty() {
++            return Ok(Some(send_bufs.init_buf(|_| (), |buf| {
++                buf.extend_from_slice(&allocator.policy_limits());
++            })));
 +        }
 +        let needs_file = request_data.get(4).is_some_and(|op| matches!(op, 1 | 6));
 +        let status = if fds.len() == usize::from(needs_file) {

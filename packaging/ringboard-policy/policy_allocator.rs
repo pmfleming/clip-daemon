@@ -1,6 +1,15 @@
 // Included inside Ringboard's allocator module. This extension is AGPL-3.0-only,
 // like the server it modifies. It does not change the legacy protocol layout.
 impl Allocator {
+    pub fn policy_limits(&self) -> [u8; 20] {
+        let mut response = [0; 20];
+        response[..4].copy_from_slice(b"CDS1");
+        response[4..8].copy_from_slice(&self.rings[RingKind::Main].ring.capacity().to_le_bytes());
+        response[8..12].copy_from_slice(&self.rings[RingKind::Favorites].ring.capacity().to_le_bytes());
+        // Zero explicitly means capture-side byte enforcement is unsupported.
+        response
+    }
+
     pub fn policy_request(&mut self, request: &[u8], fd: Option<OwnedFd>) -> u8 {
         // CDP1 | op:u8 | raw_id:u64 LE | expected_proof:32 | mime_len:u8 | mime
         if request.len() < 46 || &request[..4] != b"CDP1" {

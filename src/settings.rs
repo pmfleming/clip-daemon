@@ -33,6 +33,15 @@ pub struct CaptureState {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+pub(crate) struct RetentionState {
+    pub desired_max_entries: u32,
+    pub desired_max_favorites: u32,
+    pub effective: Option<crate::ringboard::ipc::EngineLimits>,
+    pub synchronized: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClipboardSettings {
@@ -156,24 +165,60 @@ impl SettingsManager {
         let _transaction = self.transaction.lock().await;
         let current = self.preferences()?;
         let updated = update.apply(&current)?;
-        if updated == current {
-            return self.get();
+        if updated != current {
+            self.save(updated.clone(), persist_config_pair, SETTINGS_SAVED)
+                .await?;
         }
-        let restart_required = retention_changed(&current, &updated);
-        let updated = self
-            .save(updated, persist_config_pair, SETTINGS_SAVED)
-            .await?;
-        if restart_required {
-            let _ = self.record_capture(Err("Capture restart is not yet verified".into()));
-            let result = async {
-                restart_capture(self.services.as_ref(), &updated).await?;
-                self.verify_capture(updated.capture_paused).await
-            }
-            .await;
-            self.record_capture(result)
-                .map_err(|error| format!("{SETTINGS_SAVED}, but {error}"))?;
-        }
+        // Compare effective engine state even on a no-op retry after a failed
+        // restart. Saved preferences alone are not evidence of applied limits.
+        self.apply_retention(&updated)
+            .await
+            .map_err(|error| format!("{SETTINGS_SAVED}, but {error}"))?;
         self.get()
+    }
+
+    /// Run before starting Ringboard (also used by the packaged service).
+    pub fn prepare_engine(&self) -> Result<(), String> {
+        persist_config_pair(self.path.as_deref(), &self.preferences()?)
+    }
+
+    pub(crate) async fn initialize_retention(&self) -> Result<(), String> {
+        let _transaction = self.transaction.lock().await;
+        let desired = self.preferences()?;
+        self.save(desired.clone(), persist_config_pair, SETTINGS_SAVED)
+            .await?;
+        self.apply_retention(&desired).await
+    }
+
+    pub(crate) async fn retention_state(&self) -> Result<RetentionState, String> {
+        let desired = self.preferences()?;
+        let result = self.services.limits().await;
+        Ok(RetentionState {
+            desired_max_entries: desired.max_entries,
+            desired_max_favorites: desired.max_favorites,
+            synchronized: result
+                .as_ref()
+                .is_ok_and(|limits| limits_match(limits, &desired)),
+            error: result.as_ref().err().cloned(),
+            effective: result.ok(),
+        })
+    }
+
+    async fn apply_retention(&self, desired: &ClipboardSettings) -> Result<(), String> {
+        if limits_match(&self.services.limits().await?, desired) {
+            return Ok(());
+        }
+        let _ = self.record_capture(Err("Capture restart is not yet verified".into()));
+        let result = async {
+            restart_capture(self.services.as_ref(), desired).await?;
+            self.verify_capture(desired.capture_paused).await
+        }
+        .await;
+        self.record_capture(result)?;
+        if !limits_match(&self.services.limits().await?, desired) {
+            return Err("Running Ringboard has not applied the saved retention limits".into());
+        }
+        Ok(())
     }
 
     async fn save(
@@ -299,10 +344,8 @@ fn validated_update<T: Copy + PartialOrd>(
     }
 }
 
-fn retention_changed(current: &ClipboardSettings, updated: &ClipboardSettings) -> bool {
-    updated.max_entries != current.max_entries
-        || updated.max_favorites != current.max_favorites
-        || updated.max_entry_bytes != current.max_entry_bytes
+fn limits_match(limits: &crate::ringboard::ipc::EngineLimits, desired: &ClipboardSettings) -> bool {
+    limits.max_entries == desired.max_entries && limits.max_favorites == desired.max_favorites
 }
 
 async fn restart_capture(
@@ -348,12 +391,42 @@ fn load_settings(path: Option<&Path>) -> Result<ClipboardSettings, String> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(ClipboardSettings::default());
+            return import_native_settings();
         }
         Err(_) => return Err("Clipboard settings could not be read".into()),
     };
-    serde_json::from_slice(&bytes)
-        .map_err(|_| "Clipboard settings file is invalid; refusing to use defaults".into())
+    let value = serde_json::from_slice(&bytes)
+        .map_err(|_| "Clipboard settings file is invalid; refusing to use defaults".to_owned())?;
+    validate_loaded_settings(value)
+}
+
+fn validate_loaded_settings(value: ClipboardSettings) -> Result<ClipboardSettings, String> {
+    SettingsUpdate {
+        max_entries: Some(value.max_entries),
+        max_favorites: Some(value.max_favorites),
+        max_entry_bytes: Some(value.max_entry_bytes),
+        collapse_self_echoes: None,
+    }
+    .apply(&value)?;
+    if value.private_mode && !value.capture_paused {
+        return Err("Private mode requires a paused capture preference".into());
+    }
+    Ok(value)
+}
+
+fn import_native_settings() -> Result<ClipboardSettings, String> {
+    let path = data_dir().join(config::server::file_name());
+    let mut value = ClipboardSettings::default();
+    if path
+        .try_exists()
+        .map_err(|_| "Native Ringboard configuration is unreadable")?
+    {
+        let native =
+            config::server::load(path).map_err(|_| "Native Ringboard configuration is invalid")?;
+        value.max_entries = native.max_entries.main.get();
+        value.max_favorites = native.max_entries.favorites.get();
+    }
+    validate_loaded_settings(value)
 }
 
 const CLIPBOARD: &str = "Clipboard settings";

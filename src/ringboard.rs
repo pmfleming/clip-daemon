@@ -38,7 +38,7 @@ mod artifacts;
 #[cfg(all(test, feature = "benchmarks"))]
 mod benchmarks;
 mod content;
-mod ipc;
+pub(crate) mod ipc;
 mod mutation;
 mod operation;
 use operation::OperationControl;

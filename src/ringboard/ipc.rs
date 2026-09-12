@@ -3,7 +3,7 @@
 use std::{
     fs::File,
     io::{IoSlice, Seek, Write},
-    os::fd::AsFd,
+    os::fd::{AsFd, OwnedFd},
     time::Duration,
 };
 
@@ -60,6 +60,30 @@ pub(super) fn remove_many(targets: &[(u64, [u8; 32])]) -> BackendResult<()> {
     request(6, 0, &[0; 32], "", Some(&file))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct EngineLimits {
+    pub max_entries: u32,
+    pub max_favorites: u32,
+    pub max_entry_bytes: Option<u64>,
+}
+
+pub(crate) fn limits() -> BackendResult<EngineLimits> {
+    let socket = send_request(7, 0, &[0; 32], "", None)?;
+    let mut response = [0; 20];
+    let (_, length) = recv(&socket, &mut response, RecvFlags::TRUNC).map_err(ipc_error)?;
+    if length != response.len() || &response[..4] != b"CDS1" {
+        return Err(ipc_error(
+            "Engine does not expose effective retention limits",
+        ));
+    }
+    let max_bytes = u64::from_le_bytes(response[12..20].try_into().map_err(ipc_error)?);
+    Ok(EngineLimits {
+        max_entries: u32::from_le_bytes(response[4..8].try_into().map_err(ipc_error)?),
+        max_favorites: u32::from_le_bytes(response[8..12].try_into().map_err(ipc_error)?),
+        max_entry_bytes: (max_bytes != 0).then_some(max_bytes),
+    })
+}
+
 fn request(
     op: u8,
     id: u64,
@@ -67,6 +91,32 @@ fn request(
     mime: &str,
     file: Option<&File>,
 ) -> BackendResult<()> {
+    let socket = send_request(op, id, proof, mime, file)?;
+    let mut response = [0; 5];
+    let (_, length) = recv(&socket, &mut response, RecvFlags::TRUNC).map_err(ipc_error)?;
+    if length != response.len() || &response[..4] != b"CDR1" {
+        return Err(ipc_error(
+            "Invalid policy response; refresh history before retrying",
+        ));
+    }
+    match response[4] {
+        0 => Ok(()),
+        1 => Err(BackendError::stale(
+            "Clipboard content changed before the mutation",
+        )),
+        _ => Err(ipc_error(
+            "Ringboard rejected the mutation; refresh history before retrying",
+        )),
+    }
+}
+
+fn send_request(
+    op: u8,
+    id: u64,
+    proof: &[u8; 32],
+    mime: &str,
+    file: Option<&File>,
+) -> BackendResult<OwnedFd> {
     let mime_len = u8::try_from(mime.len())
         .ok()
         .filter(|length| *length <= 96)
@@ -113,22 +163,7 @@ fn request(
         SendFlags::NOSIGNAL,
     )
     .map_err(ipc_error)?;
-    let mut response = [0; 5];
-    let (_, length) = recv(&socket, &mut response, RecvFlags::TRUNC).map_err(ipc_error)?;
-    if length != response.len() || &response[..4] != b"CDR1" {
-        return Err(ipc_error(
-            "Invalid policy response; refresh history before retrying",
-        ));
-    }
-    match response[4] {
-        0 => Ok(()),
-        1 => Err(BackendError::stale(
-            "Clipboard content changed before the mutation",
-        )),
-        _ => Err(ipc_error(
-            "Ringboard rejected the mutation; refresh history before retrying",
-        )),
-    }
+    Ok(socket)
 }
 
 fn ipc_error(error: impl std::fmt::Display) -> BackendError {

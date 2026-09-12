@@ -30,6 +30,8 @@ enum Command {
         #[arg(long)]
         mime: String,
     },
+    /// Persist validated native settings before starting the Ringboard server.
+    ConfigureEngine,
     /// Check whether the pinned Ringboard database is readable.
     ProbeRingboard,
     /// Print stable protocol metadata and fixtures.
@@ -63,6 +65,9 @@ async fn run(command: Command) -> Result<()> {
         Command::Daemon => daemon::run(Arc::new(RingboardBackend::default())).await,
         Command::Client => client::run().await,
         Command::Publish { mime } => publish_stdin(&mime).await,
+        Command::ConfigureEngine => clip_daemon::settings::SettingsManager::default()
+            .prepare_engine()
+            .map_err(anyhow::Error::msg),
         Command::ProbeRingboard => probe_ringboard().await,
         Command::Debug { command } => print_debug(command),
     }

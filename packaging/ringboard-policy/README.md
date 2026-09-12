@@ -11,7 +11,8 @@ daemon refuses to send any mutating request in that case. Never send extension
 packets to a server without a successful policy handshake.
 
 Packets: `CDP1`, operation byte (1 = compare-and-replace, 2 = compare-and-remove,
-3/4 = compare-and-favorite/unfavorite, 5 = wipe, 6 = validated bulk delete), raw entry ID (u64 LE),
+3/4 = compare-and-favorite/unfavorite, 5 = wipe, 6 = validated bulk delete,
+7 = effective limits), raw entry ID (u64 LE),
 32-byte expected content proof, MIME length (u8, maximum 96), MIME bytes. Replace
 also passes one regular file descriptor using SCM_RIGHTS. Bulk delete passes a
 regular file containing u32 LE count followed by that many (u64 LE ID, 32-byte
@@ -20,6 +21,10 @@ bulk delete execute in a single reactor turn, so other requests cannot interleav
 Disk-I/O failures are still reported as potentially partial outcomes. Replies are `CDR1`
 plus status: 0 committed, 1 stale/missing, 2 rejected/error. IPC waits are bounded.
 A lost reply is an uncertain outcome: refresh history before retrying.
+
+Operation 7 returns `CDS1`, main capacity (u32 LE), favorite capacity (u32 LE),
+and enforced capture byte limit (u64 LE; zero explicitly means unsupported).
+These are runtime values, not a reread of desired configuration.
 
 The proof is SHA-256(`clip-daemon:proof:v1:` || content_digest || stored_mime).
 Content digest is SHA-256(`clip-daemon:entry-content:v1:` || all stored bytes).

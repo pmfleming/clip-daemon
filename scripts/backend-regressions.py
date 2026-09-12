@@ -66,7 +66,7 @@ class Desktop:
         self.log = (root / "services.log").open("w")
         run("ringboard", "configure", "server", "--max-main-entries", str(capacity),
             "--max-favorite-entries", str(capacity))
-        self.start(os.environ.get("RINGBOARD_SERVER", "ringboard-server"))
+        self.server = self.start(os.environ.get("RINGBOARD_SERVER", "ringboard-server"))
         wait_for(lambda: Path(os.environ["RINGBOARD_SOCK"]).is_socket())
         self.daemon = self.start(str(BINARY), "daemon")
         wait_for(lambda: BUS.encode() in run("busctl", "--user", "list", "--acquired"))
@@ -80,6 +80,16 @@ class Desktop:
         child = subprocess.Popen(argv, stdout=self.log, stderr=self.log)
         self.children.append(child)
         return child
+
+    def restart_server(self):
+        self.daemon.terminate()
+        self.daemon.wait(timeout=5)
+        self.server.terminate()
+        self.server.wait(timeout=5)
+        self.server = self.start(os.environ.get("RINGBOARD_SERVER", "ringboard-server"))
+        time.sleep(0.2)
+        self.daemon = self.start(str(BINARY), "daemon")
+        wait_for(lambda: BUS.encode() in run("busctl", "--user", "list", "--acquired"))
 
     def restart_daemon(self):
         self.daemon.terminate()
@@ -329,9 +339,33 @@ def concurrent_mutations(_desktop):
     assert not history()["entries"]
 
 
+def retention_recovery(desktop):
+    initial = call("clipboard.settings.get")
+    assert initial["settings"]["max_entries"] == 2, "native retention was not adopted"
+    assert initial["retention"]["synchronized"], initial
+    # No systemd manager exists on this bus. Saving succeeds; restart fails.
+    for _ in range(2):
+        call("clipboard.settings.update", {"max_entries": 4, "max_favorites": 3}, ok=False)
+        state = call("clipboard.settings.get")
+        assert state["settings"]["max_entries"] == 4
+        assert state["retention"]["effective"]["max_entries"] == 2
+        assert not state["retention"]["synchronized"]
+    desktop.restart_server()
+    state = call("clipboard.settings.update", {"max_entries": 4, "max_favorites": 3})
+    assert state["settings"]["max_entries"] == 4
+    assert call("clipboard.settings.get")["retention"]["synchronized"]
+    # Pre-start configuration validates persisted values instead of applying bad limits.
+    settings = Path(os.environ["XDG_STATE_HOME"]) / "clip-daemon/settings.json"
+    value = json.loads(settings.read_text())
+    value["max_entries"] = 0
+    settings.write_text(json.dumps(value))
+    result = subprocess.run([str(BINARY), "configure-engine"], stdout=desktop.log, stderr=desktop.log)
+    assert result.returncode != 0
+
+
 CASES = {"wraparound": wraparound, "replacement": replacement,
          "legacy-replacement": legacy_replacement, "artifact-references": artifact_references,
-         "privacy-retry": privacy_retry, "subscription-baselines": subscription_baselines, "echo-identity": echo_identity, "png-contract": png_contract, "concurrent-mutations": concurrent_mutations}
+         "privacy-retry": privacy_retry, "subscription-baselines": subscription_baselines, "echo-identity": echo_identity, "png-contract": png_contract, "concurrent-mutations": concurrent_mutations, "retention-recovery": retention_recovery}
 
 
 def isolated(case):
@@ -360,7 +394,7 @@ if __name__ == "__main__":
         finally:
             desktop.close()
     else:
-        needs_policy = {"replacement", "concurrent-mutations"}
+        needs_policy = {"replacement", "concurrent-mutations", "retention-recovery"}
         cases = sys.argv[1:] or [name for name in CASES if (name != "legacy-replacement" if os.environ.get("RINGBOARD_SERVER") else name not in needs_policy)]
         for case in cases:
             isolated(case)

@@ -46,6 +46,9 @@ impl ApiService {
     }
 
     pub(crate) async fn initialize(&self) {
+        if let Err(error) = self.settings.initialize_retention().await {
+            tracing::warn!(%error, "Saved retention is not verified against the running engine");
+        }
         if let Err(error) = self.settings.reconcile_capture().await {
             tracing::warn!(%error, "Capture preference could not be verified; privacy is not asserted");
         }
@@ -221,7 +224,12 @@ impl ApiService {
         let _ = self.settings.refresh_capture().await;
         let settings = self.settings.get().map_err(settings_error)?;
         let capture = self.settings.capture_state().map_err(settings_error)?;
-        Ok(json!({ "settings": settings, "capture": capture }))
+        let retention = self
+            .settings
+            .retention_state()
+            .await
+            .map_err(settings_error)?;
+        Ok(json!({ "settings": settings, "capture": capture, "retention": retention }))
     }
 
     async fn update_settings(&self, update: SettingsUpdate) -> Result<Value, ApiError> {
