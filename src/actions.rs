@@ -65,6 +65,7 @@ pub(crate) struct ClipboardService {
     backend: Backend,
     edits: Mutex<HashMap<String, EditLease>>,
     sessions: SessionManager,
+    history_search: crate::history_search::HistorySearch,
 }
 
 impl ClipboardService {
@@ -73,6 +74,7 @@ impl ClipboardService {
             backend,
             edits: Mutex::new(HashMap::new()),
             sessions: SessionManager::default(),
+            history_search: Default::default(),
         }
     }
 
@@ -127,12 +129,27 @@ impl ClipboardService {
         &self,
         params: QueryParams,
         collapse_self_echoes: bool,
+        owner: Option<&str>,
     ) -> Result<Value, ApiError> {
         if params.query.len() > crate::backend::MAX_QUERY_BYTES {
             return Err(ApiError::validation("Search query exceeds 4096 bytes"));
         }
         if !(1..=MAX_QUERY_LIMIT).contains(&params.limit) {
             return Err(ApiError::validation("limit must be between 1 and 200"));
+        }
+        if params.fuzzy {
+            if params.offset != 0 {
+                return Err(ApiError::validation(
+                    "Use next_cursor, not offsets, for fuzzy history queries",
+                ));
+            }
+            return self
+                .history_search
+                .query(&self.backend, params, owner, collapse_self_echoes)
+                .await;
+        }
+        if params.cursor.is_some() {
+            return Err(ApiError::validation("A cursor requires fuzzy history mode"));
         }
         let history = self
             .backend
@@ -434,13 +451,16 @@ pub(crate) struct EntryParams {
 #[derive(Deserialize)]
 pub(crate) struct QueryParams {
     #[serde(default)]
-    query: String,
+    pub query: String,
     #[serde(default)]
-    generation: u64,
+    pub generation: u64,
     #[serde(default)]
-    offset: usize,
+    pub offset: usize,
     #[serde(default = "default_query_limit")]
-    limit: usize,
+    pub limit: usize,
+    #[serde(default)]
+    pub fuzzy: bool,
+    pub cursor: Option<String>,
 }
 
 #[derive(Deserialize)]

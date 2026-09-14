@@ -86,6 +86,53 @@ async fn concurrent_queries_observe_consistent_replacements_and_only_one_revisio
 }
 
 #[tokio::test]
+async fn native_search_uses_revision_bound_owner_scoped_cursors() {
+    let backend = Arc::new(FakeBackend::with_entries(vec![
+        entry("one", EntryKind::Text, Some("Café one")),
+        entry("two", EntryKind::Text, Some("Café two")),
+        entry("three", EntryKind::Text, Some("Café three")),
+    ]));
+    let api = ApiService::new(backend.clone());
+    let request = json!({"query":"cafee", "generation":9, "fuzzy":true, "limit":2});
+    let first = api
+        .dispatch_owned(
+            "clipboard.history.query",
+            request.clone(),
+            Some(":1.1".into()),
+        )
+        .await;
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(first["data"]["history"]["total"], 3);
+    assert_eq!(first["data"]["history"]["entries"][0]["id"], "one");
+    let mut next = request.clone();
+    next["cursor"] = first["data"]["history"]["next_cursor"].clone();
+    let second = api
+        .dispatch_owned("clipboard.history.query", next.clone(), Some(":1.1".into()))
+        .await;
+    assert_eq!(second["ok"], true, "{second}");
+    assert_eq!(second["data"]["history"]["entries"][0]["id"], "three");
+    assert!(second["data"]["history"]["next_cursor"].is_null());
+    let wrong_owner = api
+        .dispatch_owned("clipboard.history.query", next.clone(), Some(":1.2".into()))
+        .await;
+    assert_eq!(wrong_owner["error"]["code"], "stale-cursor");
+    let restarted = ApiService::new(backend.clone())
+        .dispatch_owned("clipboard.history.query", next.clone(), Some(":1.1".into()))
+        .await;
+    assert_eq!(restarted["error"]["code"], "stale-cursor");
+    backend
+        .replace("one", 1, "text/plain", b"changed")
+        .await
+        .unwrap();
+    let changed = api
+        .dispatch_owned("clipboard.history.query", next, Some(":1.1".into()))
+        .await;
+    assert_eq!(changed["error"]["code"], "stale-cursor");
+    let fresh = api.dispatch("clipboard.history.query", request).await;
+    assert_eq!(fresh["data"]["history"]["total"], 2);
+}
+
+#[tokio::test]
 async fn history_pagination_is_stable() {
     let api = ApiService::new(Arc::new(FakeBackend::with_entries(vec![
         entry("one", EntryKind::Text, Some("one")),

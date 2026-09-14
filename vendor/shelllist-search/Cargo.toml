@@ -1,0 +1,21 @@
+[package]
+name = "shelllist-search"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Fuzzy result ranking service for Shelllist"
+repository = "https://github.com/pmfleming/shelllist"
+
+[dependencies]
+fuzzy-matcher = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+strsim = "0.11"
+unicode-normalization = "0.1"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"

@@ -28,9 +28,21 @@
         "name": "clipboard.history.query",
         "params_example": {
           "generation": 1,
-          "offset": 0,
+          "fuzzy": true,
+          "cursor": null,
           "limit": 100,
           "query": ""
+        },
+        "pagination": {
+          "kind": "opaque-cursor",
+          "request_field": "cursor",
+          "response_field": "next_cursor",
+          "revision_field": "snapshot_revision",
+          "stale_error": "stale-cursor",
+          "expires_seconds": 120,
+          "max_page_entries": 200,
+          "max_search_entries": 5000,
+          "legacy_offset_mode": "fuzzy=false"
         },
         "response_key": "history",
         "stream": "clipboard.history.changed"

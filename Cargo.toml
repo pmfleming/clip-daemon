@@ -16,6 +16,8 @@ clipboard-history-client-sdk = "=0.16.2"
 # internal `version = "0"` range on 0.16.2; core 0.17 is incompatible.
 clipboard-history-core = "=0.16.2"
 hex = "0.4"
+hmac = "0.12"
+shelllist-search = { path = "vendor/shelllist-search" }
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "tiff", "webp"] }
 rustix = { version = "1", features = ["fs", "net"] }
 serde = { version = "1", features = ["derive"] }

@@ -109,7 +109,11 @@ impl ApiService {
         owner: Option<String>,
     ) -> Value {
         tracing::debug!(%method, "clip-api request started");
-        let result = self.dispatch_method(method, params).await;
+        let result = if method == "clipboard.history.query" {
+            self.query_history(params, owner.as_deref()).await
+        } else {
+            self.dispatch_method(method, params).await
+        };
         if let Ok(data) = &result {
             self.publish_lifecycle(method, data);
             if let Some(id) = started_operation_id(data) {
@@ -130,7 +134,6 @@ impl ApiService {
 
     async fn dispatch_method(&self, method: &str, params: Value) -> Result<Value, ApiError> {
         match method {
-            "clipboard.history.query" => self.query_history(params).await,
             "clipboard.history.revision" => self.history_revision().await,
             "clipboard.entry.details" => self.actions.details(decode(params)?).await,
             "clipboard.entry.thumbnail" => self.actions.thumbnail(decode(params)?).await,
@@ -151,16 +154,17 @@ impl ApiService {
     }
 
     async fn history_revision(&self) -> Result<Value, ApiError> {
-        Ok(json!({ "revision": self.actions.change_token().await? }))
+        let revision = self.actions.change_token().await?;
+        Ok(json!({ "revision": revision, "snapshot_revision": revision.to_string() }))
     }
 
-    async fn query_history(&self, params: Value) -> Result<Value, ApiError> {
+    async fn query_history(&self, params: Value, owner: Option<&str>) -> Result<Value, ApiError> {
         let collapse = self
             .settings
             .get()
             .map_err(settings_error)?
             .collapse_self_echoes;
-        self.actions.query(decode(params)?, collapse).await
+        self.actions.query(decode(params)?, collapse, owner).await
     }
 
     async fn dispatch_wipe(&self, method: &str, params: Value) -> Result<Value, ApiError> {

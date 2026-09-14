@@ -1,4 +1,5 @@
 mod actions;
+mod history_search;
 
 pub mod api;
 pub mod backend;
