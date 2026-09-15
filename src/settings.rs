@@ -1,10 +1,6 @@
 use std::{
-    fs,
-    fs::{File, OpenOptions},
-    io,
-    io::Write,
+    fs, io,
     num::NonZeroU32,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
 };
@@ -12,13 +8,12 @@ use std::{
 use clipboard_history_client_sdk::config;
 use clipboard_history_core::dirs::data_dir;
 use serde::{Deserialize, Serialize};
-use shelllist_daemon_core::{XdgRoot, resolve_xdg_path};
+use shelllist_daemon_core::{AtomicFilePolicy, StagedFile, XdgRoot, resolve_xdg_path, sync_parent};
 use tokio::{
     sync::Mutex as AsyncMutex,
     task::spawn_blocking,
     time::{Duration, sleep},
 };
-use uuid::Uuid;
 
 mod services;
 use services::{ServiceControl, Systemd};
@@ -485,7 +480,7 @@ fn persist(path: Option<&Path>, value: &ClipboardSettings) -> Result<(), String>
 
 struct StagedWrite {
     path: PathBuf,
-    temp: PathBuf,
+    file: StagedFile,
     previous: Option<Vec<u8>>,
     label: &'static str,
 }
@@ -494,14 +489,17 @@ fn stage_config(path: &Path, bytes: &[u8], label: &'static str) -> Result<Staged
     Ok(StagedWrite {
         path: path.to_owned(),
         previous: read_existing(path)?,
-        temp: stage_write(path, bytes, label)?,
+        file: StagedFile::new(path, bytes, AtomicFilePolicy::PRIVATE)
+            .map_err(|error| format!("{label} could not be staged: {error}"))?,
         label,
     })
 }
 
-fn commit_all(writes: Vec<StagedWrite>) -> Result<(), String> {
-    for write in &writes {
-        if let Err(error) = commit_staged(&write.path, &write.temp, write.label) {
+// Best-effort coordinated updates, not a crash-atomic multi-file transaction.
+fn commit_all(mut writes: Vec<StagedWrite>) -> Result<(), String> {
+    for write in &mut writes {
+        if let Err(error) = write.file.commit() {
+            let error = format!("{} could not be committed: {error}", write.label);
             return Err(rollback_writes(&writes, error));
         }
     }
@@ -521,52 +519,9 @@ fn rollback_writes(writes: &[StagedWrite], error: String) -> String {
     }
 }
 
-impl Drop for StagedWrite {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.temp);
-    }
-}
-
 fn atomic_write(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
-    let temp = stage_write(path, bytes, label)?;
-    commit_staged(path, &temp, label)
-}
-
-fn stage_write(path: &Path, bytes: &[u8], label: &str) -> Result<PathBuf, String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{label} path is invalid"))?;
-    fs::create_dir_all(parent).map_err(|_| format!("{label} directory is unavailable"))?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-        .map_err(|_| format!("{label} directory permissions could not be set"))?;
-    let temp = parent.join(format!(".{}.tmp", Uuid::new_v4()));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(&temp)
-        .map_err(|_| format!("{label} temporary file could not be created"))?;
-    if file
-        .write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .is_err()
-    {
-        let _ = fs::remove_file(&temp);
-        return Err(format!("{label} could not be written"));
-    }
-    Ok(temp)
-}
-
-fn commit_staged(path: &Path, temp: &Path, label: &str) -> Result<(), String> {
-    if fs::rename(temp, path).is_err() {
-        let _ = fs::remove_file(temp);
-        return Err(format!("{label} could not be committed"));
-    }
-    sync_parent(path).map_err(|_| format!("{label} directory could not be synced"))
-}
-
-fn sync_parent(path: &Path) -> io::Result<()> {
-    File::open(path.parent().ok_or(io::ErrorKind::InvalidInput)?)?.sync_all()
+    shelllist_daemon_core::write_bytes_atomic(path, bytes, AtomicFilePolicy::PRIVATE)
+        .map_err(|error| format!("{label} could not be written: {error}"))
 }
 
 fn read_existing(path: &Path) -> Result<Option<Vec<u8>>, String> {

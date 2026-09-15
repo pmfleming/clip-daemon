@@ -7,17 +7,17 @@
         ]
       },
       "locked": {
-        "lastModified": 1788384005,
-        "narHash": "sha256-b+tVRRctw4KIo69/c6sxshBsKmgRrVcOMGVzuwf5gPo=",
+        "lastModified": 1789488442,
+        "narHash": "sha256-7qRB8gZa+j4a5U06nj4guQCp+gpIwv7VchrbeFPjnBM=",
         "owner": "pmfleming",
         "repo": "daemon-framework",
-        "rev": "c90883428ed83baa8e451dec5b598ad4e3141d25",
+        "rev": "47d5a6505a8fbaebb48469d8e689e2743980e416",
         "type": "github"
       },
       "original": {
         "owner": "pmfleming",
         "repo": "daemon-framework",
-        "rev": "c90883428ed83baa8e451dec5b598ad4e3141d25",
+        "rev": "47d5a6505a8fbaebb48469d8e689e2743980e416",
         "type": "github"
       }
     },

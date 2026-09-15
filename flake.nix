@@ -3,7 +3,7 @@
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   inputs.daemonFramework = {
-    url = "github:pmfleming/daemon-framework/c90883428ed83baa8e451dec5b598ad4e3141d25";
+    url = "github:pmfleming/daemon-framework/47d5a6505a8fbaebb48469d8e689e2743980e416";
     inputs.nixpkgs.follows = "nixpkgs";
   };
 

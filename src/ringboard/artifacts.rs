@@ -1,9 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    fs::OpenOptions,
-    io::{BufRead, Read, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    io::{BufRead, Read},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -270,27 +268,12 @@ impl ArtifactRegistry {
 }
 
 fn persist_manifest(path: &Path, manifest: &impl Serialize) -> BackendResult<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| artifact_error("Generated-file registry path is invalid"))?;
-    fs::create_dir_all(parent).map_err(artifact_error)?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(artifact_error)?;
-    let temp = parent.join(format!(".generated-files-{}.tmp", Uuid::new_v4()));
-    let result = (|| {
-        let bytes = serde_json::to_vec_pretty(manifest).map_err(artifact_error)?;
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(&temp)
-            .map_err(artifact_error)?;
-        file.write_all(&bytes).map_err(artifact_error)?;
-        file.sync_all().map_err(artifact_error)?;
-        fs::rename(&temp, path).map_err(artifact_error)
-    })();
-    result.inspect_err(|_| {
-        let _ = fs::remove_file(temp);
-    })
+    shelllist_daemon_core::write_json_atomic(
+        path,
+        manifest,
+        shelllist_daemon_core::AtomicWritePolicy::PRIVATE,
+    )
+    .map_err(artifact_error)
 }
 
 fn remove_artifact(root: Option<&Path>, path: &Path) -> Option<bool> {

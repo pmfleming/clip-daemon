@@ -108,14 +108,17 @@ async fn emit_event(
     subscription_id: &str,
     extra: Option<Value>,
 ) {
-    let envelope = shelllist_daemon_core::event_envelope(
+    let result = shelllist_daemon_tokio::emit_json_event(
+        emitter,
+        INTERFACE,
         shelllist_daemon_core::ApiIdentity::new(api::PROTOCOL, api::VERSION as u32),
         stream,
         event,
         shelllist_daemon_core::Correlation::Subscription(subscription_id),
         extra.unwrap_or(Value::Null),
-    );
-    if let Err(error) = ClipDaemon::event(emitter, stream, &envelope.to_string()).await {
+    )
+    .await;
+    if let Err(error) = result {
         tracing::warn!(%stream, %error, "clipboard subscription event could not be emitted");
     }
 }
@@ -125,15 +128,20 @@ pub async fn run(backend: Arc<dyn ClipboardBackend>) -> Result<()> {
     api.initialize().await;
     let event_revision = Arc::new(AtomicU64::new(0));
     let (history_events, _) = tokio::sync::broadcast::channel(32);
-    tokio::spawn(subscription::observe_history(
-        Arc::clone(&api),
-        Arc::clone(&event_revision),
-        history_events.clone(),
-    ));
+    let tasks = shelllist_daemon_tokio::TaskGroup::default();
+    tasks.spawn(
+        "clipboard-history",
+        subscription::observe_history(
+            Arc::clone(&api),
+            Arc::clone(&event_revision),
+            history_events.clone(),
+        ),
+    );
+    let subscriptions = Arc::new(OwnedTaskRegistry::default());
     let daemon = ClipDaemon {
         api,
         history_events,
-        subscriptions: Arc::new(OwnedTaskRegistry::default()),
+        subscriptions: Arc::clone(&subscriptions),
     };
     let _connection = connection::Builder::session()
         .context("connect to session D-Bus")?
@@ -149,5 +157,8 @@ pub async fn run(backend: Arc<dyn ClipboardBackend>) -> Result<()> {
         object_path = OBJECT_PATH,
         "clip-daemon started"
     );
-    shelllist_daemon_tokio::wait_for_shutdown().await
+    let result = shelllist_daemon_tokio::wait_for_shutdown().await;
+    subscriptions.shutdown().await;
+    tasks.shutdown().await;
+    result
 }

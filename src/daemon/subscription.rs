@@ -7,17 +7,13 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use tokio::{
-    sync::{broadcast::error::RecvError, oneshot},
-    time::MissedTickBehavior,
-};
+use shelllist_daemon_tokio::{BroadcastEvent, forward_broadcast};
+use tokio::{sync::broadcast::error::RecvError, time::MissedTickBehavior};
 use zbus::{names::UniqueName, object_server::SignalEmitter};
 
 use crate::{api, api::ApiService, protocol};
 
 use super::{ClipDaemon, emit_event};
-
-type Subscriptions = Arc<shelllist_daemon_tokio::OwnedTaskRegistry>;
 
 const HISTORY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -32,11 +28,9 @@ struct RequestedStreams {
 struct SubscriptionTask {
     destination: SignalEmitter<'static>,
     api_service: Arc<ApiService>,
-    subscriptions: Subscriptions,
     history_events: tokio::sync::broadcast::Sender<HistoryUpdate>,
     id: String,
     streams: Vec<String>,
-    owner: UniqueName<'static>,
     requested: RequestedStreams,
 }
 
@@ -85,7 +79,6 @@ impl RequestedStreams {
 
 impl SubscriptionTask {
     async fn run(self) {
-        let connection = self.destination.connection().clone();
         // Register receivers before acknowledging the subscription. Each history
         // subscriber also gets its own fresh baseline, even if polling is active.
         let history = self.requested.watches_clipboard().then(|| {
@@ -119,9 +112,7 @@ impl SubscriptionTask {
             () = await_optional(history) => {}
             () = await_optional(operations) => {}
             () = await_optional(lifecycle) => {}
-            _ = shelllist_daemon_tokio::wait_for_owner_loss(&connection, self.owner) => {}
         }
-        self.subscriptions.remove(&self.id).await;
         tracing::debug!(subscription_id = %self.id, "clipboard subscription ended");
     }
 }
@@ -173,34 +164,23 @@ pub(super) async fn start(
     };
     let id = daemon.next_id("subscription");
     let destination = emitter.set_destination(owner.clone().into()).to_owned();
-    let task_owner = owner.clone();
-    let task_id = id.clone();
-    let task_streams = streams.clone();
-    let api_service = Arc::clone(&daemon.api);
-    let subscriptions = Arc::clone(&daemon.subscriptions);
-    let history_events = daemon.history_events.clone();
-    let (start, ready) = oneshot::channel();
-    let task = tokio::spawn(async move {
-        if ready.await.is_ok() {
-            SubscriptionTask {
-                destination,
-                api_service,
-                subscriptions,
-                history_events,
-                id: task_id,
-                streams: task_streams,
-                owner,
-                requested,
-            }
-            .run()
-            .await;
-        }
-    });
-    daemon
-        .subscriptions
-        .insert(id.clone(), Some(task_owner.to_string()), task)
-        .await;
-    let _ = start.send(());
+    let connection = destination.connection().clone();
+    let task = SubscriptionTask {
+        destination,
+        api_service: Arc::clone(&daemon.api),
+        history_events: daemon.history_events.clone(),
+        id: id.clone(),
+        streams: streams.clone(),
+        requested,
+    };
+    if let Err(error) = daemon.subscriptions.spawn_for_owner(
+        id.clone(),
+        Some(owner.to_string()),
+        &connection,
+        task.run(),
+    ) {
+        return api::error("subscription-unavailable", error.to_string()).to_string();
+    }
     tracing::debug!(subscription_id = %id, "clipboard subscription started");
     api::success(json!({ "subscription": { "id": id, "streams": streams } })).to_string()
 }
@@ -282,47 +262,50 @@ async fn receive_history(
 
 async fn poll_operations(
     emitter: SignalEmitter<'static>,
-    mut events: tokio::sync::broadcast::Receiver<crate::model::OperationResult>,
+    events: tokio::sync::broadcast::Receiver<crate::model::OperationResult>,
     subscription_id: String,
 ) {
-    loop {
-        match events.recv().await {
-            Ok(operation) => {
+    let emitter = &emitter;
+    let subscription_id = subscription_id.as_str();
+    forward_broadcast(events, move |update| async move {
+        match update {
+            BroadcastEvent::Item(operation) => {
                 let event = operation.status.clone();
                 emit_event(
-                    &emitter,
+                    emitter,
                     protocol::stream::OPERATION,
                     &event,
-                    &subscription_id,
+                    subscription_id,
                     Some(json!({ "data": { "operation": operation } })),
                 )
                 .await;
             }
-            Err(RecvError::Lagged(skipped)) => {
+            BroadcastEvent::Lagged(skipped) => {
                 tracing::warn!(%subscription_id, skipped, "clipboard operation events lagged");
                 emit_event(
-                    &emitter,
+                    emitter,
                     protocol::stream::OPERATION,
                     "failed",
-                    &subscription_id,
+                    subscription_id,
                     Some(lag_data(skipped)),
                 )
                 .await;
             }
-            Err(RecvError::Closed) => return,
         }
-    }
+    })
+    .await;
 }
 
 impl LifecycleSubscription {
-    async fn run(self, mut events: tokio::sync::broadcast::Receiver<api::LifecycleEvent>) {
-        loop {
-            match events.recv().await {
-                Ok(update) => self.emit(update).await,
-                Err(RecvError::Lagged(skipped)) => self.emit_lag(skipped).await,
-                Err(RecvError::Closed) => return,
+    async fn run(self, events: tokio::sync::broadcast::Receiver<api::LifecycleEvent>) {
+        let sink = &self;
+        forward_broadcast(events, move |update| async move {
+            match update {
+                BroadcastEvent::Item(update) => sink.emit(update).await,
+                BroadcastEvent::Lagged(skipped) => sink.emit_lag(skipped).await,
             }
-        }
+        })
+        .await;
     }
 
     async fn emit(&self, update: api::LifecycleEvent) {
