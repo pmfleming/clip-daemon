@@ -13,18 +13,36 @@ pub(super) struct Matcher {
 impl Matcher {
     pub fn new(needle: &str) -> Self {
         let needle = fold(needle).into_bytes();
-        let mut fallback = vec![0; needle.len()];
-        let mut matched = 0;
-        for index in 1..needle.len() {
-            while matched > 0 && needle[index] != needle[matched] {
-                matched = fallback[matched - 1];
-            }
-            if needle[index] == needle[matched] {
-                matched += 1;
-            }
-            fallback[index] = matched;
+        let mut matcher = Self {
+            fallback: vec![0; needle.len()],
+            needle,
+        };
+        for index in 1..matcher.needle.len() {
+            matcher.fallback[index] =
+                matcher.advance(matcher.fallback[index - 1], matcher.needle[index]);
         }
-        Self { needle, fallback }
+        matcher
+    }
+
+    // Both prefix construction and streaming search use the same KMP transition.
+    fn advance(&self, mut matched: usize, byte: u8) -> usize {
+        while matched > 0 && byte != self.needle[matched] {
+            matched = self.fallback[matched - 1];
+        }
+        matched + usize::from(byte == self.needle[matched])
+    }
+
+    fn feed(&self, text: &str, matched: &mut usize, found: &mut bool) {
+        for character in text.chars().flat_map(char::to_lowercase) {
+            let mut encoded = [0; 4];
+            for &byte in character.encode_utf8(&mut encoded).as_bytes() {
+                *matched = self.advance(*matched, byte);
+                if *matched == self.needle.len() {
+                    *found = true;
+                    *matched = self.fallback[*matched - 1];
+                }
+            }
+        }
     }
 
     pub fn contains(&self, mut source: impl Read) -> io::Result<bool> {
@@ -53,21 +71,8 @@ impl Matcher {
                 ),
                 Err(_) => return Ok(false),
             };
-            for character in valid.chars().flat_map(char::to_lowercase) {
-                let mut encoded = [0; 4];
-                for &byte in character.encode_utf8(&mut encoded).as_bytes() {
-                    while matched > 0 && byte != self.needle[matched] {
-                        matched = self.fallback[matched - 1];
-                    }
-                    if byte == self.needle[matched] {
-                        matched += 1;
-                    }
-                    if matched == self.needle.len() {
-                        found = true;
-                        matched = self.fallback[matched - 1];
-                    }
-                }
-            }
+            // A match is not success until the entire input is valid UTF-8.
+            self.feed(valid, &mut matched, &mut found);
             buffer.copy_within(end - incomplete..end, 0);
             carry = incomplete;
         }
@@ -76,7 +81,64 @@ impl Matcher {
 
 #[cfg(test)]
 mod tests {
-    use super::Matcher;
+    use super::{Matcher, fold};
+    use std::io::{self, Read};
+
+    struct Chunks<'a> {
+        bytes: &'a [u8],
+        size: usize,
+        interrupted: bool,
+    }
+    impl Read for Chunks<'_> {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            if std::mem::take(&mut self.interrupted) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let length = output.len().min(self.size);
+            self.bytes.read(&mut output[..length])
+        }
+    }
+
+    #[test]
+    fn short_reads_match_whole_string_search_and_reject_invalid_tails() {
+        for text in ["", "ababababac", "ÉCOLE İSTANBUL 😀", "€éa"] {
+            for needle in ["", "ababac", "école i̇stanbul", "😀", "€é", "absent"] {
+                for size in 1..=7 {
+                    let input = Chunks {
+                        bytes: text.as_bytes(),
+                        size,
+                        interrupted: true,
+                    };
+                    assert_eq!(
+                        Matcher::new(needle).contains(input).unwrap(),
+                        fold(text).contains(&fold(needle))
+                    );
+                }
+            }
+        }
+        for bytes in [&b"match\xff"[..], &b"match\xf0\x9f"[..]] {
+            let input = Chunks {
+                bytes,
+                size: 1,
+                interrupted: true,
+            };
+            assert!(!Matcher::new("match").contains(input).unwrap());
+        }
+        let failure = &b"match"[..];
+        // An I/O failure after a match must still propagate.
+        struct Failure;
+        impl Read for Failure {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::Other.into())
+            }
+        }
+        assert!(
+            Matcher::new("match")
+                .contains(failure.chain(Failure))
+                .is_err()
+        );
+    }
+
     #[test]
     fn complete_unicode_text_is_searched_across_chunks() {
         let text = format!(
