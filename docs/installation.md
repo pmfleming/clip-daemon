@@ -3,12 +3,15 @@
 ## Nix package
 
 ```sh
-nix build .#default .#ringboard
-nix profile install .#default .#ringboard
+package=$(python3 ../daemon-framework/tools/local-build.py build . --no-link --print-out-paths)
+ringboard=$(python3 ../daemon-framework/tools/local-build.py build --attr ringboard . --no-link --print-out-paths)
+nix profile install "$package" "$ringboard"
 ```
 
-The flake pins its framework dependency to a public Git revision; **building or
-installing the package does not require a sibling checkout**. The default package
+Keep the current `daemon-framework` checkout alongside this repository. Cargo
+and Nix builds use that same source, including tracked dirty files. The helper
+snapshots sources per invocation without persisting local deployment pins.
+Do not vendor or revision-pin the framework. The default package
 contains all three service definitions and references the patched engine by
 absolute store path. Satty, grim, hyprctl, service control, notifications and file
 opening dependencies are wrapped into the daemon's runtime PATH. The separate
@@ -24,7 +27,7 @@ For a manually managed user installation, link the packaged units (review any
 existing destination first; these commands deliberately do not overwrite it):
 
 ```sh
-package=$(nix build .#default --no-link --print-out-paths)
+package=$(python3 ../daemon-framework/tools/local-build.py build . --no-link --print-out-paths)
 mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 for unit in clip-daemon ringboard-server ringboard-wayland; do
   ln -s "$package/share/systemd/user/$unit.service" \
@@ -59,8 +62,8 @@ The engine extension is not a power-loss-ACID storage layer.
 ## Verify without touching production
 
 ```sh
-package=$(nix build .#default --no-link --print-out-paths)
-nix develop --command python3 scripts/package-smoke.py "$package"
+package=$(python3 ../daemon-framework/tools/local-build.py build . --no-link --print-out-paths)
+python3 ../daemon-framework/tools/local-build.py develop . --command python3 scripts/package-smoke.py "$package"
 ```
 
 This checks installed unit syntax, private first-boot files, startup privacy
@@ -75,10 +78,10 @@ successful service control.
 
 ## Cargo development
 
-Direct Cargo development still uses the shared framework path dependency. For a
-fresh workspace, clone `https://github.com/pmfleming/daemon-framework` alongside
-this repository and check out `c90883428ed83baa8e451dec5b598ad4e3141d25`. Do not reset
-an existing sibling development checkout. Then use `nix develop` and `just check`.
+For a fresh workspace, clone `https://github.com/pmfleming/daemon-framework`
+alongside this repository. Use its current worktree; never check out an old
+compatibility pin or reset an existing development checkout. Enter the shell via
+`python3 ../daemon-framework/tools/local-build.py develop .`, then `just check`.
 
 Stock Ringboard is read-compatible only: safe mutations and pre-write byte
 admission require the supplied policy-enabled package. Server extension source

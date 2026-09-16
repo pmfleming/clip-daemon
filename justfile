@@ -49,4 +49,5 @@ hardware-acceptance:
     ./scripts/hardware-acceptance.sh check
 
 nix-check:
-    nix flake check --show-trace
+    # Always test the current shared framework, never a local deployment pin.
+    python3 ../daemon-framework/tools/local-build.py check . --show-trace

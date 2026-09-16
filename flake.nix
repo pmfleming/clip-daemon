@@ -2,8 +2,10 @@
   description = "Clipboard policy and clip-api daemon for Shelllist";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  # Co-development: one live sibling framework; no per-daemon revision pins.
+  # Use ../daemon-framework/tools/local-build.py for Nix builds/checks.
   inputs.daemonFramework = {
-    url = "github:pmfleming/daemon-framework/47d5a6505a8fbaebb48469d8e689e2743980e416";
+    url = "git+file:../daemon-framework";
     inputs.nixpkgs.follows = "nixpkgs";
   };
 

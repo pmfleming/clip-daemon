@@ -6,14 +6,15 @@ Rust clipboard policy and `clip-api` facade for the Shelllist clipboard surface.
 
 See [`docs/installation.md`](docs/installation.md) for a standalone Nix build,
 packaged server/watcher units, first-start privacy ordering, and isolated package
-verification. No sibling checkout is needed to build the Nix package.
+verification. Keep `daemon-framework` beside this checkout: all five daemons
+consume that current worktree, never a private framework pin or vendored copy.
 
 ## Local Rust environment
 
 ```sh
 direnv allow
 # or
-nix develop
+python3 ../daemon-framework/tools/local-build.py develop .
 just check                 # locked tests, Clippy, unused dependencies, RustSec
 just quality               # full RQLens evidence and verification
 just live-acceptance       # disposable nested desktop; never wipes normal history
@@ -76,7 +77,7 @@ See [`docs/phase4-safety.md`](docs/phase4-safety.md) for enforced privacy behavi
 Run the local quality review with:
 
 ```sh
-nix develop --command ../rust-quality-lens/target/debug/rqlens measure all --config rqlens.toml
+python3 ../daemon-framework/tools/local-build.py develop . --command ../rust-quality-lens/target/debug/rqlens measure all --config rqlens.toml
 ```
 
 See [`docs/adr-0001-ringboard-facade.md`](docs/adr-0001-ringboard-facade.md), [`docs/adr-0002-wayland-selection-ownership.md`](docs/adr-0002-wayland-selection-ownership.md), and [`docs/quality-review.md`](docs/quality-review.md).
