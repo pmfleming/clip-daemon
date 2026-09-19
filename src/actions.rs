@@ -193,6 +193,18 @@ impl ClipboardService {
         Ok(json!({ "thumbnail": thumbnail }))
     }
 
+    pub(crate) async fn interactive_screenshot(
+        &self,
+        request: crate::backend::InteractiveScreenshot,
+        max_entry_bytes: u64,
+    ) -> Result<Value, ApiError> {
+        let operation = self
+            .backend
+            .interactive_screenshot(request, max_entry_bytes)
+            .await?;
+        Ok(json!({ "operation": operation }))
+    }
+
     pub(crate) async fn capture_screenshot(
         &self,
         params: ScreenshotParams,

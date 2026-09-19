@@ -89,6 +89,28 @@ pub async fn publish(mime: &str, bytes: Vec<u8>) -> Result<()> {
     }
 }
 
+pub async fn screenshot(screen: bool, annotate: bool) -> Result<()> {
+    let connection = zbus::Connection::session().await?;
+    let proxy = zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE).await?;
+    let params = serde_json::json!({
+        "mode": if screen { "screen" } else { "region" }, "annotate": annotate,
+    })
+    .to_string();
+    let response: String = proxy
+        .call("Call", &("clipboard.capture.interactive", params))
+        .await?;
+    let response: Value = serde_json::from_str(&response)?;
+    anyhow::ensure!(
+        response["ok"] == true,
+        "{}",
+        response
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("Screenshot request failed")
+    );
+    Ok(())
+}
+
 pub async fn run() -> Result<()> {
     run_jsonl_client(JsonlClientConfig {
         endpoint: ENDPOINT,

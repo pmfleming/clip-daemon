@@ -42,6 +42,7 @@ mod content;
 pub(crate) mod ipc;
 mod mutation;
 mod operation;
+mod screenshot;
 mod search;
 use operation::OperationControl;
 
@@ -102,6 +103,7 @@ impl SummaryCache {
 }
 
 struct OperationTask {
+    action: &'static str,
     control: Arc<OperationControl>,
     handle: JoinHandle<()>,
     files: Vec<PathBuf>,
@@ -794,6 +796,15 @@ impl ClipboardBackend for RingboardBackend {
         run_backend!(self, capture_region(region, max_bytes))
     }
 
+    async fn interactive_screenshot(
+        &self,
+        request: crate::backend::InteractiveScreenshot,
+        max_bytes: u64,
+    ) -> BackendResult<OperationResult> {
+        let _gate = self.operation_gate.lock().await;
+        screenshot::launch(self.clone(), request, max_bytes)
+    }
+
     async fn publish(
         &self,
         mime: &str,
@@ -876,12 +887,13 @@ impl ClipboardBackend for RingboardBackend {
         operation.handle.abort();
         let _ = (&mut operation.handle).await;
         let control = Arc::clone(&operation.control);
+        let action = operation.action;
         drop(operation);
         let _ = self.operation_events.send(OperationResult::with_id(
             operation_id.to_owned(),
-            "annotate",
+            action,
             "cancelled",
-            "Image edit cancelled",
+            "Image operation cancelled",
         ));
         control.finish();
         Ok(true)

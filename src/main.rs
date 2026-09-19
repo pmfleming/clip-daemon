@@ -30,6 +30,13 @@ enum Command {
         #[arg(long)]
         mime: String,
     },
+    /// Start a daemon-owned screenshot (region selection by default).
+    Screenshot {
+        #[arg(long)]
+        screen: bool,
+        #[arg(long)]
+        annotate: bool,
+    },
     /// Persist validated native settings before starting the Ringboard server.
     ConfigureEngine,
     /// Check whether the pinned Ringboard database is readable.
@@ -65,6 +72,7 @@ async fn run(command: Command) -> Result<()> {
         Command::Daemon => daemon::run(RingboardBackend::default()).await,
         Command::Client => client::run().await,
         Command::Publish { mime } => publish_stdin(&mime).await,
+        Command::Screenshot { screen, annotate } => client::screenshot(screen, annotate).await,
         Command::ConfigureEngine => clip_daemon::settings::SettingsManager::default()
             .prepare_engine()
             .map_err(anyhow::Error::msg),

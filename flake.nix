@@ -53,7 +53,7 @@
             '';
             postFixup = ''
               wrapProgram $out/bin/clip-daemon \
-                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.grim pkgs.hyprland pkgs.libnotify satty pkgs.systemd pkgs.xdg-utils ]}
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.coreutils pkgs.grim pkgs.slurp pkgs.hyprland pkgs.libnotify satty pkgs.systemd pkgs.xdg-utils ]}
             '';
             meta = {
               description = "Wayland clipboard policy and clip-api daemon for Shelllist";
