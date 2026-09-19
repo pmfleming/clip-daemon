@@ -36,10 +36,14 @@ pub struct ApiService {
 
 impl ApiService {
     pub fn new(backend: actions::Backend) -> Self {
+        Self::with_capture(backend, Arc::new(crate::capture::Unavailable))
+    }
+
+    pub(crate) fn with_settings(backend: actions::Backend, settings: SettingsManager) -> Self {
         let (lifecycle_events, _) = broadcast::channel(64);
         Self {
             wipe_challenges: Mutex::new(HashMap::new()),
-            settings: SettingsManager::default(),
+            settings,
             actions: ClipboardService::new(backend),
             lifecycle_events,
             operation_owners: Mutex::new(HashMap::new()),
@@ -51,10 +55,7 @@ impl ApiService {
         backend: actions::Backend,
         capture: Arc<dyn crate::capture::CaptureControl>,
     ) -> Self {
-        Self {
-            settings: SettingsManager::with_capture(capture),
-            ..Self::new(backend)
-        }
+        Self::with_settings(backend, SettingsManager::with_capture(capture))
     }
 
     pub(crate) async fn initialize(&self) {
@@ -280,8 +281,16 @@ impl ApiService {
         if deadline <= Instant::now() {
             return Err(ApiError::new("stale-action", "wipe challenge expired"));
         }
+        let capture = self.settings.quiesce().await.map_err(settings_error)?;
         self.actions.clear().await;
-        self.actions.wipe().await
+        let mut data = self.actions.wipe().await?;
+        if let Err(error) = capture.resume().await {
+            // Wipe has committed. Report failed capture recovery separately.
+            data["operation"]["warning"] = json!(format!(
+                "History was wiped; capture remains stopped: {error}"
+            ));
+        }
+        Ok(data)
     }
 }
 

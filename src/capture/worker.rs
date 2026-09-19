@@ -189,6 +189,31 @@ struct Runtime {
     terminal_error: Option<String>,
 }
 
+impl Runtime {
+    async fn stop(&mut self) -> Result<(), String> {
+        if let Some(error) = &self.terminal_error {
+            return Err(error.clone());
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.close();
+            // A cancelled waiter leaves a sticky unverified state, not a false
+            // successful pause while the detached fence is still pending.
+            self.terminal_error = Some("Capture shutdown is not yet verified".into());
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                tokio::task::spawn_blocking(move || worker.finish()),
+            )
+            .await
+            .map_err(|_| "Capture shutdown timed out".to_owned())
+            .and_then(|result| result.map_err(|_| "Capture shutdown task failed".to_owned()))
+            .and_then(|result| result);
+            self.terminal_error = result.as_ref().err().cloned();
+            result?;
+        }
+        Ok(())
+    }
+}
+
 pub struct Controller {
     sink: Arc<dyn CaptureSink>,
     runtime: AsyncMutex<Runtime>,
@@ -225,22 +250,7 @@ impl CaptureControl for Controller {
         {
             return worker.state().map(|_| ());
         }
-        if let Some(worker) = runtime.worker.take() {
-            worker.close();
-            // Cancellation of this future must not make a later status call
-            // report verified pause while a detached fence is still pending.
-            runtime.terminal_error = Some("Capture shutdown is not yet verified".into());
-            let result = tokio::time::timeout(
-                Duration::from_secs(30),
-                tokio::task::spawn_blocking(move || worker.finish()),
-            )
-            .await
-            .map_err(|_| "Capture shutdown timed out".to_owned())
-            .and_then(|result| result.map_err(|_| "Capture shutdown task failed".to_owned()))
-            .and_then(|result| result);
-            runtime.terminal_error = result.as_ref().err().cloned();
-            result?;
-        }
+        runtime.stop().await?;
         if paused {
             runtime.attached = true; // Explicit pause, including private startup: skip bootstrap on resume.
             return Ok(());
@@ -255,6 +265,13 @@ impl CaptureControl for Controller {
             .await
             .map_err(|_| "Capture startup acknowledgement timed out")?
             .map_err(|_| "Capture worker exited before startup")?
+    }
+
+    async fn shutdown(&self) -> Result<(), String> {
+        let mut runtime = self.runtime.lock().await;
+        let result = runtime.stop().await;
+        runtime.terminal_error = Some("Capture owner has shut down".into());
+        result
     }
 
     async fn is_paused(&self) -> Result<bool, String> {
@@ -291,6 +308,14 @@ mod tests {
         assert!(controller.is_paused().await.is_err());
         controller.set_paused(true, 65536).await.unwrap();
         assert!(controller.is_paused().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cannot_be_undone_by_a_late_resume() {
+        let controller = Controller::new(Arc::new(Unavailable));
+        controller.shutdown().await.unwrap();
+        assert!(controller.set_paused(false, 65536).await.is_err());
+        assert!(controller.is_paused().await.is_err());
     }
 
     #[tokio::test]

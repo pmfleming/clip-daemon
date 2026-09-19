@@ -54,3 +54,27 @@ Production services are not changed by these development commits.
   test driver only; production still uses the packaged watcher. Settings/wipe
   coordination and full existing desktop round trips are stage 4 integration
   gates. wlr-only compositor and multi-seat hardware qualification remain pending.
+
+## Stage 4 — integrated policy and recovery
+
+- Added opt-in `daemon --capture-in-process` for disposable qualification; the
+  packaging default is unchanged until stage 5. D-Bus ownership is acquired before
+  capture initialization, and daemon teardown permanently fences its collector.
+- Settings changes quiesce before changing retention/byte limits, verify live
+  engine readiness instead of sleeping a fixed delay, and keep capture stopped on
+  saved-but-unapplied policy. Resume requires synchronized engine limits.
+- Wipe holds the settings/capture transition lock while draining old submissions
+  and mutating history. Failed fences prevent deletion. Failed recovery after a
+  committed wipe is a warning, not a false claim that wipe itself failed.
+- API-only constructors no longer control external watchers. Headless regression
+  tests exercise real in-process pause/unavailable-state handling, not fake watcher
+  systemctl state. Cancelled transitions remain conservatively unverified.
+- Validation: formatting and strict Clippy passed; 65 Rust tests passed (one
+  opt-in benchmark ignored); all 12 backend scenarios passed. Ten integrated
+  collector checks passed, including private restart, corrupt-settings startup,
+  retention failure/recovery, wipe/no recapture, and compositor reconnect. All 15
+  standard nested desktop checks passed, including GTK/terminal paste, Satty,
+  images, multi-file payloads, sensitive exclusion, and bulk deletion.
+- The two optional real-Shelllist layer-shell checks were not run in this stage;
+  neither wlr-only/multi-seat hardware nor production activation is claimed.
+- Per updated instruction, this and subsequent stages are committed locally only.

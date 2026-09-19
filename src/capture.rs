@@ -17,6 +17,27 @@ pub use worker::{CaptureSink, Controller};
 pub trait CaptureControl: Send + Sync {
     async fn set_paused(&self, paused: bool, max_bytes: u64) -> Result<(), String>;
     async fn is_paused(&self) -> Result<bool, String>;
+
+    async fn shutdown(&self) -> Result<(), String> {
+        self.set_paused(true, 0).await
+    }
+}
+
+/// API-only constructors must never start an external collector as a side effect.
+pub(crate) struct Unavailable;
+
+#[async_trait]
+impl CaptureControl for Unavailable {
+    async fn set_paused(&self, paused: bool, _: u64) -> Result<(), String> {
+        if paused {
+            Ok(())
+        } else {
+            Err("No capture owner is attached to this API".into())
+        }
+    }
+    async fn is_paused(&self) -> Result<bool, String> {
+        Ok(true)
+    }
 }
 
 /// Generation carried by an offer from admission through storage submission.

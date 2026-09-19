@@ -137,8 +137,7 @@ def acceptance(root):
         run(str(BINARY), "configure-engine")
         start("ringboard", os.environ.get("RINGBOARD_SERVER", "ringboard-server"))
         wait_for(lambda: Path(os.environ["RINGBOARD_SOCK"]).is_socket())
-        capture = start("capture", os.environ.get("RINGBOARD_WAYLAND", "ringboard-wayland"), env=dict(os.environ, RUST_LOG="info"))
-        daemon = start("daemon", str(BINARY), "daemon")
+        daemon = start("daemon", str(BINARY), "daemon", "--capture-in-process")
         wait_for(lambda: BUS.encode() in run("busctl", "--user", "list", "--acquired"))
         owner = json.loads(run("busctl", "--user", "--json=short", "call", "org.freedesktop.DBus",
                               "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetConnectionUnixProcessID", "s", BUS))
@@ -254,22 +253,22 @@ def acceptance(root):
             producer.stdin.close()
             return producer
 
-        capture_log = root / "capture.log"
-        baseline = len(capture_log.read_text())
+        before_exclusion = history()
         secret = b"clip-sensitive-synthetic-fixture"
         synthetic_offer("sensitive-offer", secret, "--sensitive")
         wait_for(lambda: b"x-kde-passwordManagerHint" in run("wl-paste", "--list-types"))
-        wait_for(lambda: "No usable mimes" in capture_log.read_text()[baseline:])
+        time.sleep(0.3)
+        assert history() == before_exclusion
         assert not history(secret.decode())["entries"]
-        assert capture.poll() is None
+        assert daemon.poll() is None
         passed("sensitive-marker-before-capture")
 
-        baseline = len(capture_log.read_text())
         synthetic_offer("oversized-offer", b"clip-oversized-fixture" + b"x" * 65536,
                         "--mime", "application/octet-stream")
-        wait_for(lambda: "Dropping oversized clipboard offer before persistence" in capture_log.read_text()[baseline:])
+        time.sleep(0.3)
+        assert history() == before_exclusion
         assert not history("clip-oversized-fixture")["entries"]
-        assert capture.poll() is None
+        assert daemon.poll() is None
         text("capture-resumes-after-policy-rejection")
         passed("oversized-offer-before-persistence")
 
@@ -309,7 +308,7 @@ def acceptance(root):
             "quickshell": os.environ.get("QUICKSHELL", "quickshell"),
             "ghostty": os.environ.get("GHOSTTY", "ghostty"),
             "ringboard_server": os.environ.get("RINGBOARD_SERVER", "ringboard-server"),
-            "ringboard_wayland": os.environ.get("RINGBOARD_WAYLAND", "ringboard-wayland"),
+            "capture": "clip-daemon in-process",
         }, indent=2) + "\n")
         for log in root.glob("*.log"):
             (report / log.name).write_bytes(log.read_bytes())

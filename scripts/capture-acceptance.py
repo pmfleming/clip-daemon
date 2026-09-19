@@ -3,12 +3,10 @@
 import json
 import os
 from pathlib import Path
-import queue
 import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,13 +27,17 @@ def wait_for(read):
     raise TimeoutError("isolated capture condition was not reached")
 
 
-def history():
+def call(method, params=None, ok=True):
     wire = run("busctl", "--user", "--auto-start=no", "--json=short", "call",
                "org.laufan.ClipDaemon", "/org/laufan/ClipDaemon", "org.laufan.ClipDaemon1",
-               "Call", "ss", "clipboard.history.query", '{"limit":200}')
+               "Call", "ss", method, json.dumps(params or {}))
     result = json.loads(json.loads(wire)["data"][0])
-    assert result["ok"], result
-    return result["data"]["history"]["entries"]
+    assert result["ok"] == ok, result
+    return result.get("data", result)
+
+
+def history():
+    return call("clipboard.history.query", {"limit":200})["history"]["entries"]
 
 
 def check(root):
@@ -52,7 +54,8 @@ def check(root):
     try:
         config = root / "hyprland.lua"
         config.write_text('hl.monitor({ output = "", mode = "1280x720@60", position = "auto", scale = 1 })\n')
-        start("hyprland", "Hyprland", "-c", str(config))
+        parent_display = os.environ["WAYLAND_DISPLAY"]
+        compositor = start("hyprland", "Hyprland", "-c", str(config))
         socket = wait_for(lambda: next((p for p in (root / "r").glob("wayland-*") if p.is_socket()), None))
         os.environ["WAYLAND_DISPLAY"] = socket.name
         run(str(BINARY), "configure-engine")
@@ -63,18 +66,22 @@ def check(root):
         run(str(BINARY), "configure-engine")
         start("server", "ringboard-server")
         wait_for(lambda: Path(os.environ["RINGBOARD_SOCK"]).is_socket())
-        start("daemon", str(BINARY), "daemon")
+        daemon = start("daemon", str(BINARY), "daemon", "--capture-in-process")
         wait_for(lambda: b"org.laufan.ClipDaemon" in run("busctl", "--user", "list", "--acquired"))
         assert not history(), "refusing to test nonempty history"
-        worker = start("capture", str(ROOT / "target/debug/examples/capture-worker"), "65536",
-                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        replies = queue.Queue()
-        threading.Thread(target=lambda: [replies.put(json.loads(line)) for line in worker.stdout], daemon=True).start()
 
         def command(value, expected):
-            worker.stdin.write(value + "\n")
-            worker.stdin.flush()
-            assert replies.get(timeout=10) == {"Ok": expected}
+            if value != "status":
+                call("clipboard.capture.setPaused", {"paused": expected, "private_mode": expected})
+            state = call("clipboard.settings.get")["capture"]
+            assert state["verified"] and state["paused"] == expected, state
+
+        def restart(name):
+            nonlocal daemon
+            daemon.terminate()
+            daemon.wait(timeout=10)
+            daemon = start(name, str(BINARY), "daemon", "--capture-in-process")
+            wait_for(lambda: b"org.laufan.ClipDaemon" in run("busctl", "--user", "list", "--acquired"))
 
         def publish(value, mime="text/plain", primary=False):
             args = ["wl-copy", "--type", mime]
@@ -121,6 +128,56 @@ def check(root):
         print("PASS exact-limit-and-pre-persistence-rejection", flush=True)
         command("pause", True)
         command("status", True)
+        before = history()
+        publish(b"private-across-restart")
+        restart("daemon-private-restart")
+        command("status", True)
+        unchanged(before)
+        print("PASS persisted-private-startup", flush=True)
+
+        valid_settings = settings_path.read_text()
+        settings_path.write_text("{broken")
+        restart("daemon-corrupt-settings")
+        call("clipboard.settings.get", ok=False)
+        publish(b"must-not-capture-invalid-settings")
+        time.sleep(0.3)
+        settings_path.write_text(valid_settings)
+        restart("daemon-restored-settings")
+        command("status", True)
+        unchanged(before)
+        command("resume", False)
+        unchanged(before)
+        print("PASS malformed-settings-fail-closed", flush=True)
+
+        # A private bus has no systemd manager: restart must fail closed while
+        # exposing saved versus effective retention, then recover on correction.
+        call("clipboard.settings.update", {"max_entries": settings["max_entries"] - 1}, ok=False)
+        state = call("clipboard.settings.get")
+        assert not state["capture"]["verified"] and not state["retention"]["synchronized"], state
+        publish(b"must-not-capture-failed-retention")
+        unchanged(before)
+        call("clipboard.capture.setPaused", {"paused": False}, ok=False)
+        call("clipboard.settings.update", {"max_entries": settings["max_entries"]})
+        unchanged(before)
+        print("PASS retention-failure-barrier-and-recovery", flush=True)
+
+        challenge = call("clipboard.history.wipe.prepare")["challenge"]
+        call("clipboard.history.wipe.commit", {"challenge_id": challenge["id"], "response": "WIPE"})
+        unchanged([])
+        publish(b"new-capture-after-wipe")
+        wait_for(lambda: any(e["preview"] == "new-capture-after-wipe" for e in history()))
+        print("PASS wipe-does-not-recapture-current-selection", flush=True)
+
+        compositor.terminate()
+        compositor.wait(timeout=10)
+        wait_for(lambda: not call("clipboard.settings.get")["capture"]["verified"])
+        start("hyprland-reconnected", "Hyprland", "-c", str(config),
+              env=dict(os.environ, WAYLAND_DISPLAY=parent_display))
+        wait_for(lambda: socket.is_socket())
+        wait_for(lambda: call("clipboard.settings.get")["capture"]["verified"])
+        publish(b"capture-after-compositor-reconnect")
+        wait_for(lambda: any(e["preview"] == "capture-after-compositor-reconnect" for e in history()))
+        print("PASS compositor-disconnect-health-and-reconnect", flush=True)
     finally:
         for child in reversed(children):
             try:

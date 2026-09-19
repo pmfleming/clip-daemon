@@ -32,6 +32,43 @@ fn entry(id: &str, kind: EntryKind, text: Option<&str>) -> EntryDetails {
     }
 }
 
+#[tokio::test]
+async fn wipe_requires_a_verified_capture_fence_before_deleting_anything() {
+    struct FailedFence;
+    #[async_trait::async_trait]
+    impl clip_daemon::capture::CaptureControl for FailedFence {
+        async fn set_paused(&self, _: bool, _: u64) -> Result<(), String> {
+            Err("uncertain capture submission".into())
+        }
+        async fn is_paused(&self) -> Result<bool, String> {
+            Err("uncertain".into())
+        }
+    }
+    let backend = Arc::new(FakeBackend::with_entries(vec![entry(
+        "keep",
+        EntryKind::Text,
+        Some("keep"),
+    )]));
+    let api = ApiService::with_capture(backend, Arc::new(FailedFence));
+    let before = api.dispatch("clipboard.history.query", json!({})).await;
+    let challenge = api
+        .dispatch("clipboard.history.wipe.prepare", json!({}))
+        .await;
+    let result = api
+        .dispatch(
+            "clipboard.history.wipe.commit",
+            json!({
+                "challenge_id": challenge["data"]["challenge"]["id"], "response":"WIPE"
+            }),
+        )
+        .await;
+    assert_eq!(result["ok"], false);
+    assert_eq!(
+        api.dispatch("clipboard.history.query", json!({})).await,
+        before
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_queries_observe_consistent_replacements_and_only_one_revision_wins() {
     let backend = Arc::new(FakeBackend::with_entries(vec![entry(

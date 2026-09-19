@@ -124,8 +124,23 @@ async fn emit_event(
 }
 
 pub async fn run(backend: Arc<dyn ClipboardBackend>) -> Result<()> {
-    let api = Arc::new(ApiService::new(backend));
-    api.initialize().await;
+    serve(Arc::new(ApiService::with_settings(
+        backend,
+        crate::settings::SettingsManager::default(),
+    )))
+    .await
+}
+
+pub async fn run_with_capture(
+    backend: Arc<dyn ClipboardBackend>,
+    capture: Arc<dyn crate::capture::CaptureControl>,
+) -> Result<()> {
+    let result = serve(Arc::new(ApiService::with_capture(backend, capture.clone()))).await;
+    let shutdown = capture.shutdown().await.map_err(anyhow::Error::msg);
+    result.and(shutdown)
+}
+
+async fn serve(api: Arc<ApiService>) -> Result<()> {
     let event_revision = Arc::new(AtomicU64::new(0));
     let (history_events, _) = tokio::sync::broadcast::channel(32);
     let tasks = shelllist_daemon_tokio::TaskGroup::default();
@@ -139,11 +154,11 @@ pub async fn run(backend: Arc<dyn ClipboardBackend>) -> Result<()> {
     );
     let subscriptions = Arc::new(OwnedTaskRegistry::default());
     let daemon = ClipDaemon {
-        api,
+        api: api.clone(),
         history_events,
         subscriptions: Arc::clone(&subscriptions),
     };
-    let _connection = connection::Builder::session()
+    let connection = connection::Builder::session()
         .context("connect to session D-Bus")?
         .name(BUS_NAME)
         .context("claim clip-daemon bus name")?
@@ -152,12 +167,15 @@ pub async fn run(backend: Arc<dyn ClipboardBackend>) -> Result<()> {
         .build()
         .await
         .context("start clip-daemon D-Bus service")?;
+    // Claim singleton ownership before any collector can open admission.
+    api.initialize().await;
     tracing::info!(
         bus_name = BUS_NAME,
         object_path = OBJECT_PATH,
         "clip-daemon started"
     );
     let result = shelllist_daemon_tokio::wait_for_shutdown().await;
+    drop(connection);
     subscriptions.shutdown().await;
     tasks.shutdown().await;
     result

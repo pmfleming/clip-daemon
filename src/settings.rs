@@ -126,6 +126,21 @@ impl Default for SettingsManager {
     }
 }
 
+/// Dropping an incomplete transition leaves admission closed. Never resume from
+/// Drop: cancelled/destructive operations must not replay queued clipboard data.
+pub(crate) struct CaptureGuard<'a> {
+    manager: &'a SettingsManager,
+    _transaction: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl CaptureGuard<'_> {
+    pub(crate) async fn resume(self) -> Result<(), String> {
+        self.manager
+            .apply_capture(&self.manager.preferences()?)
+            .await
+    }
+}
+
 type SettingsWriter = fn(Option<&Path>, &ClipboardSettings) -> Result<(), String>;
 const SETTINGS_SAVED: &str = "Clipboard settings were saved";
 const CAPTURE_SAVED: &str = "Capture preference was saved";
@@ -170,6 +185,9 @@ impl SettingsManager {
         let _transaction = self.transaction.lock().await;
         let current = self.preferences()?;
         let updated = update.apply(&current)?;
+        if retention_changed(&current, &updated) {
+            self.quiesce_locked().await?;
+        }
         if updated != current {
             self.save(updated.clone(), persist_config_pair, SETTINGS_SAVED)
                 .await?;
@@ -177,6 +195,9 @@ impl SettingsManager {
         // Compare effective engine state even on a no-op retry after a failed
         // restart. Saved preferences alone are not evidence of applied limits.
         self.apply_retention(&updated)
+            .await
+            .map_err(|error| format!("{SETTINGS_SAVED}, but {error}"))?;
+        self.apply_capture(&updated)
             .await
             .map_err(|error| format!("{SETTINGS_SAVED}, but {error}"))?;
         self.get()
@@ -215,29 +236,47 @@ impl SettingsManager {
     }
 
     async fn apply_retention(&self, desired: &ClipboardSettings) -> Result<(), String> {
-        if limits_match(&self.services.limits().await?, desired) {
+        if self
+            .services
+            .limits()
+            .await
+            .is_ok_and(|limits| limits_match(&limits, desired))
+        {
             return Ok(());
         }
-        let _ = self.record_capture(Err("Capture restart is not yet verified".into()));
-        let result = async {
-            self.capture
-                .set_paused(true, desired.max_entry_bytes)
-                .await?;
-            self.services
-                .control("restart", &["ringboard-server.service"])
-                .await?;
-            sleep(Duration::from_millis(200)).await;
-            self.capture
-                .set_paused(desired.capture_paused, desired.max_entry_bytes)
-                .await?;
-            self.verify_capture(desired.capture_paused).await
-        }
-        .await;
-        self.record_capture(result)?;
-        if !limits_match(&self.services.limits().await?, desired) {
-            return Err("Running Ringboard has not applied the saved retention limits".into());
-        }
-        Ok(())
+        self.quiesce_locked().await?;
+        self.services
+            .control("restart", &["ringboard-server.service"])
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if self
+                    .services
+                    .limits()
+                    .await
+                    .is_ok_and(|limits| limits_match(&limits, desired))
+                {
+                    return Ok(());
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .map_err(|_| "Running Ringboard has not applied the saved retention limits".to_owned())?
+    }
+
+    async fn quiesce_locked(&self) -> Result<(), String> {
+        let _ = self.record_capture(Err("Capture is quiesced for a policy transition".into()));
+        self.capture.set_paused(true, 0).await
+    }
+
+    pub(crate) async fn quiesce(&self) -> Result<CaptureGuard<'_>, String> {
+        let transaction = self.transaction.lock().await;
+        self.quiesce_locked().await?;
+        Ok(CaptureGuard {
+            manager: self,
+            _transaction: transaction,
+        })
     }
 
     async fn save(
@@ -334,6 +373,18 @@ impl SettingsManager {
     async fn apply_capture(&self, updated: &ClipboardSettings) -> Result<(), String> {
         let _ = self.record_capture(Err("Capture transition is not yet verified".into()));
         let result = async {
+            if !updated.capture_paused
+                && !self
+                    .services
+                    .limits()
+                    .await
+                    .is_ok_and(|limits| limits_match(&limits, updated))
+            {
+                self.capture.set_paused(true, 0).await?;
+                return Err(
+                    "Capture is disabled until engine retention/limits are synchronized".into(),
+                );
+            }
             self.capture
                 .set_paused(updated.capture_paused, updated.max_entry_bytes)
                 .await?;
@@ -367,6 +418,11 @@ fn validated_update<T: Copy + PartialOrd>(
         Some(_) => Err("Clipboard setting is outside the supported range".into()),
         None => Ok(current),
     }
+}
+
+fn retention_changed(a: &ClipboardSettings, b: &ClipboardSettings) -> bool {
+    (a.max_entries, a.max_favorites, a.max_entry_bytes)
+        != (b.max_entries, b.max_favorites, b.max_entry_bytes)
 }
 
 fn limits_match(limits: &crate::ringboard::ipc::EngineLimits, desired: &ClipboardSettings) -> bool {
@@ -608,6 +664,14 @@ mod tests {
         async fn capture_paused(&self) -> Result<bool, String> {
             Ok(self.paused.load(std::sync::atomic::Ordering::SeqCst))
         }
+        async fn limits(&self) -> Result<crate::ringboard::ipc::EngineLimits, String> {
+            let defaults = ClipboardSettings::default();
+            Ok(crate::ringboard::ipc::EngineLimits {
+                max_entries: defaults.max_entries,
+                max_favorites: defaults.max_favorites,
+                max_entry_bytes: Some(defaults.max_entry_bytes),
+            })
+        }
     }
 
     #[tokio::test]
@@ -634,6 +698,31 @@ mod tests {
         assert!(manager.get().unwrap().private_mode);
         manager.set_paused(false, false).await.unwrap();
         assert!(manager.capture_allowed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn abandoned_quiesce_stays_closed_and_serializes_policy_changes() {
+        use std::sync::{Arc, atomic::Ordering::SeqCst};
+        let services = Arc::new(MockServices::default());
+        let mut manager = manager(None);
+        manager.services = services.clone();
+        manager.capture = Arc::new(super::SystemdCapture(services.clone()));
+        let guard = manager.quiesce().await.unwrap();
+        assert!(services.paused.load(SeqCst));
+        assert!(!manager.capture_state().unwrap().verified);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                manager.set_paused(false, false)
+            )
+            .await
+            .is_err()
+        );
+        drop(guard);
+        assert!(services.paused.load(SeqCst));
+        manager.quiesce().await.unwrap().resume().await.unwrap();
+        assert!(!services.paused.load(SeqCst));
+        assert!(manager.capture_state().unwrap().verified);
     }
 
     #[tokio::test]

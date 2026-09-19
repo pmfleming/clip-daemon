@@ -68,13 +68,16 @@ class Desktop:
             "--max-favorite-entries", str(capacity))
         self.server = self.start(os.environ.get("RINGBOARD_SERVER", "ringboard-server"))
         wait_for(lambda: Path(os.environ["RINGBOARD_SOCK"]).is_socket())
-        self.daemon = self.start(str(BINARY), "daemon")
+        self.daemon = self.start(str(BINARY), "daemon", "--capture-in-process")
         wait_for(lambda: BUS.encode() in run("busctl", "--user", "list", "--acquired"))
         owner = json.loads(run("busctl", "--user", "--json=short", "call",
                               "org.freedesktop.DBus", "/org/freedesktop/DBus",
                               "org.freedesktop.DBus", "GetConnectionUnixProcessID", "s", BUS))
         assert owner["data"][0] == self.daemon.pid
         assert not history()["entries"], "refusing to test nonempty history"
+        # Headless storage tests deliberately pause the managed collector. No
+        # fake systemctl watcher or unverified privacy assumption is needed.
+        call("clipboard.capture.setPaused", {"paused": True})
 
     def start(self, *argv):
         child = subprocess.Popen(argv, stdout=self.log, stderr=self.log)
@@ -88,13 +91,13 @@ class Desktop:
         self.server.wait(timeout=5)
         self.server = self.start(os.environ.get("RINGBOARD_SERVER", "ringboard-server"))
         time.sleep(0.2)
-        self.daemon = self.start(str(BINARY), "daemon")
+        self.daemon = self.start(str(BINARY), "daemon", "--capture-in-process")
         wait_for(lambda: BUS.encode() in run("busctl", "--user", "list", "--acquired"))
 
     def restart_daemon(self):
         self.daemon.terminate()
         self.daemon.wait(timeout=5)
-        self.daemon = self.start(str(BINARY), "daemon")
+        self.daemon = self.start(str(BINARY), "daemon", "--capture-in-process")
         wait_for(lambda: BUS.encode() in run("busctl", "--user", "list", "--acquired"))
 
     def close(self):
@@ -194,42 +197,16 @@ def artifact_references(desktop):
 
 
 def privacy_retry(desktop):
-    directory = desktop.root / "bin"
-    directory.mkdir()
-    control = directory / "systemctl"
-    control.write_text('''#!/usr/bin/env python3
-import os,sys
-from pathlib import Path
-root=Path(os.environ["XDG_STATE_HOME"])
-state=root/"service-state"
-if "show" in sys.argv:
-    print(state.read_text() if state.exists() else "active")
-else:
-    with (root/"attempts").open("a") as f:f.write("attempt\\n")
-    if (root/"fail-control").exists():sys.exit(1)
-    state.write_text("inactive" if "stop" in sys.argv else "active")
-''')
-    control.chmod(0o700)
-    os.environ["PATH"] = str(directory) + ":" + os.environ["PATH"]
-    desktop.restart_daemon()
-    state = Path(os.environ["XDG_STATE_HOME"])
-    attempts = state / "attempts"
-    before = len(attempts.read_text().splitlines())
-    failure = state / "fail-control"
-    failure.touch()
     for _ in range(2):
-        call("clipboard.capture.setPaused", {"paused": True, "private_mode": True}, ok=False)
-        settings = call("clipboard.settings.get")
-        assert settings["capture"]["desired_private_mode"]
-        assert not settings["settings"]["private_mode"]
-        assert settings["capture"]["paused"] is None
-    assert len(attempts.read_text().splitlines()) == before + 2
-    failure.unlink()
-    assert call("clipboard.capture.setPaused", {"paused": True, "private_mode": True})["capture"]["private_mode"]
+        # No compositor exists in this disposable bus/session: resume fails,
+        # but an acknowledged pause succeeds without relying on systemd state.
+        call("clipboard.capture.setPaused", {"paused": False}, ok=False)
+        state = call("clipboard.settings.get")["capture"]
+        assert not state["verified"] and state["paused"] is None, state
+        assert call("clipboard.capture.setPaused", {"paused": True, "private_mode": True})["capture"]["private_mode"]
     desktop.restart_daemon()
-    assert call("clipboard.settings.get")["settings"]["private_mode"]
-    (state / "service-state").write_text("active")
-    assert not call("clipboard.settings.get")["settings"]["private_mode"]
+    state = call("clipboard.settings.get")["capture"]
+    assert state["verified"] and state["private_mode"] and state["desired_private_mode"], state
 
 
 def subscription_baselines(desktop):

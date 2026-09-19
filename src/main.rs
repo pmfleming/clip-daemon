@@ -21,7 +21,11 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run the session D-Bus service backed by Ringboard.
-    Daemon,
+    Daemon {
+        /// Migration qualification only: never run alongside ringboard-wayland.
+        #[arg(long)]
+        capture_in_process: bool,
+    },
     /// Bridge JSON Lines on stdin/stdout to the session service.
     Client,
     /// Publish stdin to the clipboard through the running daemon.
@@ -64,7 +68,17 @@ async fn run(command: Command) -> Result<()> {
         )
         .init();
     match command {
-        Command::Daemon => daemon::run(Arc::new(RingboardBackend::default())).await,
+        Command::Daemon { capture_in_process } => {
+            let backend = RingboardBackend::default();
+            if capture_in_process {
+                let capture = clip_daemon::capture::Controller::new(Arc::new(
+                    clip_daemon::ringboard::capture::RingboardCapture::new(backend.clone()),
+                ));
+                daemon::run_with_capture(Arc::new(backend), Arc::new(capture)).await
+            } else {
+                daemon::run(Arc::new(backend)).await
+            }
+        }
         Command::Client => client::run().await,
         Command::Publish { mime } => publish_stdin(&mime).await,
         Command::ConfigureEngine => clip_daemon::settings::SettingsManager::default()
