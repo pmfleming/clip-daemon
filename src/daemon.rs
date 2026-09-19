@@ -123,12 +123,11 @@ async fn emit_event(
     }
 }
 
-pub async fn run(backend: Arc<dyn ClipboardBackend>) -> Result<()> {
-    serve(Arc::new(ApiService::with_settings(
-        backend,
-        crate::settings::SettingsManager::default(),
-    )))
-    .await
+pub async fn run(backend: crate::ringboard::RingboardBackend) -> Result<()> {
+    let capture = crate::capture::Controller::new(Arc::new(
+        crate::ringboard::capture::RingboardCapture::new(backend.clone()),
+    ));
+    run_with_capture(Arc::new(backend), Arc::new(capture)).await
 }
 
 pub async fn run_with_capture(

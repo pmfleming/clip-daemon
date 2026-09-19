@@ -68,7 +68,7 @@ class Desktop:
             "--max-favorite-entries", str(capacity))
         self.server = self.start(os.environ.get("RINGBOARD_SERVER", "ringboard-server"))
         wait_for(lambda: Path(os.environ["RINGBOARD_SOCK"]).is_socket())
-        self.daemon = self.start(str(BINARY), "daemon", "--capture-in-process")
+        self.daemon = self.start(str(BINARY), "daemon")
         wait_for(lambda: BUS.encode() in run("busctl", "--user", "list", "--acquired"))
         owner = json.loads(run("busctl", "--user", "--json=short", "call",
                               "org.freedesktop.DBus", "/org/freedesktop/DBus",
@@ -91,13 +91,13 @@ class Desktop:
         self.server.wait(timeout=5)
         self.server = self.start(os.environ.get("RINGBOARD_SERVER", "ringboard-server"))
         time.sleep(0.2)
-        self.daemon = self.start(str(BINARY), "daemon", "--capture-in-process")
+        self.daemon = self.start(str(BINARY), "daemon")
         wait_for(lambda: BUS.encode() in run("busctl", "--user", "list", "--acquired"))
 
     def restart_daemon(self):
         self.daemon.terminate()
         self.daemon.wait(timeout=5)
-        self.daemon = self.start(str(BINARY), "daemon", "--capture-in-process")
+        self.daemon = self.start(str(BINARY), "daemon")
         wait_for(lambda: BUS.encode() in run("busctl", "--user", "list", "--acquired"))
 
     def close(self):

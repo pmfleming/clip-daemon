@@ -78,3 +78,24 @@ Production services are not changed by these development commits.
 - The two optional real-Shelllist layer-shell checks were not run in this stage;
   neither wlr-only/multi-seat hardware nor production activation is claimed.
 - Per updated instruction, this and subsequent stages are committed locally only.
+
+## Stage 5 — two-unit packaging and declarative cutover
+
+- `clip-daemon daemon` now owns capture by default. Removed the migration flag,
+  external-watcher control adapter, `capture-allowed` command and packaged watcher
+  unit. Retained the legacy engine/watcher build for the rollback window only.
+- The package ships facade + notify-ready engine units. The facade conflicts with
+  and orders shutdown of a legacy watcher, while remaining independent of engine
+  restarts so it can report retention failures.
+- Prepared Home Manager's two-unit mapping and a `/dev/null` mask for the retired
+  collector in the isolated `nixos-capture` worktree. No live units were changed.
+- Added deliberate backup/cutover/rollback instructions. Fresh unit linkage does
+  not overwrite existing files; no test or migration command activates production.
+- Validation: strict Rust checks/65 tests and all ten integrated collector checks
+  passed with the default daemon command. The Nix package built successfully.
+  Installed-package smoke verified two units, conflict ordering, private startup,
+  D-Bus activation and v2 negotiation. Synthetic history/private intent survived
+  previous-engine rollback followed by upgrade. This is not a real systemd VM test.
+- Nix configuration evaluation verified two enabled packaged services, no duplicate
+  declarations, no watcher enablement and a mask resolving to `/dev/null`.
+  Nix formatting, deadnix and statix checks passed after formatting the new mapping.

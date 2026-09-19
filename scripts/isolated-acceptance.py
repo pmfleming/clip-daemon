@@ -137,7 +137,7 @@ def acceptance(root):
         run(str(BINARY), "configure-engine")
         start("ringboard", os.environ.get("RINGBOARD_SERVER", "ringboard-server"))
         wait_for(lambda: Path(os.environ["RINGBOARD_SOCK"]).is_socket())
-        daemon = start("daemon", str(BINARY), "daemon", "--capture-in-process")
+        daemon = start("daemon", str(BINARY), "daemon")
         wait_for(lambda: BUS.encode() in run("busctl", "--user", "list", "--acquired"))
         owner = json.loads(run("busctl", "--user", "--json=short", "call", "org.freedesktop.DBus",
                               "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetConnectionUnixProcessID", "s", BUS))

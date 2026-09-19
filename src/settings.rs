@@ -17,7 +17,7 @@ use tokio::{
 
 mod services;
 use crate::capture::CaptureControl;
-use services::{ServiceControl, Systemd, SystemdCapture};
+use services::{ServiceControl, Systemd};
 
 #[derive(Debug, Serialize)]
 pub struct CaptureState {
@@ -121,7 +121,7 @@ impl Default for SettingsManager {
             path,
             transaction: AsyncMutex::new(()),
             services: Arc::new(Systemd),
-            capture: Arc::new(SystemdCapture(Arc::new(Systemd))),
+            capture: Arc::new(crate::capture::Unavailable),
         }
     }
 }
@@ -201,11 +201,6 @@ impl SettingsManager {
             .await
             .map_err(|error| format!("{SETTINGS_SAVED}, but {error}"))?;
         self.get()
-    }
-
-    /// ExecCondition reads persisted intent, never the unverified legacy view.
-    pub fn capture_allowed(&self) -> Result<bool, String> {
-        Ok(!self.preferences()?.capture_paused)
     }
 
     /// Run before starting Ringboard (also used by the packaged service).
@@ -628,9 +623,7 @@ mod tests {
             path,
             transaction: Default::default(),
             services: std::sync::Arc::new(super::Systemd),
-            capture: std::sync::Arc::new(super::SystemdCapture(std::sync::Arc::new(
-                super::Systemd,
-            ))),
+            capture: std::sync::Arc::new(crate::capture::Unavailable),
         }
     }
 
@@ -661,9 +654,6 @@ mod tests {
             self.paused.store(action == "stop", SeqCst);
             Ok(())
         }
-        async fn capture_paused(&self) -> Result<bool, String> {
-            Ok(self.paused.load(std::sync::atomic::Ordering::SeqCst))
-        }
         async fn limits(&self) -> Result<crate::ringboard::ipc::EngineLimits, String> {
             let defaults = ClipboardSettings::default();
             Ok(crate::ringboard::ipc::EngineLimits {
@@ -674,18 +664,28 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl crate::capture::CaptureControl for MockServices {
+        async fn set_paused(&self, paused: bool, _: u64) -> Result<(), String> {
+            super::ServiceControl::control(self, if paused { "stop" } else { "start" }, &[]).await
+        }
+        async fn is_paused(&self) -> Result<bool, String> {
+            Ok(self.paused.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+
     #[tokio::test]
     async fn failed_pause_retries_and_never_asserts_unverified_privacy() {
         use std::sync::{Arc, atomic::Ordering::SeqCst};
         let services = Arc::new(MockServices::default());
         let mut manager = manager(None);
         manager.services = services.clone();
-        manager.capture = Arc::new(super::SystemdCapture(services.clone()));
+        manager.capture = services.clone();
         services.fail.store(true, SeqCst);
         assert!(manager.set_paused(true, true).await.is_err());
         assert!(!manager.get().unwrap().private_mode);
         assert!(manager.capture_state().unwrap().desired_private_mode);
-        assert!(!manager.capture_allowed().unwrap());
+        assert!(manager.preferences().unwrap().capture_paused);
         assert_eq!(manager.capture_state().unwrap().paused, None);
         services.fail.store(false, SeqCst);
         assert!(manager.set_paused(true, true).await.unwrap().private_mode);
@@ -697,7 +697,7 @@ mod tests {
         manager.reconcile_capture().await.unwrap();
         assert!(manager.get().unwrap().private_mode);
         manager.set_paused(false, false).await.unwrap();
-        assert!(manager.capture_allowed().unwrap());
+        assert!(!manager.preferences().unwrap().capture_paused);
     }
 
     #[tokio::test]
@@ -706,7 +706,7 @@ mod tests {
         let services = Arc::new(MockServices::default());
         let mut manager = manager(None);
         manager.services = services.clone();
-        manager.capture = Arc::new(super::SystemdCapture(services.clone()));
+        manager.capture = services.clone();
         let guard = manager.quiesce().await.unwrap();
         assert!(services.paused.load(SeqCst));
         assert!(!manager.capture_state().unwrap().verified);
@@ -732,7 +732,7 @@ mod tests {
         // A directory cannot be replaced by the atomic settings file.
         let mut manager = manager(Some(directory.path().to_owned()));
         let services = Arc::new(MockServices::default());
-        manager.capture = Arc::new(super::SystemdCapture(services.clone()));
+        manager.capture = services.clone();
         assert!(manager.set_paused(true, true).await.is_err());
         assert!(services.paused.load(SeqCst));
         let state = manager.capture_state().unwrap();

@@ -1,4 +1,4 @@
-use std::{io::IsTerminal, sync::Arc};
+use std::io::IsTerminal;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -20,12 +20,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the session D-Bus service backed by Ringboard.
-    Daemon {
-        /// Migration qualification only: never run alongside ringboard-wayland.
-        #[arg(long)]
-        capture_in_process: bool,
-    },
+    /// Run the clipboard capture and D-Bus service backed by Ringboard storage.
+    Daemon,
     /// Bridge JSON Lines on stdin/stdout to the session service.
     Client,
     /// Publish stdin to the clipboard through the running daemon.
@@ -36,8 +32,6 @@ enum Command {
     },
     /// Persist validated native settings before starting the Ringboard server.
     ConfigureEngine,
-    /// systemd ExecCondition: fail closed unless persisted intent allows capture.
-    CaptureAllowed,
     /// Check whether the pinned Ringboard database is readable.
     ProbeRingboard,
     /// Print stable protocol metadata and fixtures.
@@ -68,30 +62,12 @@ async fn run(command: Command) -> Result<()> {
         )
         .init();
     match command {
-        Command::Daemon { capture_in_process } => {
-            let backend = RingboardBackend::default();
-            if capture_in_process {
-                let capture = clip_daemon::capture::Controller::new(Arc::new(
-                    clip_daemon::ringboard::capture::RingboardCapture::new(backend.clone()),
-                ));
-                daemon::run_with_capture(Arc::new(backend), Arc::new(capture)).await
-            } else {
-                daemon::run(Arc::new(backend)).await
-            }
-        }
+        Command::Daemon => daemon::run(RingboardBackend::default()).await,
         Command::Client => client::run().await,
         Command::Publish { mime } => publish_stdin(&mime).await,
         Command::ConfigureEngine => clip_daemon::settings::SettingsManager::default()
             .prepare_engine()
             .map_err(anyhow::Error::msg),
-        Command::CaptureAllowed => {
-            let settings = clip_daemon::settings::SettingsManager::default();
-            anyhow::ensure!(
-                settings.capture_allowed().map_err(anyhow::Error::msg)?,
-                "Capture is disabled by persisted preference"
-            );
-            Ok(())
-        }
         Command::ProbeRingboard => probe_ringboard().await,
         Command::Debug { command } => print_debug(command),
     }

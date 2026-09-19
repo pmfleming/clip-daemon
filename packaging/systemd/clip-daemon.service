@@ -1,9 +1,11 @@
 [Unit]
-Description=Shelllist clipboard policy service
+Description=Shelllist clipboard capture and policy service
 Documentation=https://github.com/pmfleming/clip-daemon
 After=graphical-session-pre.target ringboard-server.service ringboard-wayland.service
 PartOf=graphical-session.target
-Wants=ringboard-server.service ringboard-wayland.service
+Wants=ringboard-server.service
+# Stop the retired managed collector before opening in-process admission.
+Conflicts=ringboard-wayland.service
 
 [Service]
 Type=dbus

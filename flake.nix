@@ -40,7 +40,7 @@
               done
               substituteInPlace $out/share/systemd/user/*.service \
                 --replace-fail @out@ $out
-              substituteInPlace $out/share/systemd/user/ringboard-{server,wayland}.service \
+              substituteInPlace $out/share/systemd/user/ringboard-server.service \
                 --replace-fail @ringboard@ ${ringboard}
               install -Dm644 ${./packaging/dbus/org.laufan.ClipDaemon.service} \
                 $out/share/dbus-1/services/org.laufan.ClipDaemon.service

@@ -66,7 +66,7 @@ def check(root):
         run(str(BINARY), "configure-engine")
         start("server", "ringboard-server")
         wait_for(lambda: Path(os.environ["RINGBOARD_SOCK"]).is_socket())
-        daemon = start("daemon", str(BINARY), "daemon", "--capture-in-process")
+        daemon = start("daemon", str(BINARY), "daemon")
         wait_for(lambda: b"org.laufan.ClipDaemon" in run("busctl", "--user", "list", "--acquired"))
         assert not history(), "refusing to test nonempty history"
 
@@ -80,7 +80,7 @@ def check(root):
             nonlocal daemon
             daemon.terminate()
             daemon.wait(timeout=10)
-            daemon = start(name, str(BINARY), "daemon", "--capture-in-process")
+            daemon = start(name, str(BINARY), "daemon")
             wait_for(lambda: b"org.laufan.ClipDaemon" in run("busctl", "--user", "list", "--acquired"))
 
         def publish(value, mime="text/plain", primary=False):

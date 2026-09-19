@@ -2,7 +2,6 @@
 Description=Policy-enabled Ringboard history engine
 After=graphical-session-pre.target
 PartOf=graphical-session.target
-Wants=ringboard-wayland.service
 
 [Service]
 Type=notify
