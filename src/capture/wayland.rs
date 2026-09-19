@@ -78,6 +78,13 @@ struct Seat {
     proxy: wl_seat::WlSeat,
     device: Option<Device>,
 }
+impl Drop for Seat {
+    fn drop(&mut self) {
+        if self.proxy.version() >= 5 {
+            self.proxy.release();
+        }
+    }
+}
 struct Pending {
     offer: Offer,
     mimes: OfferedMimes,
@@ -135,7 +142,7 @@ impl State {
     }
 
     fn offer(&mut self, offer: Offer, seat: u32) {
-        if self.offers.len() >= MAX_OFFERS {
+        if self.offers.len() + self.transfers.len() >= MAX_OFFERS {
             return;
         }
         self.offers.insert(
@@ -317,6 +324,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
             },
             wl_registry::Event::GlobalRemove { name } => {
                 state.remove_seat(name);
+                if state.ready && state.seats.is_empty() {
+                    state.error = Some("Wayland capture has no seats");
+                }
                 if state.ext == Some(name) || state.wlr == Some(name) {
                     state.error = Some("Wayland data-control manager disappeared");
                 }
@@ -357,6 +367,11 @@ impl Dispatch<wl_callback::WlCallback, Barrier> for State {
                 connection.display().sync(qh, Barrier::Ready);
             }
             Barrier::Ready => {
+                // A seat/device may disappear between the two sync barriers.
+                if state.error.is_some() || state.seats.is_empty() {
+                    state.error.get_or_insert("Wayland capture has no seats");
+                    return;
+                }
                 state.ready = true;
                 state.session.running();
             }

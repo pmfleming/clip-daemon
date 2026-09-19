@@ -60,7 +60,7 @@ def check(root, start, passed, sink, sink_process, api):
         (bin_path / "shelllist-search").symlink_to(Path(search).resolve())
         # The real shell eagerly loads non-clipboard surfaces. Never launch their
         # real daemons (or access host system services) during clipboard tests.
-        for daemon in ("nm-daemon", "bt-daemon", "bar-daemon", "app-daemon"):
+        for daemon in ("nm-daemon", "bt-daemon", "bar-daemon", "app-daemon", "update-daemon"):
             stub = bin_path / daemon
             stub.write_text("#!/bin/sh\nexit 1\n")
             stub.chmod(0o700)

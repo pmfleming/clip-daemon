@@ -32,6 +32,11 @@ live-acceptance:
     cargo build --locked
     python3 scripts/isolated-acceptance.py
 
+capture-acceptance:
+    cargo build --locked --examples
+    cargo build --locked
+    python3 scripts/capture-acceptance.py
+
 backend-regressions:
     cargo build --locked
     RINGBOARD_SERVER="$(command -v ringboard-server)" python3 scripts/backend-regressions.py

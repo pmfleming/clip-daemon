@@ -1,7 +1,8 @@
 # ADR 0003: daemon-owned regular Wayland capture
 
-Status: accepted design; implementation staged behind the migration gates.
-Supersedes the capture-ownership portion of ADR 0002 only after cutover.
+Status: implemented as the packaged default; production activation remains pending.
+Supersedes the capture-ownership portion of ADR 0002 for the two-service package.
+See [qualification](capture-qualification.md) for tested and pending combinations.
 
 ## Decision
 
@@ -45,7 +46,7 @@ These are internal constants, not new user-facing settings in clip-api v1:
 
 | Resource | Limit / behavior |
 | --- | --- |
-| Seats | 16; excess seats unavailable to capture, reported without identifiers |
+| Seats | 16; additional seats are ignored |
 | Tracked offers | 64 total; overflow rejected, no retained backlog |
 | MIME types per offer | 64 |
 | MIME bytes per offer | 8 KiB aggregate, each value <= Ringboard's 96-byte limit |
@@ -61,7 +62,7 @@ These are internal constants, not new user-facing settings in clip-api v1:
 
 Overload drops new offers rather than creating a replay queue. Payloads use
 CLOEXEC memory-backed FDs; no filesystem staging before server admission. OS swap
-is outside this guarantee. Logging uses fixed reason codes and counters, never
+is outside this guarantee. Capture drop logging uses fixed reason codes, never
 content, offered strings, or content hashes.
 
 ## Privacy and mutation barriers

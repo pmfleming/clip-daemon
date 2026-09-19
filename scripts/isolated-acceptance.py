@@ -223,6 +223,10 @@ def acceptance(root):
             before = selected["revision"]
             operation_id = annotate(selected)
             editor = wait_for(lambda: next((c for c in clients() if "satty" in c["class"].lower()), None))
+            # A just-closed layer-shell picker can leave keyboard focus unset.
+            # Drive the editor only after an explicit, observed focus transition.
+            run("hyprctl", "dispatch", f"hl.dsp.focus({{ window = 'address:{editor['address']}' }})")
+            wait_for(lambda: json.loads(run("hyprctl", "-j", "activewindow")).get("address") == editor["address"])
             time.sleep(0.5)
             shortcut(editor["address"], key)
             wait_for(lambda: not any(c["address"] == editor["address"] for c in clients()))

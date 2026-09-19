@@ -255,7 +255,14 @@ impl RingboardBackend {
     ) -> BackendResult<u64> {
         let (entry, _, resolved) = self.selected_proven(opaque_id, expected_revision)?;
         let file = File::open(path).map_err(operation_error)?;
-        super::ipc::replace(entry.id(), &resolved.proof, mime, &file)?;
+        // Mirror Ringboard Add normalization. Otherwise publishing a text edit
+        // creates a second, MIME-distinct capture instead of deduplicating it.
+        super::ipc::replace(
+            entry.id(),
+            &resolved.proof,
+            super::storage_mime(mime),
+            &file,
+        )?;
         self.clear_identity_state()?;
         Ok(entry.id())
     }

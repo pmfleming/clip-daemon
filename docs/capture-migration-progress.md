@@ -99,3 +99,33 @@ Production services are not changed by these development commits.
 - Nix configuration evaluation verified two enabled packaged services, no duplicate
   declarations, no watcher enablement and a mask resolving to `/dev/null`.
   Nix formatting, deadnix and statix checks passed after formatting the new mapping.
+
+## Stage 6 — qualification and documentation (release gates remain open)
+
+- Integrated the separately committed screenshot work from main into the isolated
+  migration branch without modifying the original checkout.
+- A new live regression reproduced duplicate entries after inline text edits.
+  Capture and replacement now share Ringboard's plain-text MIME normalization;
+  main/favorite edits preserve one history entry. Other MIME identities and server
+  proof validation remain unchanged.
+- Tightened the tracked-offer cap to include transfers, released seat proxies on
+  removal, and report unavailability after losing the last seat.
+- Added a real 64 MiB boundary check, metadata-only CPU/RSS/FD sampling, a
+  `just capture-acceptance` entry point, and updated ownership, privacy, command,
+  qualification, preflight and rollback documentation.
+- Validation: `just check` passed: formatting, strict Clippy, 69 Rust tests (one
+  opt-in benchmark ignored), no unused dependencies, and RustSec with only the
+  already documented unmaintained transitive `paste` warning. Public API fixture
+  comparison passed. All 12 backend and 12 collector scenarios passed. The default
+  15-check desktop suite passed, and a full 17-check real-Shelllist run passed.
+- Three combined desktop attempts timed out while closing Satty via keyboard,
+  including the latest combined rerun; one full run passed. Explicit focus did
+  not eliminate the intermittent failure. The latest standard 15-check run,
+  12 collector checks, 12 backend scenarios and final-package smoke/rollback all
+  passed. The combined GUI gate is open, not presented as a stable test guarantee.
+- [Detailed qualification](capture-qualification.md) records scope and remaining
+  gates: wlr-only/multi-seat, physical login/systemd activation, GUI stability,
+  concurrent maximum-size stress/baseline comparison and broader crash injection.
+  The implementation is recorded, not a claim that every original release gate
+  passed. No production activation, remote push or automatic merge into the
+  original working checkouts is part of this stage.

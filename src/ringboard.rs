@@ -935,6 +935,14 @@ where
         .map_err(|_| operation_failed("Clipboard backend task failed"))?
 }
 
+fn storage_mime(mime: &str) -> &str {
+    if clipboard_history_core::is_plaintext_mime(mime) {
+        ""
+    } else {
+        mime
+    }
+}
+
 fn stored_mime_type(loaded: &LoadedEntry<'_, File>) -> BackendResult<String> {
     let Some(file) = loaded.backing_file() else {
         return loaded
@@ -1134,12 +1142,26 @@ fn entry_revision(fingerprint: &[u8; 32]) -> u64 {
 mod tests {
     use super::{
         CachedProjection, MAX_SAFE_JSON_INTEGER, QueryCandidate, ResolvedEntry, entry_fingerprint,
-        entry_revision, inspect_entry, opaque_id,
+        entry_revision, inspect_entry, opaque_id, storage_mime,
     };
     use crate::{
         backend::HistoryQuery,
         model::{EntryKind, EntrySummary},
     };
+
+    #[test]
+    fn capture_and_replacement_share_plaintext_storage_normalization() {
+        for mime in ["", "text/plain", "UTF8_STRING", "text/plain;charset=utf-8"] {
+            assert_eq!(storage_mime(mime), "");
+        }
+        for mime in [
+            "image/png",
+            "application/json",
+            "text/plain;charset=iso-8859-1",
+        ] {
+            assert_eq!(storage_mime(mime), mime);
+        }
+    }
 
     fn query(
         needle: &str,

@@ -3,3 +3,5 @@
 /.direnv
 *.log
 __pycache__/
+# Standalone metadata inspection; dependencies are locked by the root Cargo.lock.
+/vendor/shelllist-search/Cargo.lock

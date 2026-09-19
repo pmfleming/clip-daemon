@@ -1,6 +1,10 @@
 # Plan: move Wayland capture into clip-daemon
 
-Status: proposed; no runtime or deployment changes made by this plan.
+Status: implementation and two-unit packaging completed on the local migration
+branch; production activation and remaining qualification gates are pending.
+This document retains the original staged plan and baseline. See
+[progress](capture-migration-progress.md) and [qualification](capture-qualification.md)
+for implemented behavior, measured evidence, and untested cases.
 
 ## Goal and scope
 
@@ -22,7 +26,7 @@ Related baseline: [ADR 0002](adr-0002-wayland-selection-ownership.md),
 [server extension](../packaging/ringboard-policy/README.md). Add a new ADR when
 implementation starts; do not rewrite historical decisions as if already shipped.
 
-## Current integration points
+## Baseline integration points (before migration)
 
 | Area | Current implementation | Required change |
 | --- | --- | --- |

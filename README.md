@@ -1,13 +1,17 @@
 # clip-daemon
 
-Rust clipboard policy and `clip-api` facade for the Shelllist clipboard surface. Ringboard owns capture, persistent history, favorites, and retention; this daemon owns the stable UI boundary, Wayland selection publication, paste targeting, and product policy.
+Rust Wayland clipboard collector and `clip-api` facade for Shelllist. The daemon owns regular-selection capture, publication, paste targeting, and product policy. The policy-enabled Ringboard server owns persistent history, favorites, retention, and atomic mutations.
 
-Proposed next architecture: [move Wayland capture into clip-daemon](docs/wayland-capture-migration.md), retaining Ringboard as the storage engine. This is a migration plan, not the current runtime behavior.
+The package ships two services: daemon and server. The external watcher is retired.
+See [ADR 0003](docs/adr-0003-daemon-wayland-capture.md), the
+[migration record](docs/capture-migration-progress.md), and
+[qualification results and remaining gates](docs/capture-qualification.md).
+Production cutover remains a deliberate, separate operation.
 
 ## Installation
 
 See [`docs/installation.md`](docs/installation.md) for a standalone Nix build,
-packaged server/watcher units, first-start privacy ordering, and isolated package
+packaged daemon/server units, first-start privacy ordering, and isolated package
 verification. Keep `daemon-framework` beside this checkout: all five daemons
 consume that current worktree, never a private framework pin or vendored copy.
 
@@ -21,6 +25,7 @@ just check                 # locked tests, Clippy, unused dependencies, RustSec
 just quality               # full RQLens evidence and verification
 just live-acceptance       # disposable nested desktop; never wipes normal history
 just backend-regressions   # real-server storage/concurrency/admission regressions
+just capture-acceptance    # collector privacy/recovery, edits, and 64 MiB boundary
 just benchmark-history     # synthetic release projection comparison
 just hardware-acceptance   # remaining manual hardware gates
 ```
@@ -38,7 +43,6 @@ keyboard/login qualification remains a separate manual gate.
 
 ```sh
 clip-daemon configure-engine # before starting Ringboard; validate/apply native configuration
-clip-daemon capture-allowed  # systemd ExecCondition; exits 1 when capture must not start
 clip-daemon daemon
 clip-daemon client
 clip-daemon publish --mime image/png < image.png
@@ -56,7 +60,7 @@ nix run .#qualify
 
 The daemon supports bounded history queries with complete-text search (Unicode lowercase matching, queries up to 4096 bytes), semantic details, private image thumbnails, exact-MIME restoration through Ringboard, opaque entry IDs, structured errors, D-Bus/JSONL transport, and the checked `clip-api` v1 registry. History metadata is polled only while a frontend subscription exists. `clipboard.settings.get` separates desired/effective capture and retention state; unverified privacy is never asserted. Existing native retention counts are adopted on first use, while a fresh setup receives the documented defaults.
 
-Phase 3 adds copy and compositor-aware paste sessions, terminal/GUI shortcuts after the picker is hidden, image-as-file materialization, external image annotation with validated PNG return, and two-phase history wipe. Phase 4 adds delete, favorite/current pinning, pause/private mode, native Ringboard retention settings, cancellation, and cache cleanup. Phase 5 adds bounded inline editing, explicit validated URL/file launch actions, a daemon-enforced type/action matrix, and position-preserving text/image replacement. Generated files use collision-safe names, private permissions, and a persistent ownership registry; unreferenced daemon-owned files are pruned without touching unrelated files. Equivalent Ringboard echoes of generated file URIs and completed annotations are collapsed by default in the API projection and can be retained with the `collapse_self_echoes` setting. Raw clipboard images and single safe local image-file entries use the same `ResolvedContent` policy: MIME aliases, summaries, details, thumbnails, normal image publication, and file-URI publication all resolve through one abstraction. `clip-daemon` publishes exact-MIME Wayland selections directly while Ringboard remains the sole capture/history engine.
+Phase 3 adds copy and compositor-aware paste sessions, terminal/GUI shortcuts after the picker is hidden, image-as-file materialization, external image annotation with validated PNG return, and two-phase history wipe. Phase 4 adds delete, favorite/current pinning, pause/private mode, native Ringboard retention settings, cancellation, and cache cleanup. Phase 5 adds bounded inline editing, explicit validated URL/file launch actions, a daemon-enforced type/action matrix, and position-preserving text/image replacement. Generated files use collision-safe names, private permissions, and a persistent ownership registry; unreferenced daemon-owned files are pruned without touching unrelated files. Equivalent Ringboard echoes of generated file URIs and completed annotations are collapsed by default in the API projection and can be retained with the `collapse_self_echoes` setting. Raw clipboard images and single safe local image-file entries use the same `ResolvedContent` policy: MIME aliases, summaries, details, thumbnails, normal image publication, and file-URI publication all resolve through one abstraction. `clip-daemon` captures and publishes Wayland selections independently; pausing automatic capture does not disable explicit publication or edits. Resuming discards the current-selection bootstrap snapshot, so content copied during a private interval is not replayed. Copy again to capture it.
 
 `publish` reads bounded content from stdin and sends it over D-Bus to the running daemon. The daemon enforces the configured entry-size limit, validates the MIME type, and remains the Wayland selection owner. Valid UTF-8 plain text retains its exact offer and also exposes standard text aliases for GTK and other desktop consumers; binary/image/file-list offers do not gain text aliases. This supports short-lived producers without `wl-copy`; for example, standalone Satty can use `copy-command = "clip-daemon publish --mime image/png"`.
 

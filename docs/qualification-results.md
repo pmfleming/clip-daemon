@@ -1,5 +1,9 @@
 # Ringboard qualification results
 
+For the current two-service capture implementation, see
+[daemon capture qualification](capture-qualification.md). The sections below
+retain earlier results and must not be read as production cutover approval.
+
 Historical production probe: 2026-07-25. Physical hardware records remain tracked
 by `just hardware-acceptance`; see the remediation section below for current
 nested-desktop qualification.

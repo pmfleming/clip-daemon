@@ -56,11 +56,7 @@ impl RingboardCapture {
         let mut digest = super::content_hasher();
         std::io::copy(&mut file.take(size + 1), &mut digest)
             .map_err(|_| "Could not hash captured bytes")?;
-        let stored_mime = if clipboard_history_core::is_plaintext_mime(mime) {
-            ""
-        } else {
-            mime
-        };
+        let stored_mime = super::storage_mime(mime);
         let proof = ipc::content_proof(&digest.finalize().into(), stored_mime);
         let candidate = candidate(file, size, stored_mime).map_err(|error| error.to_string())?;
         file.rewind()

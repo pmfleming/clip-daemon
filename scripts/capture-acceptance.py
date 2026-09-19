@@ -40,8 +40,17 @@ def history():
     return call("clipboard.history.query", {"limit":200})["history"]["entries"]
 
 
+def resources(pid):
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()
+    status = dict(line.split(":", 1) for line in Path(f"/proc/{pid}/status").read_text().splitlines() if ":" in line)
+    return {"cpu_seconds": (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK"),
+            "rss_kib": int(status["VmRSS"].split()[0]), "peak_rss_kib": int(status["VmHWM"].split()[0]),
+            "fds": len(list(Path(f"/proc/{pid}/fd").iterdir()))}
+
+
 def check(root):
     children, logs = [], []
+    metrics = {}
 
     def start(name, *args, **kwargs):
         log = (root / (name + ".log")).open("w")
@@ -94,12 +103,34 @@ def check(root):
             assert history() == before, "excluded content changed history"
 
         command("resume", False)
+        idle = resources(daemon.pid)
+        time.sleep(1)
+        metrics["idle_cpu_seconds_over_one_second"] = resources(daemon.pid)["cpu_seconds"] - idle["cpu_seconds"]
+        started = time.monotonic()
         publish(b"capture-one")
         wait_for(lambda: any(e["preview"] == "capture-one" for e in history()))
+        metrics["copy_to_query_visible_ms"] = (time.monotonic() - started) * 1000
+        metrics["initial"] = resources(daemon.pid)
         before = history()
         publish(b"capture-one")
         unchanged(before)
         print("PASS real-capture-and-duplicate", flush=True)
+        for favorite in (False, True):
+            selected = history()[0]
+            if favorite:
+                call("clipboard.entry.action", {"entry_id":selected["id"], "revision":selected["revision"], "action":"favorite"})
+                selected = wait_for(lambda: next((e for e in history() if e["favorite"]), None))
+            count = len(history())
+            lease = call("clipboard.entry.edit.begin", {"entry_id":selected["id"], "revision":selected["revision"]})["edit"]
+            value = "edited-favorite-capture" if favorite else "edited-main-capture"
+            call("clipboard.entry.edit.commit", {"edit_id":lease["id"], "value":value})
+            wait_for(lambda: any(e["preview"] == value for e in history()))
+            time.sleep(0.3)
+            after = history()
+            assert len(after) == count, "restoring an edit created a duplicate history entry"
+            assert any(e["preview"] == value and e["favorite"] == favorite for e in after)
+        before = history()
+        print("PASS inline-main-and-favorite-edits-without-echo-entries", flush=True)
         publish(b"primary-is-not-history", primary=True)
         unchanged(before)
         print("PASS primary-ignored", flush=True)
@@ -178,6 +209,20 @@ def check(root):
         publish(b"capture-after-compositor-reconnect")
         wait_for(lambda: any(e["preview"] == "capture-after-compositor-reconnect" for e in history()))
         print("PASS compositor-disconnect-health-and-reconnect", flush=True)
+
+        # Exercise the hard limit with real pipes/FDs, not only size arithmetic.
+        call("clipboard.settings.update", {"max_entry_bytes": 64 * 1024 * 1024})
+        before = history()
+        publish(b"x" * (64 * 1024 * 1024 + 1), "application/octet-stream")
+        time.sleep(1)
+        assert history() == before
+        publish(b"x" * (64 * 1024 * 1024), "application/octet-stream")
+        wait_for(lambda: any(e["byte_size"] == 64 * 1024 * 1024 for e in history()))
+        metrics["after_hard_limit_capture"] = resources(daemon.pid)
+        command("pause", True)
+        metrics["after_pause"] = resources(daemon.pid)
+        assert metrics["after_pause"]["fds"] <= metrics["after_hard_limit_capture"]["fds"]
+        print("PASS hard-limit-pipe-admission-and-resource-release", flush=True)
     finally:
         for child in reversed(children):
             try:
@@ -192,6 +237,7 @@ def check(root):
             log.close()
         report = ROOT / "target/capture-acceptance"
         report.mkdir(parents=True, exist_ok=True)
+        (report / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
         for path in root.glob("*.log"):
             (report / path.name).write_bytes(path.read_bytes())
 
