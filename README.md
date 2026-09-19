@@ -2,6 +2,8 @@
 
 Rust clipboard policy and `clip-api` facade for the Shelllist clipboard surface. Ringboard owns capture, persistent history, favorites, and retention; this daemon owns the stable UI boundary, Wayland selection publication, paste targeting, and product policy.
 
+Proposed next architecture: [move Wayland capture into clip-daemon](docs/wayland-capture-migration.md), retaining Ringboard as the storage engine. This is a migration plan, not the current runtime behavior.
+
 ## Installation
 
 See [`docs/installation.md`](docs/installation.md) for a standalone Nix build,

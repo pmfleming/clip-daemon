@@ -1,0 +1,16 @@
+[
+  {"name":"plain text preferred to html", "offers":["text/html","text/plain"], "expected":["text/plain","text/html"]},
+  {"name":"parameterless text preferred", "offers":["text/plain;charset=utf-8","text/plain"], "expected":["text/plain"]},
+  {"name":"text alias preserved for request", "offers":["UTF8_STRING"], "expected":["UTF8_STRING"]},
+  {"name":"cut file representation preferred to URI", "offers":["text/uri-list","x-special/gnome-copied-files"], "expected":["x-special/gnome-copied-files","text/uri-list"]},
+  {"name":"plain URI fallback baseline", "offers":["text/uri-list","text/plain"], "expected":["text/plain","text/uri-list"]},
+  {"name":"image preferred to URI", "offers":["text/uri-list","image/png"], "expected":["image/png","text/uri-list"]},
+  {"name":"first image representation retained", "offers":["image/png","image/jpeg"], "expected":["image/png"]},
+  {"name":"binary fallback", "offers":["application/octet-stream"], "expected":["application/octet-stream"]},
+  {"name":"chromium internal excluded", "offers":["chromium/x-internal-source-rfh-token","text/plain"], "expected":["text/plain"]},
+  {"name":"chromium custom retained before rich text", "offers":["text/html","chromium/x-web-custom-data"], "expected":["chromium/x-web-custom-data","text/html"]},
+  {"name":"sensitive marker last", "offers":["text/plain","image/png","x-kde-passwordManagerHint"], "expected":[]},
+  {"name":"sensitive marker first", "offers":["x-kde-passwordManagerHint","text/plain"], "expected":[]},
+  {"name":"sensitive marker middle", "offers":["text/html","x-kde-passwordManagerHint","text/plain"], "expected":[]},
+  {"name":"no usable MIME", "offers":["TARGETS","TIMESTAMP"], "expected":[]}
+]
