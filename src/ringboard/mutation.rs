@@ -147,7 +147,7 @@ impl RingboardBackend {
         ))
     }
 
-    fn selection_changed(&self) -> BackendResult<()> {
+    pub(super) fn selection_changed(&self) -> BackendResult<()> {
         self.artifact_registry()?.clear_active_selection();
         self.clear_identity_state()
     }
@@ -202,6 +202,7 @@ impl RingboardBackend {
         active.insert(
             operation_id,
             OperationTask {
+                action: "annotate",
                 control,
                 handle,
                 files,
@@ -593,7 +594,7 @@ fn selection_size_error(size: u64, limit: u64) -> BackendError {
     )
 }
 
-fn valid_edited_image(path: &Path, max_bytes: u64) -> bool {
+pub(super) fn valid_edited_image(path: &Path, max_bytes: u64) -> bool {
     if !path.symlink_metadata().is_ok_and(|metadata| {
         metadata.is_file() && metadata.len() <= max_bytes.min(MAX_THUMBNAIL_BYTES)
     }) {
@@ -623,7 +624,7 @@ fn image_directory() -> BackendResult<PathBuf> {
     private_directory(PathBuf::from(home).join("Pictures/Screenshots/clipboard-history"))
 }
 
-fn runtime_directory(child: &str) -> BackendResult<PathBuf> {
+pub(super) fn runtime_directory(child: &str) -> BackendResult<PathBuf> {
     let root = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir);
@@ -636,7 +637,7 @@ fn private_directory(path: PathBuf) -> BackendResult<PathBuf> {
     Ok(path)
 }
 
-fn private_file(path: &Path) -> BackendResult<File> {
+pub(super) fn private_file(path: &Path) -> BackendResult<File> {
     OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -654,7 +655,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> BackendResult<()> {
     result
 }
 
-fn unique_path(directory: &Path, extension: &str) -> PathBuf {
+pub(super) fn unique_path(directory: &Path, extension: &str) -> PathBuf {
     directory.join(format!("clipboard-{}.{}", Uuid::new_v4(), extension))
 }
 
@@ -674,7 +675,7 @@ fn completed(action: &str, message: &str) -> OperationResult {
     OperationResult::completed(action, message)
 }
 
-fn operation_error(error: impl std::fmt::Display) -> BackendError {
+pub(super) fn operation_error(error: impl std::fmt::Display) -> BackendError {
     BackendError::new(BackendErrorKind::OperationFailed, error.to_string())
 }
 
@@ -691,6 +692,7 @@ mod tests {
         let operations = std::sync::Mutex::new(std::collections::HashMap::from([(
             "operation-1".to_owned(),
             OperationTask {
+                action: "annotate",
                 control: Default::default(),
                 handle: tokio::spawn(async {}),
                 files: Vec::new(),
@@ -727,6 +729,7 @@ mod tests {
             backend.operations.lock().unwrap().insert(
                 "cancel-me".into(),
                 OperationTask {
+                    action: "annotate",
                     control,
                     handle,
                     files: vec![staged.clone()],
@@ -782,6 +785,7 @@ mod tests {
         backend.operations.lock().unwrap().insert(
             "committing".into(),
             OperationTask {
+                action: "annotate",
                 control,
                 handle,
                 files: vec![staged.clone()],

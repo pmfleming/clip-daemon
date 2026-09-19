@@ -26,6 +26,7 @@ pub const METHODS: &[&str] = &[
     "clipboard.entry.edit.cancel",
     "clipboard.capture.setPaused",
     "clipboard.capture.screenshot",
+    "clipboard.capture.interactive",
     "clipboard.selection.publishText",
     "clipboard.selection.publishFiles",
     "clipboard.settings.get",

@@ -36,6 +36,21 @@ pub struct ScreenshotRegion {
     pub height: u32,
 }
 
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScreenshotMode {
+    Region,
+    Screen,
+}
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InteractiveScreenshot {
+    pub mode: ScreenshotMode,
+    #[serde(default)]
+    pub annotate: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileSelectionOperation {
     Copy,
@@ -174,6 +189,15 @@ pub trait ClipboardBackend: Send + Sync {
         region: ScreenshotRegion,
         max_bytes: u64,
     ) -> BackendResult<OperationResult>;
+    async fn interactive_screenshot(
+        &self,
+        _request: InteractiveScreenshot,
+        _max_bytes: u64,
+    ) -> BackendResult<OperationResult> {
+        Err(BackendError::unavailable(
+            "Interactive screenshots are unavailable",
+        ))
+    }
     async fn publish(
         &self,
         mime: &str,
