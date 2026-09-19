@@ -363,6 +363,9 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
  "wl-clipboard-rs",
  "zbus",
 ]

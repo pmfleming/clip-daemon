@@ -64,6 +64,54 @@ impl Allocator {
         }
     }
 
+    // v2 capture: one reactor turn admits bytes, validates a duplicate candidate,
+    // and either promotes it in its existing ring or adds to main. Status 3 is
+    // explicitly uncertain (I/O may have followed eviction); never retry blindly.
+    pub fn policy_capture(&mut self, request: &[u8], fd: OwnedFd) -> [u8; 13] {
+        let result = self.policy_capture_inner(request, fd);
+        let mut response = [0; 13];
+        response[..4].copy_from_slice(b"CDR1");
+        match result {
+            Ok(Some(id)) => response[5..].copy_from_slice(&id.to_le_bytes()),
+            Ok(None) => response[4] = 2,
+            Err(_) => {
+                log::error!("Capture persistence outcome is uncertain");
+                response[4] = 3;
+            }
+        }
+        response
+    }
+
+    fn policy_capture_inner(&mut self, request: &[u8], fd: OwnedFd) -> Result<Option<u64>, CliError> {
+        use sha2::{Digest, Sha256};
+        if request.len() < 46 || &request[..5] != b"CDP1\x08" { return Ok(None); }
+        let length = usize::from(request[45]);
+        if length > 96 || request.len() != 46 + length { return Ok(None); }
+        let Some(mime) = std::str::from_utf8(&request[46..]).ok()
+            .and_then(|mime| MimeType::from(mime).ok()) else { return Ok(None) };
+        let Some(fd) = self.policy_admit(fd)? else { return Ok(None) };
+        let mut file = File::from(fd);
+        let mut digest = Sha256::new();
+        digest.update(b"clip-daemon:entry-content:v1:");
+        io::copy(&mut file, &mut digest).map_io_err(|| "Hash admitted capture")?;
+        file.seek(SeekFrom::Start(0)).map_io_err(|| "Rewind admitted capture")?;
+        let mut hash = Sha256::new();
+        hash.update(b"clip-daemon:proof:v1:");
+        hash.update(digest.finalize());
+        if !is_plaintext_mime(&mime) { hash.update(mime.as_bytes()); }
+        let proof: [u8; 32] = hash.finalize().into();
+        if request[13..45] != proof { return Ok(None); }
+        let id = u64::from_le_bytes(request[5..13].try_into().unwrap());
+        if id != u64::MAX && self.policy_proof(id).ok() == Some(proof) {
+            if let MoveToFrontResponse::Success { id } = self.move_to_front(id, None)? {
+                return Ok(Some(id));
+            }
+        }
+        // Already admitted: never evict or stage before the bounded snapshot.
+        let id = self.add_internal(RingKind::Main, |head, data| data.alloc(file.into(), &mime, RingKind::Main, head))?;
+        Ok(Some(composite_id(RingKind::Main, id)))
+    }
+
     fn policy_remove_many(&mut self, fd: OwnedFd) -> Result<u8, CliError> {
         let file = File::from(fd);
         if !file.metadata().map_io_err(|| "Inspect deletion targets")?.is_file() { return Ok(2); }

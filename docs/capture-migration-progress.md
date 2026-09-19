@@ -31,3 +31,26 @@ Production services are not changed by these development commits.
 - Work continues on branch `capture-migration` in the sibling worktree
   `clip-daemon-capture` to avoid unrelated concurrent screenshot changes on main.
   Actual transfer cancellation and Wayland lifecycle remain stage 3/4 gates.
+
+## Stage 3 — transport and atomic ingestion
+
+- Added an event-driven ext/wlr collector, regular-selection-only capture, full
+  offer exclusion, bounded memory-backed transfers, deadlines, bounded ingest
+  queue, and acknowledgement-based pause/join. Bootstrap selections are skipped
+  after pause/reconnect, using a compositor sync barrier rather than a timer.
+- Added policy protocol v2 (`0xc2`, operation 8): the server admits and hashes a
+  bounded snapshot, then atomically promotes a matching candidate in its original
+  ring or adds to main. Safe rejection and uncertain outcomes are distinct.
+- Real desktop qualification exposed a panic in the upstream SDK deduplicator's
+  BorrowedBuf helper. Replaced that dependency with bounded positional comparisons
+  using the existing backend read boundary. No new unsafe Rust or copied SDK code.
+  A 128 MiB candidate-I/O budget may intentionally fall back to Add under a
+  pathological comparison workload; no unchecked promotion is used.
+- Validation: strict Clippy and formatting passed; 62 Rust tests passed (one opt-in
+  benchmark ignored); all 12 policy backend scenarios passed. The disposable
+  nested-Hyprland collector test passed capture/dedup, primary exclusion, pause
+  fencing/no replay, sensitive exclusion, and exact/over-limit admission.
+- This stage's collector is accessible through the disposable `capture-worker`
+  test driver only; production still uses the packaged watcher. Settings/wipe
+  coordination and full existing desktop round trips are stage 4 integration
+  gates. wlr-only compositor and multi-seat hardware qualification remain pending.

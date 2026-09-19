@@ -43,6 +43,27 @@ of database-wide power-loss ACID transactions. Ringboard's existing durability
 and recovery model still applies. Staging/sync and install errors are reported;
 failed old-file cleanup is logged for retry.
 
+## Capture ingestion extension v2 (migration branch)
+
+Clients requiring atomic capture ingestion negotiate `0xc2`; the server echoes
+that byte only when v2 is supported. Existing `0xc1` clients remain supported.
+The daemon collector refuses older servers before receiving clipboard payloads.
+
+Operation 8 uses the same CDP1 header, one admitted FD, and a candidate raw ID
+(`u64::MAX` means no candidate). The expected proof covers the complete input
+payload and the MIME Ringboard will store (empty for normalized plain text).
+The server independently computes that proof from its admitted snapshot. If a
+candidate still has identical full content and stored MIME, it is promoted within
+its existing ring; otherwise the snapshot is added to main. Comparison and mutation
+occur in one reactor turn, so a stale deduplication hint cannot promote another
+entry. An untrusted candidate/proof never bypasses byte admission.
+
+The reply is `CDR1`, status byte, and raw ID (u64 LE): status 0 committed, 2 safely
+rejected before mutation, 3 uncertain I/O outcome. Only status 0 carries a valid
+ID. A transport error or uncertain result closes collector admission; it is not
+blindly retried or reported as a verified privacy barrier. This protocol is not
+an exactly-once guarantee across process crashes.
+
 ## Capture admission
 
 `clip-daemon-max-bytes` in the Ringboard data directory is an atomic decimal

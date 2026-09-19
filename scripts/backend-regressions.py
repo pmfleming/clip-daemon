@@ -339,6 +339,57 @@ def concurrent_mutations(_desktop):
     assert not history()["entries"]
 
 
+def capture_request(value, candidate=(1 << 64) - 1, mime=b"text/plain", proof=None):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
+        connection.settimeout(10)
+        connection.connect(os.environ["RINGBOARD_SOCK"])
+        connection.send(b"\xc2")
+        assert connection.recv(1) == b"\xc2", "capture-v2 policy server required"
+        if proof is None:
+            proof = content_proof(value, b"" if mime == b"text/plain" else mime)
+        packet = b"CDP1\x08" + struct.pack("<Q", candidate) + proof + bytes([len(mime)]) + mime
+        with tempfile.TemporaryFile() as file:
+            file.write(value)
+            file.seek(0)
+            connection.sendmsg([packet], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [file.fileno()]))])
+        response = connection.recv(14)
+        assert len(response) == 13 and response[:4] == b"CDR1", response
+        return response[4], struct.unpack("<Q", response[5:])[0]
+
+
+def capture_ingest(_desktop):
+    for favorite in (False, True):
+        original = int(add("duplicate", favorite).split()[-1])
+        add("neighbor", favorite)
+        before = [row for row in history()["entries"] if row["favorite"] == favorite]
+        status, promoted = capture_request(b"duplicate", original)
+        assert status == 0
+        after = [row for row in history()["entries"] if row["favorite"] == favorite]
+        assert len(after) == len(before) == 2, after
+        assert {row["preview"] for row in after} == {"duplicate", "neighbor"}
+        assert capture_request(b"duplicate", promoted)[0] == 0
+    before = history()
+    assert capture_request(b"mismatched-proof", proof=bytes(32))[0] == 2
+    assert history() == before, "bad capture proof mutated history"
+    # Use the actual configured data path rather than assume a package directory.
+    candidates = list(Path(os.environ["XDG_DATA_HOME"]).rglob("clip-daemon-max-bytes"))
+    assert len(candidates) == 1, candidates
+    limit = candidates[0]
+    limit.write_text("65536\n")
+    assert capture_request(b"x" * 65537)[0] == 2
+    assert history() == before, "oversized capture evicted an entry"
+    # Candidate is only a hint: mismatched bytes must add, not promote that row.
+    candidate = int(add("latest").split()[-1])
+    status, different = capture_request(b"different", candidate)
+    assert status == 0
+    rows = [row for row in history()["entries"] if not row["favorite"]]
+    assert {row["preview"] for row in rows} == {"latest", "different"}, rows
+    # A matching payload with a different stored MIME is not a duplicate.
+    assert capture_request(b"different", different, b"application/octet-stream")[0] == 0
+    rows = [row for row in history()["entries"] if not row["favorite"]]
+    assert len(rows) == 2 and {row["mime"] for row in rows} == {"text/plain", "application/octet-stream"}, rows
+
+
 def retention_recovery(desktop):
     initial = call("clipboard.settings.get")
     assert initial["settings"]["max_entries"] == 2, "native retention was not adopted"
@@ -410,7 +461,7 @@ def admission_limit(_desktop):
 
 CASES = {"wraparound": wraparound, "replacement": replacement,
          "legacy-replacement": legacy_replacement, "artifact-references": artifact_references,
-         "privacy-retry": privacy_retry, "subscription-baselines": subscription_baselines, "echo-identity": echo_identity, "png-contract": png_contract, "concurrent-mutations": concurrent_mutations, "retention-recovery": retention_recovery, "full-text-search": full_text_search, "admission-limit": admission_limit}
+         "privacy-retry": privacy_retry, "subscription-baselines": subscription_baselines, "echo-identity": echo_identity, "png-contract": png_contract, "concurrent-mutations": concurrent_mutations, "capture-ingest": capture_ingest, "retention-recovery": retention_recovery, "full-text-search": full_text_search, "admission-limit": admission_limit}
 
 
 def isolated(case):
@@ -439,7 +490,7 @@ if __name__ == "__main__":
         finally:
             desktop.close()
     else:
-        needs_policy = {"replacement", "concurrent-mutations", "retention-recovery", "admission-limit"}
+        needs_policy = {"replacement", "concurrent-mutations", "capture-ingest", "retention-recovery", "admission-limit"}
         cases = sys.argv[1:] or [name for name in CASES if (name != "legacy-replacement" if os.environ.get("RINGBOARD_SERVER") else name not in needs_policy)]
         for case in cases:
             isolated(case)

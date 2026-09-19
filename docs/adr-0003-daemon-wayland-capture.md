@@ -54,6 +54,7 @@ These are internal constants, not new user-facing settings in clip-api v1:
 | Payload per transfer | min(configured limit, 64 MiB), plus one overflow-detection byte |
 | Aggregate payload reservation | 128 MiB, including queued/in-flight ingest |
 | Completed ingest queue | 1; backpressure never blocks lifecycle commands |
+| Duplicate candidate comparisons | 2048 main / 16 favorite entries, at most 128 MiB of historical byte reads per capture; budget exhaustion falls back to Add |
 | Idle / total transfer timeout | 5 s / 15 s |
 | Reconnect backoff | 250 ms to 10 s, cancellable |
 | Lifecycle acknowledgement | bounded; failure/uncertain Add never claims verified pause |

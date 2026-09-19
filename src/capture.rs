@@ -6,6 +6,12 @@ use std::sync::{
 
 use async_trait::async_trait;
 
+mod policy;
+mod transfer;
+mod wayland;
+mod worker;
+pub use worker::{CaptureSink, Controller};
+
 /// Implementations acknowledge pause only after fencing every storage submission.
 #[async_trait]
 pub trait CaptureControl: Send + Sync {
@@ -87,7 +93,10 @@ impl Admission {
         if !self.accepts(generation) {
             return Ok(None);
         }
-        match submit() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(submit))
+            .map_err(|_| "Capture sink panicked".to_owned())
+            .and_then(|result| result);
+        match result {
             Ok(value) => Ok(Some(value)),
             Err(error) => {
                 self.uncertain.store(true, Ordering::SeqCst);
@@ -159,6 +168,18 @@ mod tests {
                 .unwrap(),
             None::<()>
         );
+    }
+
+    #[test]
+    fn sink_panic_closes_admission_without_poisoning_the_fence() {
+        let gate = Admission::default();
+        gate.resume().unwrap();
+        assert!(
+            gate.submit::<()>(gate.admit().unwrap(), || panic!("injected"))
+                .is_err()
+        );
+        assert!(gate.admit().is_none());
+        assert!(gate.fence().is_err());
     }
 
     #[test]

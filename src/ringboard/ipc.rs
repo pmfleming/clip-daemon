@@ -68,7 +68,14 @@ pub(crate) struct EngineLimits {
 }
 
 pub(crate) fn limits() -> BackendResult<EngineLimits> {
-    let socket = send_request(7, 0, &[0; 32], "", None)?;
+    read_limits(send_request(7, 0, &[0; 32], "", None)?)
+}
+
+pub(super) fn capture_ready() -> BackendResult<EngineLimits> {
+    read_limits(send_request_version(0xc2, 7, 0, &[0; 32], "", None)?)
+}
+
+fn read_limits(socket: OwnedFd) -> BackendResult<EngineLimits> {
     let mut response = [0; 20];
     let (_, length) = recv(&socket, &mut response, RecvFlags::TRUNC).map_err(ipc_error)?;
     if length != response.len() || &response[..4] != b"CDS1" {
@@ -82,6 +89,31 @@ pub(crate) fn limits() -> BackendResult<EngineLimits> {
         max_favorites: u32::from_le_bytes(response[8..12].try_into().map_err(ipc_error)?),
         max_entry_bytes: (max_bytes != 0).then_some(max_bytes),
     })
+}
+
+/// v2 capture atomically promotes a proven candidate or admits a new entry.
+/// None is a confirmed safe rejection; transport errors have uncertain outcome.
+pub(super) fn capture(
+    id: Option<u64>,
+    proof: &[u8; 32],
+    mime: &str,
+    file: &File,
+) -> BackendResult<Option<u64>> {
+    let socket = send_request_version(0xc2, 8, id.unwrap_or(u64::MAX), proof, mime, Some(file))?;
+    let mut response = [0; 13];
+    let (_, length) = recv(&socket, &mut response, RecvFlags::TRUNC).map_err(ipc_error)?;
+    if length != response.len() || &response[..4] != b"CDR1" {
+        return Err(ipc_error(
+            "Capture outcome is unknown; do not retry automatically",
+        ));
+    }
+    match response[4] {
+        0 => Ok(Some(u64::from_le_bytes(
+            response[5..].try_into().map_err(ipc_error)?,
+        ))),
+        2 => Ok(None),
+        _ => Err(ipc_error("Capture outcome is unknown")),
+    }
 }
 
 fn request(
@@ -117,6 +149,17 @@ fn send_request(
     mime: &str,
     file: Option<&File>,
 ) -> BackendResult<OwnedFd> {
+    send_request_version(0xc1, op, id, proof, mime, file)
+}
+
+fn send_request_version(
+    version: u8,
+    op: u8,
+    id: u64,
+    proof: &[u8; 32],
+    mime: &str,
+    file: Option<&File>,
+) -> BackendResult<OwnedFd> {
     let mime_len = u8::try_from(mime.len())
         .ok()
         .filter(|length| *length <= 96)
@@ -136,10 +179,10 @@ fn send_request(
         &SocketAddrUnix::new(socket_file()).map_err(ipc_error)?,
     )
     .map_err(ipc_error)?;
-    send(&socket, &[0xc1], SendFlags::NOSIGNAL).map_err(ipc_error)?;
-    let mut version = [0];
-    let (_, length) = recv(&socket, &mut version, RecvFlags::empty()).map_err(ipc_error)?;
-    if length != 1 || version != [0xc1] {
+    send(&socket, &[version], SendFlags::NOSIGNAL).map_err(ipc_error)?;
+    let mut negotiated = [0];
+    let (_, length) = recv(&socket, &mut negotiated, RecvFlags::empty()).map_err(ipc_error)?;
+    if length != 1 || negotiated != [version] {
         return Err(BackendError::unavailable(
             "Safe mutations require the clip-daemon Ringboard policy package; no history was changed",
         ));
