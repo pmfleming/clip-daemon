@@ -16,7 +16,8 @@ use tokio::{
 };
 
 mod services;
-use services::{ServiceControl, Systemd};
+use crate::capture::CaptureControl;
+use services::{ServiceControl, Systemd, SystemdCapture};
 
 #[derive(Debug, Serialize)]
 pub struct CaptureState {
@@ -93,6 +94,7 @@ pub struct SettingsManager {
     path: Option<PathBuf>,
     transaction: AsyncMutex<()>,
     services: Arc<dyn ServiceControl>,
+    capture: Arc<dyn CaptureControl>,
 }
 
 struct SettingsState {
@@ -119,6 +121,7 @@ impl Default for SettingsManager {
             path,
             transaction: AsyncMutex::new(()),
             services: Arc::new(Systemd),
+            capture: Arc::new(SystemdCapture(Arc::new(Systemd))),
         }
     }
 }
@@ -128,6 +131,13 @@ const SETTINGS_SAVED: &str = "Clipboard settings were saved";
 const CAPTURE_SAVED: &str = "Capture preference was saved";
 
 impl SettingsManager {
+    pub(crate) fn with_capture(capture: Arc<dyn CaptureControl>) -> Self {
+        Self {
+            capture,
+            ..Self::default()
+        }
+    }
+
     /// Legacy booleans never assert privacy unless service state is verified.
     pub fn get(&self) -> Result<ClipboardSettings, String> {
         let state = self
@@ -210,7 +220,16 @@ impl SettingsManager {
         }
         let _ = self.record_capture(Err("Capture restart is not yet verified".into()));
         let result = async {
-            restart_capture(self.services.as_ref(), desired).await?;
+            self.capture
+                .set_paused(true, desired.max_entry_bytes)
+                .await?;
+            self.services
+                .control("restart", &["ringboard-server.service"])
+                .await?;
+            sleep(Duration::from_millis(200)).await;
+            self.capture
+                .set_paused(desired.capture_paused, desired.max_entry_bytes)
+                .await?;
             self.verify_capture(desired.capture_paused).await
         }
         .await;
@@ -262,7 +281,18 @@ impl SettingsManager {
         let mut updated = self.preferences()?;
         updated.capture_paused = paused;
         updated.private_mode = paused && private;
-        let updated = self.save(updated, persist, CAPTURE_SAVED).await?;
+        let updated = match self.save(updated, persist, CAPTURE_SAVED).await {
+            Ok(updated) => updated,
+            Err(error) => {
+                // Stop locally even if intent cannot be persisted. Never claim
+                // that this pause survives restart or matches saved settings.
+                if paused {
+                    let _ = self.capture.set_paused(true, 0).await;
+                    let _ = self.record_capture(Err(error.clone()));
+                }
+                return Err(error);
+            }
+        };
         // Idempotent control is intentional: a prior failure or external restart
         // must never turn a repeated request into a false success.
         self.apply_capture(&updated).await?;
@@ -295,7 +325,7 @@ impl SettingsManager {
     }
 
     async fn verify_capture(&self, desired: bool) -> Result<(), String> {
-        let actual = self.services.capture_paused().await?;
+        let actual = self.capture.is_paused().await?;
         (actual == desired)
             .then_some(())
             .ok_or_else(|| "Capture service does not match the saved preference".into())
@@ -303,14 +333,9 @@ impl SettingsManager {
 
     async fn apply_capture(&self, updated: &ClipboardSettings) -> Result<(), String> {
         let _ = self.record_capture(Err("Capture transition is not yet verified".into()));
-        let action = if updated.capture_paused {
-            "stop"
-        } else {
-            "start"
-        };
         let result = async {
-            self.services
-                .control(action, &["ringboard-wayland.service"])
+            self.capture
+                .set_paused(updated.capture_paused, updated.max_entry_bytes)
                 .await?;
             self.verify_capture(updated.capture_paused).await
         }
@@ -353,24 +378,6 @@ fn limits_match(limits: &crate::ringboard::ipc::EngineLimits, desired: &Clipboar
                     .max_entry_bytes
                     .min(crate::backend::MAX_WAYLAND_SELECTION_BYTES),
             )
-}
-
-async fn restart_capture(
-    services: &dyn ServiceControl,
-    settings: &ClipboardSettings,
-) -> Result<(), String> {
-    services
-        .control("restart", &["ringboard-server.service"])
-        .await?;
-    sleep(Duration::from_millis(200)).await;
-    let capture_action = if settings.capture_paused {
-        "stop"
-    } else {
-        "restart"
-    };
-    services
-        .control(capture_action, &["ringboard-wayland.service"])
-        .await
 }
 
 fn encoded_ringboard_config(value: &ClipboardSettings) -> Result<(PathBuf, Vec<u8>), String> {
@@ -565,6 +572,9 @@ mod tests {
             path,
             transaction: Default::default(),
             services: std::sync::Arc::new(super::Systemd),
+            capture: std::sync::Arc::new(super::SystemdCapture(std::sync::Arc::new(
+                super::Systemd,
+            ))),
         }
     }
 
@@ -606,6 +616,7 @@ mod tests {
         let services = Arc::new(MockServices::default());
         let mut manager = manager(None);
         manager.services = services.clone();
+        manager.capture = Arc::new(super::SystemdCapture(services.clone()));
         services.fail.store(true, SeqCst);
         assert!(manager.set_paused(true, true).await.is_err());
         assert!(!manager.get().unwrap().private_mode);
@@ -623,6 +634,22 @@ mod tests {
         assert!(manager.get().unwrap().private_mode);
         manager.set_paused(false, false).await.unwrap();
         assert!(manager.capture_allowed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_persistence_stops_capture_without_claiming_durable_privacy() {
+        use std::sync::{Arc, atomic::Ordering::SeqCst};
+        let directory = tempdir().unwrap();
+        // A directory cannot be replaced by the atomic settings file.
+        let mut manager = manager(Some(directory.path().to_owned()));
+        let services = Arc::new(MockServices::default());
+        manager.capture = Arc::new(super::SystemdCapture(services.clone()));
+        assert!(manager.set_paused(true, true).await.is_err());
+        assert!(services.paused.load(SeqCst));
+        let state = manager.capture_state().unwrap();
+        assert!(!state.verified);
+        assert!(!state.private_mode);
+        assert!(!state.desired_paused);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tokio::process::Command;
@@ -16,6 +16,26 @@ pub(super) trait ServiceControl: Send + Sync {
 }
 
 pub(super) struct Systemd;
+
+/// Transitional adapter: settings no longer own watcher lifecycle mechanics.
+/// Replaced by the in-process controller at the packaging cutover.
+pub(super) struct SystemdCapture(pub Arc<dyn ServiceControl>);
+
+#[async_trait]
+impl crate::capture::CaptureControl for SystemdCapture {
+    async fn set_paused(&self, paused: bool, _: u64) -> Result<(), String> {
+        self.0
+            .control(
+                if paused { "stop" } else { "start" },
+                &["ringboard-wayland.service"],
+            )
+            .await
+    }
+
+    async fn is_paused(&self) -> Result<bool, String> {
+        self.0.capture_paused().await
+    }
+}
 
 async fn output(arguments: &[&str]) -> Result<std::process::Output, String> {
     let mut command = Command::new("systemctl");

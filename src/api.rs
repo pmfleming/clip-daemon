@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -42,6 +43,17 @@ impl ApiService {
             actions: ClipboardService::new(backend),
             lifecycle_events,
             operation_owners: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Inject capture ownership without opening Wayland in API/unit-test constructors.
+    pub fn with_capture(
+        backend: actions::Backend,
+        capture: Arc<dyn crate::capture::CaptureControl>,
+    ) -> Self {
+        Self {
+            settings: SettingsManager::with_capture(capture),
+            ..Self::new(backend)
         }
     }
 

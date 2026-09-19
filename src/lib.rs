@@ -3,6 +3,7 @@ mod history_search;
 
 pub mod api;
 pub mod backend;
+pub mod capture;
 pub mod classification;
 pub mod client;
 pub mod daemon;
