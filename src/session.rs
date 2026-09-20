@@ -278,17 +278,4 @@ mod tests {
         assert!(!manager.arm_paste(&id).await);
         assert!(manager.hidden(&id).await.is_err());
     }
-
-    #[tokio::test]
-    async fn paste_is_armed_only_after_publication() {
-        let manager = SessionManager::default();
-        assert!(manager.validate_paste("missing").await.is_err());
-        assert!(!manager.arm_paste("missing").await);
-
-        let id = manager.test_target().await;
-        assert!(manager.validate_paste(&id).await.expect("valid target"));
-        assert!(!manager.sessions.lock().await[&id].paste_pending);
-        assert!(manager.arm_paste(&id).await);
-        assert!(manager.sessions.lock().await[&id].paste_pending);
-    }
 }

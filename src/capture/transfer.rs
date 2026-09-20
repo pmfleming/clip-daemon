@@ -81,15 +81,15 @@ impl Transfer {
         })
     }
 
-    /// One bounded chunk per tick keeps control responsive under a hot producer.
-    pub fn receive(&mut self, now: Instant) -> io::Result<Option<bool>> {
+    /// Read one bounded chunk per tick; true means EOF, ready for `finish`.
+    pub fn receive(&mut self, now: Instant) -> io::Result<bool> {
         if now.duration_since(self.progress) >= IDLE || now.duration_since(self.started) >= TOTAL {
             return Err(io::ErrorKind::TimedOut.into());
         }
         let mut bytes = [0; 64 * 1024];
         let remaining = (self.limit + 1 - self.length).min(bytes.len() as u64) as usize;
         match self.source.read(&mut bytes[..remaining]) {
-            Ok(0) => Ok(Some(self.nonblank)),
+            Ok(0) => Ok(true),
             Ok(count) => {
                 self.length += count as u64;
                 if self.length > self.limit {
@@ -100,7 +100,7 @@ impl Transfer {
                     .iter()
                     .any(|byte| !byte.is_ascii_whitespace());
                 self.data.write_all(&bytes[..count])?;
-                Ok(None)
+                Ok(false)
             }
             Err(error)
                 if matches!(
@@ -108,14 +108,14 @@ impl Transfer {
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) =>
             {
-                Ok(None)
+                Ok(false)
             }
             Err(error) => Err(error),
         }
     }
 
-    pub fn finish(mut self, nonblank: bool) -> io::Result<Received> {
-        if !nonblank {
+    pub fn finish(mut self) -> io::Result<Received> {
+        if !self.nonblank {
             return Ok(Received::Blank);
         }
         self.data.rewind()?;
@@ -131,7 +131,7 @@ mod tests {
         fs::File,
         io::{Seek, Write},
         sync::Arc,
-        time::Instant,
+        time::{Duration, Instant},
     };
 
     fn source(bytes: &[u8]) -> File {
@@ -142,37 +142,30 @@ mod tests {
     }
 
     #[test]
-    fn limits_blank_content_and_reservations_are_enforced() {
+    fn transfers_enforce_size_idle_deadline_blank_filtering_and_budget_release() {
         let budget = Arc::new(Budget::default());
-        for (bytes, limit, accepted) in [(b"abcd".as_slice(), 4, true), (b"abcde", 4, false)] {
-            let mut transfer =
-                Transfer::new(source(bytes), limit, budget.reserve(limit + 1).unwrap()).unwrap();
-            let result = transfer.receive(Instant::now());
-            assert_eq!(result.is_ok(), accepted);
-            if accepted {
-                assert_eq!(transfer.receive(Instant::now()).unwrap(), Some(true));
-                assert!(matches!(
-                    transfer.finish(true).unwrap(),
-                    Received::Complete(..)
-                ));
+        for (bytes, delay, nonblank) in [
+            (b"abcd".as_slice(), Duration::ZERO, Some(true)),
+            (b"abcde", Duration::ZERO, None),
+            (b"\0\xff", Duration::ZERO, Some(true)),
+            (b" \n\t", Duration::ZERO, Some(false)),
+            (b"abcd", IDLE, None),
+        ] {
+            let mut transfer = Transfer::new(source(bytes), 4, budget.reserve(5).unwrap()).unwrap();
+            let result = transfer.receive(Instant::now() + delay);
+            assert_eq!(result.is_ok(), nonblank.is_some());
+            if let Some(nonblank) = nonblank {
+                assert!(!result.unwrap());
+                assert!(transfer.receive(Instant::now()).unwrap());
+                assert_eq!(
+                    matches!(transfer.finish().unwrap(), Received::Complete(..)),
+                    nonblank
+                );
             }
         }
-        let mut blank = Transfer::new(source(b" \n\t"), 4, budget.reserve(5).unwrap()).unwrap();
-        assert_eq!(blank.receive(Instant::now()).unwrap(), None);
-        assert_eq!(blank.receive(Instant::now()).unwrap(), Some(false));
-        drop(blank);
         let reserved = budget.reserve(TOTAL_BYTES).unwrap();
         assert!(budget.reserve(1).is_none());
         drop(reserved);
         assert!(budget.reserve(TOTAL_BYTES).is_some());
-    }
-
-    #[test]
-    fn stalled_transfers_expire_and_binary_non_whitespace_is_kept() {
-        let budget = Arc::new(Budget::default());
-        let mut transfer = Transfer::new(source(b"\0\xff"), 8, budget.reserve(9).unwrap()).unwrap();
-        assert_eq!(transfer.receive(Instant::now()).unwrap(), None);
-        assert_eq!(transfer.receive(Instant::now()).unwrap(), Some(true));
-        assert!(transfer.receive(Instant::now() + IDLE).is_err());
     }
 }

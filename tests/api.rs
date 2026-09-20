@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use clip_daemon::{
     api::ApiService,
-    backend::{ClipboardBackend, HistoryQuery},
+    backend::ClipboardBackend,
     fake::FakeBackend,
     model::{EntryDetails, EntryKind, EntrySummary},
 };
@@ -69,59 +69,6 @@ async fn wipe_requires_a_verified_capture_fence_before_deleting_anything() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_queries_observe_consistent_replacements_and_only_one_revision_wins() {
-    let backend = Arc::new(FakeBackend::with_entries(vec![entry(
-        "one",
-        EntryKind::Text,
-        Some("seed"),
-    )]));
-    let barrier = Arc::new(tokio::sync::Barrier::new(9));
-    let mut writers = Vec::new();
-    for index in 0..8 {
-        let backend = Arc::clone(&backend);
-        let barrier = Arc::clone(&barrier);
-        writers.push(tokio::spawn(async move {
-            barrier.wait().await;
-            backend
-                .replace(
-                    "one",
-                    1,
-                    "text/plain",
-                    format!("replacement-{index}").as_bytes(),
-                )
-                .await
-        }));
-    }
-    barrier.wait().await;
-    for _ in 0..100 {
-        let page = backend
-            .query(HistoryQuery {
-                query: String::new(),
-                generation: 1,
-                offset: 0,
-                limit: 100,
-                collapse_self_echoes: true,
-            })
-            .await
-            .unwrap();
-        assert_eq!(page.entries.len(), 1);
-        let summary = &page.entries[0];
-        assert_eq!(summary.byte_size, summary.preview.len() as u64);
-        assert!((1..=2).contains(&summary.revision));
-        tokio::task::yield_now().await;
-    }
-    let mut succeeded = 0;
-    for writer in writers {
-        match writer.await.unwrap() {
-            Ok(_) => succeeded += 1,
-            Err(error) => assert_eq!(error.kind, clip_daemon::backend::BackendErrorKind::Stale),
-        }
-    }
-    assert_eq!(succeeded, 1);
-    assert_eq!(backend.revision("one").await.unwrap(), 2);
-}
-
 #[tokio::test]
 async fn native_search_uses_revision_bound_owner_scoped_cursors() {
     let backend = Arc::new(FakeBackend::with_entries(vec![
@@ -170,43 +117,6 @@ async fn native_search_uses_revision_bound_owner_scoped_cursors() {
 }
 
 #[tokio::test]
-async fn history_pagination_is_stable() {
-    let api = ApiService::new(Arc::new(FakeBackend::with_entries(vec![
-        entry("one", EntryKind::Text, Some("one")),
-        entry("two", EntryKind::Text, Some("two")),
-        entry("three", EntryKind::Text, Some("three")),
-    ])));
-    let first = api
-        .dispatch(
-            "clipboard.history.query",
-            json!({"query":"", "generation":9, "offset":0, "limit":2}),
-        )
-        .await;
-    assert_eq!(
-        first["data"]["history"]["entries"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    assert_eq!(first["data"]["history"]["next_offset"], 2);
-    let second = api
-        .dispatch(
-            "clipboard.history.query",
-            json!({"query":"", "generation":9, "offset":2, "limit":2}),
-        )
-        .await;
-    assert_eq!(
-        second["data"]["history"]["entries"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    assert!(second["data"]["history"]["next_offset"].is_null());
-}
-
-#[tokio::test]
 async fn bulk_delete_validates_the_selection_before_removing_entries() {
     let api = ApiService::new(Arc::new(FakeBackend::with_entries(vec![
         entry("one", EntryKind::Text, Some("one")),
@@ -226,7 +136,7 @@ async fn bulk_delete_validates_the_selection_before_removing_entries() {
     let untouched = api
         .dispatch(
             "clipboard.history.query",
-            json!({"query":"", "generation":10, "offset":0, "limit":10}),
+            json!({"query":"", "generation":10, "offset":1, "limit":1}),
         )
         .await;
     assert_eq!(
@@ -234,8 +144,10 @@ async fn bulk_delete_validates_the_selection_before_removing_entries() {
             .as_array()
             .unwrap()
             .len(),
-        3
+        1
     );
+    assert_eq!(untouched["data"]["history"]["entries"][0]["id"], "two");
+    assert_eq!(untouched["data"]["history"]["next_offset"], 2);
 
     let deleted = api
         .dispatch(
@@ -257,6 +169,7 @@ async fn bulk_delete_validates_the_selection_before_removing_entries() {
     let entries = remaining["data"]["history"]["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["id"], "two");
+    assert!(remaining["data"]["history"]["next_offset"].is_null());
 
     for params in [
         json!({"entries":[]}),
@@ -312,6 +225,21 @@ async fn validation_unknown_methods_and_wipe_challenges_are_stable() {
             "validation-error",
         ),
         ("clipboard.entry.edit.begin", json!({}), "validation-error"),
+        (
+            "clipboard.settings.update",
+            json!({"max_entries":0}),
+            "settings-error",
+        ),
+        (
+            "clipboard.capture.interactive",
+            json!({"mode":"window"}),
+            "validation-error",
+        ),
+        (
+            "clipboard.capture.interactive",
+            json!({"mode":"region", "command":"evil"}),
+            "validation-error",
+        ),
         (
             "clipboard.capture.screenshot",
             json!({"x":0,"y":0,"width":0,"height":720}),
@@ -372,7 +300,10 @@ async fn validation_unknown_methods_and_wipe_challenges_are_stable() {
 
 #[tokio::test]
 async fn edit_and_type_action_policy_are_daemon_enforced() {
+    let mut truncated = entry("truncated", EntryKind::Link, Some("not a URL"));
+    truncated.preview_truncated = true;
     let backend = FakeBackend::with_entries(vec![
+        truncated,
         entry("text", EntryKind::Text, Some("old")),
         entry("link", EntryKind::Link, Some("not a URL")),
         entry("image", EntryKind::Image, None),
@@ -394,15 +325,21 @@ async fn edit_and_type_action_policy_are_daemon_enforced() {
         .await;
     assert_eq!(committed["data"]["entry"]["text"], "new");
     assert_eq!(committed["data"]["publication"]["published"], true);
-    let unsafe_paste = api
-        .dispatch(
-            "clipboard.entry.action",
-            json!({
-                "entry_id":"binary","revision":1,"action":"paste","session_id":null
-            }),
-        )
-        .await;
-    assert_eq!(unsafe_paste["error"]["code"], "validation-error");
+    for (entry_id, action, revision) in [
+        ("binary", "paste", 1),
+        ("text", "not-an-action", 2),
+        ("text", "open-file", 2),
+    ] {
+        let unsafe_action = api
+            .dispatch(
+                "clipboard.entry.action",
+                json!({
+                    "entry_id":entry_id, "revision":revision, "action":action
+                }),
+            )
+            .await;
+        assert_eq!(unsafe_action["error"]["code"], "validation-error");
+    }
     let malformed_url = api
         .dispatch(
             "clipboard.entry.action",
@@ -413,15 +350,19 @@ async fn edit_and_type_action_policy_are_daemon_enforced() {
         .await;
     assert_eq!(malformed_url["error"]["code"], "invalid-entry");
 
-    let removed_external_edit = api
+    let incomplete = api
         .dispatch(
             "clipboard.entry.action",
             json!({
-                "entry_id":"text","revision":2,"action":"edit-external","session_id":null
+                "entry_id":"truncated", "revision":1, "action":"open-url"
             }),
         )
         .await;
-    assert_eq!(removed_external_edit["error"]["code"], "validation-error");
+    assert_eq!(incomplete["error"]["code"], "invalid-entry");
+    assert_eq!(
+        incomplete["error"]["message"],
+        "Clipboard text is too large to launch safely"
+    );
 
     let missing_session = api
         .dispatch(

@@ -8,7 +8,7 @@ use super::mutation::{
 };
 use super::{OperationControl, OperationTask, RingboardBackend, run_blocking};
 use crate::{
-    backend::{BackendResult, InteractiveScreenshot, ScreenshotMode},
+    backend::{BackendResult, InteractiveScreenshot, ScreenshotMode, ScreenshotRegion},
     model::OperationResult,
 };
 
@@ -89,20 +89,8 @@ async fn capture(
     max_bytes: u64,
     control: &OperationControl,
 ) -> BackendResult<bool> {
-    let mut command = Command::new("grim");
-    if matches!(request.mode, ScreenshotMode::Region) {
-        let Some(geometry) = select_region("slurp").await? else {
-            return Ok(false);
-        };
-        command.args(["-g", &geometry]);
-    }
-    command.arg(input).kill_on_drop(true).stdin(Stdio::null());
-    let status = tokio::time::timeout(Duration::from_secs(15), command.status())
-        .await
-        .map_err(operation_error)?
-        .map_err(operation_error)?;
-    if !status.success() {
-        return Err(operation_error("Screenshot capture failed"));
+    if !grab(request.mode, input).await? {
+        return Ok(false);
     }
     if request.annotate && !edit_capture(backend, input, output, max_bytes).await? {
         return Ok(false);
@@ -127,6 +115,25 @@ async fn capture(
         Ok(true)
     })
     .await
+}
+
+async fn grab(mode: ScreenshotMode, input: &Path) -> BackendResult<bool> {
+    let mut command = Command::new("grim");
+    if matches!(mode, ScreenshotMode::Region) {
+        let Some(geometry) = select_region("slurp").await? else {
+            return Ok(false);
+        };
+        command.args(["-g", &geometry]);
+    }
+    command.arg(input).kill_on_drop(true).stdin(Stdio::null());
+    let status = tokio::time::timeout(Duration::from_secs(15), command.status())
+        .await
+        .map_err(operation_error)?
+        .map_err(operation_error)?;
+    if !status.success() {
+        return Err(operation_error("Screenshot capture failed"));
+    }
+    Ok(true)
 }
 
 async fn edit_capture(
@@ -187,10 +194,7 @@ fn parse_geometry(value: &str) -> BackendResult<String> {
     let (position, size) = value.trim().split_once(' ').ok_or_else(invalid)?;
     let (x, y) = parse_pair::<i32>(position, ',')?;
     let (width, height) = parse_pair::<u32>(size, 'x')?;
-    if !(1..=16384).contains(&width)
-        || !(1..=16384).contains(&height)
-        || u64::from(width) * u64::from(height) > 32 * 1024 * 1024
-    {
+    if !ScreenshotRegion::valid_dimensions(width, height) {
         return Err(invalid());
     }
     Ok(format!("{x},{y} {width}x{height}"))
@@ -207,30 +211,11 @@ fn parse_pair<T: std::str::FromStr>(value: &str, separator: char) -> BackendResu
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_geometry, select_region};
-    use crate::backend::InteractiveScreenshot;
+    use super::select_region;
     use std::os::unix::fs::PermissionsExt;
 
-    #[test]
-    fn regions_are_bounded_and_canonical() {
-        assert_eq!(
-            parse_geometry("-1920,0 1920x1080\n").unwrap(),
-            "-1920,0 1920x1080"
-        );
-        for value in [
-            "",
-            "0,0 0x1",
-            "0,0 16384x16384",
-            "0,0 1x1; rm -rf /",
-            "2147483648,0 1x1",
-            "0,0 -1x1",
-        ] {
-            assert!(parse_geometry(value).is_err(), "{value}");
-        }
-    }
-
     #[tokio::test]
-    async fn selector_cancellation_never_becomes_full_screen_capture() {
+    async fn selector_accepts_only_bounded_regions_and_preserves_cancellation() {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("selector");
         std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
@@ -241,22 +226,29 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        std::fs::write(&script, "#!/bin/sh\nprintf 'garbage'\n").unwrap();
-        assert!(select_region(script.to_str().unwrap()).await.is_err());
-        std::fs::write(
-            &script,
-            format!("#!/bin/sh\nprintf '{}'\n", "x".repeat(129)),
-        )
-        .unwrap();
-        assert!(select_region(script.to_str().unwrap()).await.is_err());
-    }
-
-    #[test]
-    fn requests_reject_unknown_modes_and_fields() {
-        assert!(
-            serde_json::from_str::<InteractiveScreenshot>(r#"{"mode":"region","command":"evil"}"#)
-                .is_err()
+        for value in [
+            "".into(),
+            "garbage".into(),
+            "0,0 0x1".into(),
+            "0,0 16384x16384".into(),
+            "0,0 1x1; rm -rf /".into(),
+            "2147483648,0 1x1".into(),
+            "0,0 -1x1".into(),
+            "x".repeat(129),
+        ] {
+            std::fs::write(&script, format!("#!/bin/sh\nprintf '%s' '{value}'\n")).unwrap();
+            assert!(
+                select_region(script.to_str().unwrap()).await.is_err(),
+                "{value}"
+            );
+        }
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' '-1920,0 1920x1080'\n").unwrap();
+        assert_eq!(
+            select_region(script.to_str().unwrap())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("-1920,0 1920x1080")
         );
-        assert!(serde_json::from_str::<InteractiveScreenshot>(r#"{"mode":"window"}"#).is_err());
     }
 }

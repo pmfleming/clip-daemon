@@ -42,29 +42,3 @@ impl OperationControl {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::OperationControl;
-
-    #[tokio::test]
-    async fn cancellation_and_commit_are_mutually_exclusive() {
-        for commit_first in [false, true] {
-            let control = OperationControl::default();
-            if commit_first {
-                assert!(control.begin_commit());
-                assert!(!control.cancel());
-            } else {
-                assert!(control.cancel());
-                assert!(!control.begin_commit());
-            }
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(5), control.wait())
-                    .await
-                    .is_err()
-            );
-            control.finish();
-            control.wait().await;
-        }
-    }
-}

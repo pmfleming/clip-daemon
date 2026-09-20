@@ -14,14 +14,14 @@ use uuid::Uuid;
 use crate::{
     backend::{
         BackendError, BackendErrorKind, BackendMutation, ClipboardBackend, EntryTarget,
-        FileSelection, FileSelectionOperation, HistoryQuery, MAX_QUERY_LIMIT, ScreenshotRegion,
+        FileSelection, FileSelectionOperation, HistoryQuery, MAX_FILES, MAX_QUERY_LIMIT,
+        ScreenshotRegion,
     },
     model::{EntryDetails, EntryKind, FilePreview, OperationResult},
     session::SessionManager,
 };
 
 const MAX_EDIT_BYTES: usize = 256 * 1024;
-const MAX_PUBLISHED_FILES: usize = 100;
 const MAX_DELETE_ENTRIES: usize = 5000;
 pub type Backend = Arc<dyn ClipboardBackend>;
 pub(crate) type OperationEvents = tokio::sync::broadcast::Receiver<OperationResult>;
@@ -207,21 +207,17 @@ impl ClipboardService {
 
     pub(crate) async fn capture_screenshot(
         &self,
-        params: ScreenshotParams,
+        region: ScreenshotRegion,
         max_entry_bytes: u64,
     ) -> Result<Value, ApiError> {
-        validate_screenshot_dimensions(params.width, params.height)?;
+        if !ScreenshotRegion::valid_dimensions(region.width, region.height) {
+            return Err(ApiError::validation(
+                "screenshot dimensions exceed the 16384-pixel edge or 32-megapixel limit",
+            ));
+        }
         let operation = self
             .backend
-            .capture_screenshot(
-                ScreenshotRegion {
-                    x: params.x,
-                    y: params.y,
-                    width: params.width,
-                    height: params.height,
-                },
-                max_entry_bytes,
-            )
+            .capture_screenshot(region, max_entry_bytes)
             .await?;
         Ok(json!({ "operation": operation }))
     }
@@ -262,7 +258,7 @@ impl ClipboardService {
             "cut" => FileSelectionOperation::Cut,
             _ => return Err(ApiError::validation("operation must be copy or cut")),
         };
-        if !(1..=MAX_PUBLISHED_FILES).contains(&params.paths.len()) {
+        if !(1..=MAX_FILES).contains(&params.paths.len()) {
             return Err(ApiError::validation(
                 "paths must contain between 1 and 100 files",
             ));
@@ -488,14 +484,6 @@ pub(crate) struct PublishFilesParams {
 }
 
 #[derive(Deserialize)]
-pub(crate) struct ScreenshotParams {
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-}
-
-#[derive(Deserialize)]
 struct EditCommitParams {
     edit_id: String,
     value: String,
@@ -691,28 +679,13 @@ fn invalid(message: &'static str) -> BackendError {
     BackendError::new(BackendErrorKind::InvalidData, message)
 }
 
-const MAX_SCREENSHOT_EDGE: u32 = 16_384;
-const MAX_SCREENSHOT_PIXELS: u64 = 32 * 1024 * 1024;
-
-fn validate_screenshot_dimensions(width: u32, height: u32) -> Result<(), ApiError> {
-    let dimensions_valid =
-        (1..=MAX_SCREENSHOT_EDGE).contains(&width) && (1..=MAX_SCREENSHOT_EDGE).contains(&height);
-    let pixels = u64::from(width).saturating_mul(u64::from(height));
-    if !dimensions_valid || pixels > MAX_SCREENSHOT_PIXELS {
-        return Err(ApiError::validation(
-            "screenshot dimensions exceed the 16384-pixel edge or 32-megapixel limit",
-        ));
-    }
-    Ok(())
-}
-
 const fn default_query_limit() -> usize {
     100
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ClipboardService, complete_text};
+    use super::ClipboardService;
     use crate::{
         backend::ClipboardBackend,
         fake::FakeBackend,
@@ -826,14 +799,5 @@ mod tests {
                 .as_deref(),
             Some("concurrent value")
         );
-    }
-
-    #[test]
-    fn launch_text_must_be_complete() {
-        assert_eq!(
-            complete_text(&text_details(false)).expect("complete text"),
-            "https://example.test"
-        );
-        assert!(complete_text(&text_details(true)).is_err());
     }
 }

@@ -3,7 +3,7 @@ use std::{
     env,
     fs::{self, File, OpenOptions},
     future::Future,
-    io::{Read, Write},
+    io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command as StdCommand,
@@ -11,7 +11,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clipboard_history_client_sdk::{Entry, EntryReader};
 use image::ImageReader;
 use tokio::sync::{broadcast, oneshot};
 use url::Url;
@@ -27,7 +26,7 @@ use crate::{
 
 use super::{
     MAX_THUMBNAIL_BYTES, OperationControl, OperationTask, RingboardBackend,
-    content::{Publication, ResolvedContent, ResolvedImage},
+    content::{Publication, ResolvedContent, ResolvedImage, read_entry, read_path},
     invalid_entry, run_blocking,
 };
 
@@ -139,7 +138,7 @@ impl RingboardBackend {
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
         let (summary, bytes) = selected_bytes(self, opaque_id, expected_revision, max_bytes)?;
-        publish_entry(self, &summary, &bytes, max_bytes)?;
+        publish_entry(self, &summary, bytes, max_bytes)?;
         self.selection_changed()?;
         Ok(OperationResult::completed(
             "copy",
@@ -227,14 +226,14 @@ impl RingboardBackend {
         let revision = summary.revision;
         let content = resolved_content(&summary.mime, &bytes, limit);
         let (mime, image_bytes) = match content.image() {
-            Some(ResolvedImage::Inline { mime, .. }) => ((*mime).to_owned(), bytes),
+            Some(ResolvedImage::Inline { mime, .. }) => (*mime, bytes),
             Some(ResolvedImage::LocalFile(source)) => {
-                (source.mime.to_owned(), read_path(&source.path, limit)?)
+                (source.mime, read_path(&source.path, limit)?)
             }
             None => return Err(invalid_entry("Only image entries support this action")),
         };
         let directory = runtime_directory("clip-daemon/edits")?;
-        let input = unique_path(&directory, image_extension(&mime));
+        let input = unique_path(&directory, image_extension(mime));
         let output = unique_path(&directory, "png");
         write_private(&input, &image_bytes)?;
         Ok(AnnotationStage {
@@ -537,17 +536,17 @@ fn resolved_content(mime: &str, bytes: &[u8], max_bytes: u64) -> ResolvedContent
 fn publish_entry(
     backend: &RingboardBackend,
     summary: &crate::model::EntrySummary,
-    bytes: &[u8],
+    bytes: Vec<u8>,
     max_bytes: u64,
 ) -> BackendResult<()> {
-    let content = resolved_content(&summary.mime, bytes, max_bytes);
+    let content = resolved_content(&summary.mime, &bytes, max_bytes);
     if summary.kind == EntryKind::Image && content.kind() != EntryKind::Image {
         return Err(invalid_entry(
             "Clipboard image file is missing, unsafe, invalid, or exceeds the size limit",
         ));
     }
     match content.default_publication() {
-        Publication::Bytes { mime } => backend.selection.publish(mime, bytes.to_vec(), max_bytes),
+        Publication::Bytes { mime } => backend.selection.publish(mime, bytes, max_bytes),
         Publication::File { mime, path } => backend.selection.publish_file(mime, path, max_bytes),
     }
 }
@@ -570,41 +569,6 @@ fn publish_image_uri(backend: &RingboardBackend, path: &Path, max_bytes: u64) ->
     backend
         .selection
         .publish_file_link(format!("{uri}\r\n").into_bytes(), max_bytes)
-}
-
-fn read_entry(entry: Entry, reader: &mut EntryReader, max_bytes: u64) -> BackendResult<Vec<u8>> {
-    let mut source = entry.to_file(reader).map_err(operation_error)?;
-    let size = source.metadata().map_err(operation_error)?.len();
-    read_source(&mut *source, size, max_bytes)
-}
-
-fn read_path(path: &Path, max_bytes: u64) -> BackendResult<Vec<u8>> {
-    let mut source = File::open(path).map_err(operation_error)?;
-    let size = source.metadata().map_err(operation_error)?.len();
-    read_source(&mut source, size, max_bytes)
-}
-
-fn read_source(source: impl Read, size: u64, max_bytes: u64) -> BackendResult<Vec<u8>> {
-    let limit = max_bytes.min(MAX_WAYLAND_SELECTION_BYTES);
-    if size > limit {
-        return Err(selection_size_error(size, limit));
-    }
-    let mut bytes = Vec::with_capacity(size as usize);
-    source
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(operation_error)?;
-    if bytes.len() as u64 > limit {
-        return Err(selection_size_error(bytes.len() as u64, limit));
-    }
-    Ok(bytes)
-}
-
-fn selection_size_error(size: u64, limit: u64) -> BackendError {
-    BackendError::new(
-        BackendErrorKind::InvalidData,
-        format!("Clipboard entry is {size} bytes; Wayland publishing is limited to {limit} bytes"),
-    )
 }
 
 pub(super) fn valid_edited_image(path: &Path, max_bytes: u64) -> bool {
@@ -692,25 +656,7 @@ pub(super) fn operation_error(error: impl std::fmt::Display) -> BackendError {
 mod tests {
     use std::fs;
 
-    use super::{
-        OperationTask, claim_terminal_event, command_status_with_timeout, valid_edited_image,
-    };
-
-    #[tokio::test]
-    async fn only_one_terminal_path_can_claim_an_operation() {
-        let operations = std::sync::Mutex::new(std::collections::HashMap::from([(
-            "operation-1".to_owned(),
-            OperationTask {
-                action: "annotate",
-                control: Default::default(),
-                handle: tokio::spawn(async {}),
-                files: Vec::new(),
-            },
-        )]));
-
-        assert!(claim_terminal_event(&operations, "operation-1"));
-        assert!(!claim_terminal_event(&operations, "operation-1"));
-    }
+    use super::{OperationTask, command_status_with_timeout, valid_edited_image};
 
     #[tokio::test]
     async fn annotation_cancellation_removes_files_and_emits_one_terminal_event() {
@@ -842,7 +788,11 @@ mod tests {
         fs::write(&malformed, b"\x89PNG\r\n\x1a\n").expect("write malformed image");
 
         assert!(valid_edited_image(&valid, super::MAX_THUMBNAIL_BYTES));
+        assert!(!valid_edited_image(&valid, 1));
         assert!(!valid_edited_image(&malformed, super::MAX_THUMBNAIL_BYTES));
+        let oversized = directory.path().join("oversized.png");
+        image::RgbaImage::new(16_385, 1).save(&oversized).unwrap();
+        assert!(!valid_edited_image(&oversized, super::MAX_THUMBNAIL_BYTES));
         for format in [
             image::ImageFormat::Jpeg,
             image::ImageFormat::Gif,

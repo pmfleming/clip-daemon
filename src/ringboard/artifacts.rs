@@ -401,39 +401,6 @@ mod tests {
     }
 
     #[test]
-    fn all_uri_references_are_retained_beyond_preview_and_file_limits() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut registry = ArtifactRegistry::load(Some(directory.path().into()), None);
-        let paths: Vec<_> = (0..3)
-            .map(|_| {
-                directory
-                    .path()
-                    .join(format!("clipboard-{}.png", uuid::Uuid::new_v4()))
-            })
-            .collect();
-        for path in &paths {
-            std::fs::write(path, b"image").unwrap();
-            registry
-                .register(path, "source", "image/png", b"image")
-                .unwrap();
-            registry.records.get_mut(path).unwrap().created_at = 0;
-        }
-        registry.clear_active_selection();
-        let mut payload = "# ignored comment\n".repeat(5000);
-        for path in &paths[..2] {
-            payload.push_str(url::Url::from_file_path(path).unwrap().as_str());
-            payload.push_str("\r\n");
-        }
-        let referenced = registry.references_in(payload.as_bytes()).unwrap();
-        assert_eq!(referenced.len(), 2);
-        assert_eq!(registry.reconcile(&referenced).unwrap(), 1);
-        assert!(paths[0].exists() && paths[1].exists());
-        assert!(!paths[2].exists());
-        let uninspectable = vec![b'x'; 40_000];
-        assert_eq!(registry.references_in(&uninspectable[..]).unwrap().len(), 2);
-    }
-
-    #[test]
     fn cleanup_removes_only_registered_unreferenced_files() {
         let directory = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
@@ -457,8 +424,11 @@ mod tests {
         registry.activate_if_generated(&generated);
         assert_eq!(registry.reconcile(&empty).unwrap(), 0); // active selection
         registry.clear_active_selection();
-        let referenced = std::collections::HashSet::from([generated.clone()]);
+        let uri = url::Url::from_file_path(&generated).unwrap();
+        let referenced = registry.references_in(uri.as_str().as_bytes()).unwrap();
         assert_eq!(registry.reconcile(&referenced).unwrap(), 0);
+        let ambiguous = registry.references_in(&vec![b'x'; 40_000][..]).unwrap();
+        assert_eq!(registry.reconcile(&ambiguous).unwrap(), 0); // uninspectable history cannot authorize deletion
         assert_eq!(registry.reconcile(&empty).unwrap(), 1);
         assert!(registry.records.is_empty());
 

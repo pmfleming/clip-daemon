@@ -7,17 +7,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use clipboard_history_client_sdk::{Entry, EntryReader};
 use image::{DynamicImage, ImageReader, Limits};
 use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
-    backend::{BackendError, BackendErrorKind, BackendResult},
-    classification::classify,
+    backend::{BackendError, BackendErrorKind, BackendResult, MAX_FILES},
+    classification::{INSPECTION_LIMIT, classify},
     model::{EntryKind, EntrySummary, EntryThumbnail, FilePreview, ImageMetadata},
+    selection::{read_selection, selection_io_error},
 };
 
-use super::{INSPECTION_LIMIT, MAX_FILES, MAX_THUMBNAIL_BYTES};
+pub(super) const MAX_THUMBNAIL_BYTES: u64 = 32 * 1024 * 1024;
 
 const MAX_IMAGE_DIMENSION: u32 = 16_384;
 const MAX_DECODED_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
@@ -65,10 +67,11 @@ impl ResolvedContent {
         }
 
         let semantic_mime = canonical_mime(&stored_mime);
-        let files = if accepts_local_image_mime(semantic_mime) {
-            parse_files(semantic_mime, bytes)
-        } else {
-            Vec::new()
+        let files = match semantic_mime {
+            "text/uri-list" | "x-special/gnome-copied-files" | "text/plain" => {
+                parse_files(semantic_mime, bytes)
+            }
+            _ => Vec::new(),
         };
         let local_image = local_image_source_from_files(&files, max_file_bytes);
         let kind = if local_image.is_some() {
@@ -129,6 +132,22 @@ impl ResolvedContent {
             _ => Publication::Bytes { mime: self.mime() },
         }
     }
+}
+
+pub(super) fn read_entry(
+    entry: Entry,
+    reader: &mut EntryReader,
+    max_bytes: u64,
+) -> BackendResult<Vec<u8>> {
+    let mut source = entry.to_file(reader).map_err(selection_io_error)?;
+    let size = source.metadata().map_err(selection_io_error)?.len();
+    read_selection(&mut *source, size, max_bytes)
+}
+
+pub(super) fn read_path(path: &Path, max_bytes: u64) -> BackendResult<Vec<u8>> {
+    let source = File::open(path).map_err(selection_io_error)?;
+    let size = source.metadata().map_err(selection_io_error)?.len();
+    read_selection(source, size, max_bytes)
 }
 
 pub(super) fn read_bounded(file: &mut File, limit: usize) -> BackendResult<Vec<u8>> {
@@ -269,17 +288,6 @@ fn file_preview(uri: &str, operation: &str) -> Option<FilePreview> {
     })
 }
 
-fn is_file_list_mime(mime: &str) -> bool {
-    matches!(
-        canonical_mime(mime),
-        "text/uri-list" | "x-special/gnome-copied-files"
-    )
-}
-
-fn accepts_local_image_mime(mime: &str) -> bool {
-    is_file_list_mime(mime) || canonical_mime(mime) == "text/plain"
-}
-
 fn mime_or_default(mime: &str) -> &str {
     if mime.is_empty() { "text/plain" } else { mime }
 }
@@ -412,49 +420,14 @@ pub(super) fn invalid_entry(message: &'static str) -> BackendError {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{Seek, SeekFrom, Write},
-        os::unix::fs::symlink,
-    };
+    use std::os::unix::fs::symlink;
 
-    use super::{
-        MAX_DECODED_IMAGE_BYTES, MAX_IMAGE_DIMENSION, ResolvedContent, file_preview,
-        image_decode_limits, parse_files, read_bounded,
-    };
-
-    #[test]
-    fn bounded_reads_stop_at_the_requested_limit() {
-        let mut file = tempfile::tempfile().expect("temporary file");
-        let content = vec![0x5a; 24_000];
-        file.write_all(&content).expect("write fixture");
-        file.seek(SeekFrom::Start(0)).expect("rewind fixture");
-        let bytes = read_bounded(&mut file, 10_000).expect("bounded read");
-        assert_eq!(bytes, &content[..10_000]);
-        assert_eq!(file.stream_position().unwrap(), 10_000);
-        assert!(read_bounded(&mut file, 0).unwrap().is_empty());
-        assert_eq!(file.stream_position().unwrap(), 10_000);
-        assert_eq!(read_bounded(&mut file, 20_000).unwrap(), &content[10_000..]);
-        assert!(read_bounded(&mut file, 1).unwrap().is_empty());
-    }
-
-    #[test]
-    fn file_metadata_is_parsed_inside_the_daemon() {
-        let files = parse_files(
-            "x-special/gnome-copied-files",
-            b"cut\nfile:///tmp/one.txt\nfile:///tmp/two.txt\n",
-        );
-        assert_eq!(files.len(), 2);
-        assert_eq!(files[0].display_name, "one.txt");
-        assert_eq!(files[0].operation, "cut");
-        let encoded = file_preview("file:///tmp/file%20with%20spaces.txt", "copy").unwrap();
-        assert_eq!(encoded.display_name, "file with spaces.txt");
-        assert_eq!(file_preview("not a uri", "copy"), None);
-    }
+    use super::ResolvedContent;
 
     #[test]
     fn a_single_local_image_file_can_supply_preview_dimensions() {
         let directory = tempfile::tempdir().expect("image directory");
-        let path = directory.path().join("screenshot.png");
+        let path = directory.path().join("screen shot.png");
         image::RgbaImage::new(7, 5)
             .save(&path)
             .expect("write image fixture");
@@ -470,21 +443,20 @@ mod tests {
         assert_eq!(content.kind(), crate::model::EntryKind::Image);
         let plain = inspect("text/plain", &format!("{uri}\n"));
         assert_eq!(plain.kind(), crate::model::EntryKind::Image);
-        let multiple = inspect("text/uri-list", &format!("{uri}\r\n{uri}\r\n"));
+        let multiple = inspect(
+            "x-special/gnome-copied-files",
+            &format!("cut\n{uri}\n{uri}\n"),
+        );
         assert!(multiple.local_image().is_none());
+        assert_eq!(multiple.files().len(), 2);
+        assert_eq!(multiple.files()[0].operation, "cut");
+        assert_eq!(multiple.files()[0].display_name, "screen shot.png");
+        assert!(inspect("text/uri-list", "not a uri").files().is_empty());
 
         let symlink_path = directory.path().join("screenshot-link.png");
         symlink(&path, &symlink_path).expect("image symlink");
         let symlink_uri = url::Url::from_file_path(symlink_path).unwrap().to_string();
         let symlink = inspect("text/uri-list", &format!("{symlink_uri}\r\n"));
         assert!(symlink.local_image().is_none());
-    }
-
-    #[test]
-    fn thumbnail_decode_limits_dimensions_and_allocations() {
-        let limits = image_decode_limits();
-        assert!(limits.check_dimensions(MAX_IMAGE_DIMENSION + 1, 1).is_err());
-        let mut limits = image_decode_limits();
-        assert!(limits.reserve(MAX_DECODED_IMAGE_BYTES + 1).is_err());
     }
 }

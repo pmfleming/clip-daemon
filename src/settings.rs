@@ -596,14 +596,18 @@ fn restore_previous(path: &Path, bytes: Option<&[u8]>) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        sync::{Arc, atomic::Ordering::SeqCst},
+    };
 
     use tempfile::tempdir;
 
-    use super::{ClipboardSettings, SettingsManager, SettingsState, SettingsUpdate, load_settings};
+    use super::{ClipboardSettings, SettingsManager, SettingsState, load_settings};
 
-    fn manager(path: Option<std::path::PathBuf>) -> SettingsManager {
-        SettingsManager {
+    fn manager(path: Option<std::path::PathBuf>) -> (SettingsManager, Arc<MockServices>) {
+        let services = Arc::new(MockServices::default());
+        let manager = SettingsManager {
             state: std::sync::Mutex::new(SettingsState {
                 value: ClipboardSettings::default(),
                 load_error: None,
@@ -612,18 +616,10 @@ mod tests {
             }),
             path,
             transaction: Default::default(),
-            services: std::sync::Arc::new(super::Systemd),
-            capture: std::sync::Arc::new(crate::capture::Unavailable),
-        }
-    }
-
-    #[tokio::test]
-    async fn invalid_limits_are_rejected() {
-        let update = SettingsUpdate {
-            max_entries: Some(0),
-            ..Default::default()
+            services: services.clone(),
+            capture: services.clone(),
         };
-        assert!(manager(None).update(update).await.is_err());
+        (manager, services)
     }
 
     #[derive(Default)]
@@ -636,7 +632,6 @@ mod tests {
     #[async_trait::async_trait]
     impl super::ServiceControl for MockServices {
         async fn control(&self, action: &str, _: &[&str]) -> Result<(), String> {
-            use std::sync::atomic::Ordering::SeqCst;
             self.attempts.fetch_add(1, SeqCst);
             if self.fail.load(SeqCst) {
                 return Err("injected failure".into());
@@ -660,17 +655,13 @@ mod tests {
             super::ServiceControl::control(self, if paused { "stop" } else { "start" }, &[]).await
         }
         async fn is_paused(&self) -> Result<bool, String> {
-            Ok(self.paused.load(std::sync::atomic::Ordering::SeqCst))
+            Ok(self.paused.load(SeqCst))
         }
     }
 
     #[tokio::test]
     async fn failed_pause_retries_and_never_asserts_unverified_privacy() {
-        use std::sync::{Arc, atomic::Ordering::SeqCst};
-        let services = Arc::new(MockServices::default());
-        let mut manager = manager(None);
-        manager.services = services.clone();
-        manager.capture = services.clone();
+        let (manager, services) = manager(None);
         services.fail.store(true, SeqCst);
         assert!(manager.set_paused(true, true).await.is_err());
         assert!(!manager.get().unwrap().private_mode);
@@ -692,11 +683,7 @@ mod tests {
 
     #[tokio::test]
     async fn abandoned_quiesce_stays_closed_and_serializes_policy_changes() {
-        use std::sync::{Arc, atomic::Ordering::SeqCst};
-        let services = Arc::new(MockServices::default());
-        let mut manager = manager(None);
-        manager.services = services.clone();
-        manager.capture = services.clone();
+        let (manager, services) = manager(None);
         let guard = manager.quiesce().await.unwrap();
         assert!(services.paused.load(SeqCst));
         assert!(!manager.capture_state().unwrap().verified);
@@ -717,12 +704,9 @@ mod tests {
 
     #[tokio::test]
     async fn failed_persistence_stops_capture_without_claiming_durable_privacy() {
-        use std::sync::{Arc, atomic::Ordering::SeqCst};
         let directory = tempdir().unwrap();
         // A directory cannot be replaced by the atomic settings file.
-        let mut manager = manager(Some(directory.path().to_owned()));
-        let services = Arc::new(MockServices::default());
-        manager.capture = services.clone();
+        let (manager, services) = manager(Some(directory.path().to_owned()));
         assert!(manager.set_paused(true, true).await.is_err());
         assert!(services.paused.load(SeqCst));
         let state = manager.capture_state().unwrap();

@@ -9,6 +9,7 @@ use crate::model::{
 
 pub const MAX_QUERY_LIMIT: usize = 200;
 pub const MAX_QUERY_BYTES: usize = 4096;
+pub const MAX_FILES: usize = 100;
 pub const MAX_WAYLAND_SELECTION_BYTES: u64 = 64 * 1024 * 1024;
 
 pub use crate::model::HistoryQuery;
@@ -21,12 +22,20 @@ pub struct EntryTarget {
     pub expected_revision: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 pub struct ScreenshotRegion {
     pub x: i32,
     pub y: i32,
     pub width: u32,
     pub height: u32,
+}
+
+impl ScreenshotRegion {
+    pub(crate) fn valid_dimensions(width: u32, height: u32) -> bool {
+        (1..=16_384).contains(&width)
+            && (1..=16_384).contains(&height)
+            && u64::from(width) * u64::from(height) <= 32 * 1024 * 1024
+    }
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]

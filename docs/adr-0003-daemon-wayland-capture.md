@@ -21,8 +21,9 @@ reported as unavailable while history/API access remains available.
 - Capture all supported seats, with one bounded set of offers/transfers shared
   across seats. Seat removal invalidates its offers. Never synchronize primary.
 - Reuse the Apache-2.0 SDK's `BestMimeTypeFinder` for representation priority and
-  plain-text alias behavior, rather than copying its source. Tests in
-  `tests/capture_contract.rs` pin that dependency behavior.
+  plain-text alias behavior, rather than copying its source. The daemon-policy
+  tests in `src/capture/policy.rs` exercise `test_support/capture-mime-contract.json`
+  through the actual collector policy (including whole-offer rejection).
 - Inspect all advertised MIME types before requesting data. A password-manager
   marker rejects the whole offer regardless of ordering. Invalid metadata and
   metadata overflow reject the whole offer; truncation must not hide a marker.

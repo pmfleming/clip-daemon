@@ -78,6 +78,19 @@ struct Seat {
     proxy: wl_seat::WlSeat,
     device: Option<Device>,
 }
+impl Seat {
+    fn attach(&mut self, manager: &Option<Manager>, name: u32, qh: &QueueHandle<State>) {
+        self.device = match manager {
+            Some(Manager::Ext(manager)) => {
+                Some(Device::Ext(manager.get_data_device(&self.proxy, qh, name)))
+            }
+            Some(Manager::Wlr(manager)) => {
+                Some(Device::Wlr(manager.get_data_device(&self.proxy, qh, name)))
+            }
+            None => None,
+        };
+    }
+}
 impl Drop for Seat {
     fn drop(&mut self) {
         if self.proxy.version() >= 5 {
@@ -105,7 +118,7 @@ enum Barrier {
 
 struct State {
     session: Arc<Session>,
-    registry: Option<wl_registry::WlRegistry>,
+    registry: wl_registry::WlRegistry,
     ext: Option<u32>,
     wlr: Option<u32>,
     manager: Option<Manager>,
@@ -118,21 +131,6 @@ struct State {
 }
 
 impl State {
-    fn attach(&mut self, name: u32, qh: &QueueHandle<Self>) {
-        let Some(seat) = self.seats.get_mut(&name) else {
-            return;
-        };
-        seat.device = match &self.manager {
-            Some(Manager::Ext(manager)) => {
-                Some(Device::Ext(manager.get_data_device(&seat.proxy, qh, name)))
-            }
-            Some(Manager::Wlr(manager)) => {
-                Some(Device::Wlr(manager.get_data_device(&seat.proxy, qh, name)))
-            }
-            None => None,
-        };
-    }
-
     fn remove_seat(&mut self, name: u32) {
         self.offers.retain(|_, pending| pending.seat != name);
         self.transfers
@@ -204,34 +202,51 @@ impl State {
                 continue;
             }
             match receiving.transfer.receive(Instant::now()) {
-                Ok(None) => self.transfers.push(receiving),
-                Ok(Some(nonblank)) => match receiving.transfer.finish(nonblank) {
-                    Ok(Received::Blank) => self.start(receiving.pending),
-                    Ok(Received::Complete(file, reservation)) => {
-                        let job = Job {
-                            file,
-                            mime: receiving.mime,
-                            generation: receiving.generation,
-                            _reservation: reservation,
-                        };
-                        // Full means drop, not wait: pause/shutdown always stays responsive.
-                        if self.session.jobs.try_send(job).is_err() {
-                            tracing::debug!(
-                                reason = "ingest-backpressure",
-                                "capture transfer dropped"
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        tracing::warn!(reason = "transfer-finish", "capture transfer dropped")
-                    }
-                },
+                Ok(false) => self.transfers.push(receiving),
+                Ok(true) => self.finish(receiving),
                 Err(_) => tracing::debug!(
                     reason = "transfer-limit-timeout-or-io",
                     "capture transfer dropped"
                 ),
             }
         }
+    }
+
+    fn finish(&mut self, receiving: Receiving) {
+        match receiving.transfer.finish() {
+            Ok(Received::Blank) => self.start(receiving.pending),
+            Ok(Received::Complete(file, reservation)) => {
+                let job = Job {
+                    file,
+                    mime: receiving.mime,
+                    generation: receiving.generation,
+                    _reservation: reservation,
+                };
+                // Full means drop, not wait: pause/shutdown always stays responsive.
+                if self.session.jobs.try_send(job).is_err() {
+                    tracing::debug!(reason = "ingest-backpressure", "capture transfer dropped");
+                }
+            }
+            Err(_) => tracing::warn!(reason = "transfer-finish", "capture transfer dropped"),
+        }
+    }
+
+    fn initialize(&mut self, connection: &Connection, qh: &QueueHandle<Self>) {
+        self.manager = self
+            .ext
+            .map(|name| Manager::Ext(self.registry.bind(name, 1, qh, ())))
+            .or_else(|| {
+                self.wlr
+                    .map(|name| Manager::Wlr(self.registry.bind(name, 2, qh, ())))
+            });
+        if self.manager.is_none() || self.seats.is_empty() {
+            self.error = Some("Wayland capture requires data-control and a seat");
+            return;
+        }
+        for (&name, seat) in &mut self.seats {
+            seat.attach(&self.manager, name, qh);
+        }
+        connection.display().sync(qh, Barrier::Ready);
     }
 }
 
@@ -242,7 +257,7 @@ pub(super) fn run(session: Arc<Session>, skip_initial: bool) -> Result<(), Strin
     let qh = queue.handle();
     let mut state = State {
         session,
-        registry: Some(connection.display().get_registry(&qh, ())),
+        registry: connection.display().get_registry(&qh, ()),
         ext: None,
         wlr: None,
         manager: None,
@@ -314,14 +329,12 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 "zwlr_data_control_manager_v1" if version >= 2 => state.wlr = Some(name),
                 "wl_seat" if state.seats.len() < MAX_SEATS => {
                     let proxy = registry.bind(name, version.min(7), qh, ());
-                    state.seats.insert(
-                        name,
-                        Seat {
-                            proxy,
-                            device: None,
-                        },
-                    );
-                    state.attach(name, qh);
+                    let mut seat = Seat {
+                        proxy,
+                        device: None,
+                    };
+                    seat.attach(&state.manager, name, qh);
+                    state.seats.insert(name, seat);
                 }
                 _ => {}
             },
@@ -349,26 +362,7 @@ impl Dispatch<wl_callback::WlCallback, Barrier> for State {
         qh: &QueueHandle<Self>,
     ) {
         match barrier {
-            Barrier::Registry => {
-                let Some(registry) = state.registry.as_ref() else {
-                    return;
-                };
-                state.manager = if let Some(name) = state.ext {
-                    Some(Manager::Ext(registry.bind(name, 1, qh, ())))
-                } else {
-                    state
-                        .wlr
-                        .map(|name| Manager::Wlr(registry.bind(name, 2, qh, ())))
-                };
-                if state.manager.is_none() || state.seats.is_empty() {
-                    state.error = Some("Wayland capture requires data-control and a seat");
-                    return;
-                }
-                for name in state.seats.keys().copied().collect::<Vec<_>>() {
-                    state.attach(name, qh);
-                }
-                connection.display().sync(qh, Barrier::Ready);
-            }
+            Barrier::Registry => state.initialize(connection, qh),
             Barrier::Ready => {
                 // A seat/device may disappear between the two sync barriers.
                 if state.error.is_some() || state.seats.is_empty() {

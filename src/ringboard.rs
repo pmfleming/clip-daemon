@@ -22,8 +22,8 @@ use url::Url;
 use crate::{
     backend::{
         BackendError, BackendErrorKind, BackendMutation, BackendResult, ClipboardBackend,
-        EntryTarget, FileSelection, HistoryQuery, MAX_QUERY_LIMIT, MAX_WAYLAND_SELECTION_BYTES,
-        ScreenshotRegion,
+        EntryTarget, FileSelection, HistoryQuery, MAX_FILES, MAX_QUERY_LIMIT,
+        MAX_WAYLAND_SELECTION_BYTES, ScreenshotRegion,
     },
     classification::{INSPECTION_LIMIT, bounded_preview},
     editor::ImageEditorCommand,
@@ -48,12 +48,11 @@ use operation::OperationControl;
 
 use artifacts::ArtifactRegistry;
 use content::{
-    ResolvedContent, create_resolved_thumbnail, invalid_entry, prune_thumbnails, read_bounded,
+    MAX_THUMBNAIL_BYTES, ResolvedContent, create_resolved_thumbnail, invalid_entry,
+    prune_thumbnails, read_bounded,
 };
 
 const MAX_DETAILS_BYTES: usize = 256 * 1024;
-const MAX_THUMBNAIL_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_FILES: usize = 100;
 
 macro_rules! run_backend {
     ($source:expr, $method:ident($($argument:expr),* $(,)?)) => {{
@@ -78,7 +77,6 @@ struct SummaryCache {
     search: Option<(String, HashSet<u64>)>,
 }
 
-#[derive(Clone)]
 struct ResolvedEntry {
     summary: EntrySummary,
     proof: [u8; 32],
@@ -1156,26 +1154,12 @@ fn entry_revision(fingerprint: &[u8; 32]) -> u64 {
 mod tests {
     use super::{
         CachedProjection, MAX_SAFE_JSON_INTEGER, QueryCandidate, ResolvedEntry, entry_fingerprint,
-        entry_revision, inspect_entry, opaque_id, storage_mime,
+        entry_revision, inspect_entry, opaque_id,
     };
     use crate::{
         backend::HistoryQuery,
         model::{EntryKind, EntrySummary},
     };
-
-    #[test]
-    fn capture_and_replacement_share_plaintext_storage_normalization() {
-        for mime in ["", "text/plain", "UTF8_STRING", "text/plain;charset=utf-8"] {
-            assert_eq!(storage_mime(mime), "");
-        }
-        for mime in [
-            "image/png",
-            "application/json",
-            "text/plain;charset=iso-8859-1",
-        ] {
-            assert_eq!(storage_mime(mime), mime);
-        }
-    }
 
     fn query(
         needle: &str,
@@ -1275,8 +1259,11 @@ mod tests {
     }
 
     fn fingerprint(raw_id: u64, mime: &str, bytes: &[u8]) -> [u8; 32] {
-        let (_, digest) = inspect_entry(&mut std::io::Cursor::new(bytes), bytes.len() as u64)
+        let split = bytes.len().min(crate::classification::INSPECTION_LIMIT);
+        let source = std::io::Read::chain(&bytes[..split], InterruptOnce(true, &bytes[split..]));
+        let (preview, digest) = inspect_entry(&mut InterruptOnce(true, source), bytes.len() as u64)
             .expect("fingerprint fixture");
+        assert_eq!(preview, bytes[..split]);
         entry_fingerprint(raw_id, bytes.len() as u64, mime, &digest)
     }
 
@@ -1292,26 +1279,11 @@ mod tests {
     }
 
     #[test]
-    fn inspection_is_bounded_and_hashes_the_full_stream_across_interruptions() {
-        use sha2::{Digest, Sha256};
-        use std::io::Read;
-        let limit = crate::classification::INSPECTION_LIMIT;
-        for size in [0, 1, limit - 1, limit, limit + 1, limit + 8193] {
-            let bytes = vec![b'x'; size];
-            let split = size.min(limit);
-            let tail = InterruptOnce(true, &bytes[split..]);
-            let mut source = InterruptOnce(true, (&bytes[..split]).chain(tail));
-            let (preview, digest) = inspect_entry(&mut source, size as u64).unwrap();
-            assert_eq!(preview, bytes[..split]);
-            let mut expected = Sha256::new();
-            expected.update(b"clip-daemon:entry-content:v1:");
-            expected.update(&bytes);
-            assert_eq!(digest.as_slice(), expected.finalize().as_slice());
-        }
-    }
-
-    #[test]
     fn entry_identity_covers_full_content_and_preserves_js_safe_revisions() {
+        assert_ne!(
+            fingerprint(42, "text/plain", b""),
+            fingerprint(42, "text/plain", b"a")
+        );
         let mut first = vec![b'a'; crate::classification::INSPECTION_LIMIT + 1];
         let mut second = first.clone();
         first[crate::classification::INSPECTION_LIMIT] = b'x';

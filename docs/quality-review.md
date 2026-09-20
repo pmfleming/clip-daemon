@@ -294,3 +294,81 @@ Rust adapter/example are intentionally retired.
 This review does not close the previously recorded combined Shelllist/Satty timing,
 wlr-only, multi-seat or physical login/activation gates. No production service,
 history, remote branch or shared framework checkout was changed.
+
+## Capture/search follow-up review
+
+Baseline: `43f935b`, measured with the local `../rust-quality-lens` checkout
+`d23a6e7`, Rust 1.95, architecture model v4 and complexity model v2. Fresh evidence
+is in `target/analysis-review-baseline/` and `target/analysis/`; the comparison
+is in `target/quality-review-comparison.json`. Configuration, exclusions and
+thresholds are unchanged.
+
+| Signal | Before | After |
+| --- | ---: | ---: |
+| Maximum function hotspot (effort proxy) | 87.08 | 70.95 |
+| Sum of function hotspots | 5816.31 | 5723.77 |
+| Maximum / sum cognitive complexity | 12 / 579 | 11 / 564 |
+| Maximum / sum cyclomatic complexity | 17 / 1742 | 16 / 1742 |
+| Non-test function hotspot sum | 5383.77 | 5271.57 |
+| Non-test cognitive / cyclomatic sums | 522 / 1617 | 503 / 1613 |
+| Average leverage | 67.0000 | 67.0152 |
+| Minimum / average locality | 97 / 99.8864 | 97 / 99.8864 |
+| Clone records / duplicated lines | 7 / 108 | 6 / 96 |
+| Direct `.clone()` sites, source/tests/examples | 113 | 109 |
+| Nonblank source lines measured by RQLens | 9403 | 9387 |
+| Physical Rust lines, source/tests/examples | 10970 | 10960 |
+| Escape hatches / production reliability findings | 0 / 0 | 0 / 0 |
+| Line coverage | 56.17% | 56.41% |
+
+Non-test function sums exclude qualified names containing `::tests::` or
+`::benchmarks::`. Overall sums include test helpers and the new bounded-read
+regression. Aggregate cyclomatic complexity is unchanged, although its peak and
+non-test sum decrease. Leverage improves only marginally; locality is preserved,
+not claimed as improved. The total line reduction is deliberately small rather
+than deleting tests or safety checks to meet a size target.
+
+### Refactoring
+
+- **Search:** separate catalog acquisition/ranking from page construction, group
+  cursor-authentication context, and share revision checks before/after ranking.
+  Keep the exact MAC inputs, expiry, owner and policy binding. Remove the redundant
+  title keyword allocation: the matcher already gives the identical title a
+  strictly higher weight.
+- **Capture:** keep blank/nonblank state inside `Transfer`, separate transfer
+  completion from polling, and attach devices through their owning seat. Remove
+  the temporary seat-ID vector and impossible missing-registry branch; ext-before-
+  wlr selection, sync barriers, resource limits and submission fences remain.
+- **Publication/content:** share metadata and actual-byte bounds checks with
+  selection publication; keep Ringboard/file loading in the content adapter.
+  Restore inline selections by moving their byte buffer rather than making a
+  second full copy. Borrow static annotation MIME strings. Remove redundant MIME
+  classification helpers and the unused private `ResolvedEntry: Clone` impl.
+- **Policy and tests:** deserialize screenshot regions directly and share their
+  dimension checks; separate screenshot acquisition from editing/publication.
+  Share the file-count limit, simplify editor argument substitution and UTF-8
+  truncation, and consolidate privacy-test setup. Add bounded-read cases for exact
+  limits, growth, oversized metadata, zero limits, bounded consumption and I/O
+  errors, plus multibyte preview-boundary cases.
+
+### Validation and remaining work
+
+Strict all-target/all-feature Clippy, RQLens `measure all`, `verify`, and
+`check --fail-on partial --fail-on test-failure --fail-on practice-failure` pass.
+There are **71 passing Rust tests**, one intentionally ignored benchmark and no
+unknown tests. All **12 backend regressions**, **12 isolated capture checks** and
+**15 standard nested-desktop checks** pass, including privacy fences, compositor
+reconnection, hard limits, targeted paste and Satty completion/cancellation.
+
+Remaining hotspots include Wayland event-loop orchestration, streaming UTF-8
+search and screenshot startup. The remaining token clones are low-risk and do not
+justify more macros. Production escape/reliability findings were already zero;
+SDK panic containment and scoped bootstrap configuration remain intentional.
+Contribution/conduct/security-policy/changelog warnings and the unmaintained
+transitive `paste` dependency are unchanged. Disabled optional tools are not passes.
+Shelllist layer-shell, wlr-only, multi-seat and physical-session qualification were
+not run in this pass. These are static and regression results, not runtime speedup
+claims. No production service, user history or shared framework source was changed.
+
+The subsequent [test-suite reduction](test-suite-reduction.md) records the current
+48-test inventory, selection rationale and coverage trade-off. The measurements
+above are the historical baseline before that test-only pass.

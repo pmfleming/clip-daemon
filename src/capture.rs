@@ -188,27 +188,22 @@ mod tests {
     }
 
     #[test]
-    fn sink_panic_closes_admission_without_poisoning_the_fence() {
-        let gate = Admission::default();
-        gate.resume().unwrap();
-        assert!(
-            gate.submit::<()>(gate.admit().unwrap(), || panic!("injected"))
+    fn uncertain_submission_never_becomes_verified_pause_or_retry() {
+        for panics in [false, true] {
+            let gate = Admission::default();
+            gate.resume().unwrap();
+            assert!(
+                gate.submit::<()>(gate.admit().unwrap(), || {
+                    if panics {
+                        panic!("injected sink panic");
+                    }
+                    Err("lost reply".into())
+                })
                 .is_err()
-        );
-        assert!(gate.admit().is_none());
-        assert!(gate.fence().is_err());
-    }
-
-    #[test]
-    fn ambiguous_submission_never_becomes_verified_pause_or_retry() {
-        let gate = Admission::default();
-        gate.resume().unwrap();
-        assert!(
-            gate.submit::<()>(gate.admit().unwrap(), || Err("lost reply".into()))
-                .is_err()
-        );
-        assert!(gate.admit().is_none());
-        assert!(gate.fence().is_err());
-        assert!(gate.resume().is_err());
+            );
+            assert!(gate.admit().is_none());
+            assert!(gate.fence().is_err());
+            assert!(gate.resume().is_err());
+        }
     }
 }

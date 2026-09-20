@@ -1,4 +1,4 @@
-use std::{env, io, path::Path};
+use std::{env, ffi::OsStr, io, path::Path};
 
 use tokio::process::Command;
 
@@ -72,19 +72,15 @@ impl ImageEditorCommand {
         let mut command = Command::new(&self.argv[0]);
         command.kill_on_drop(true);
         command.process_group(0);
-        for argument in &self.argv[1..] {
-            match argument.as_str() {
-                INPUT_PLACEHOLDER => {
-                    command.arg(input);
-                }
-                OUTPUT_PLACEHOLDER => {
-                    command.arg(output);
-                }
-                _ => {
-                    command.arg(argument);
-                }
-            }
-        }
+        command.args(
+            self.argv[1..]
+                .iter()
+                .map(|argument| match argument.as_str() {
+                    INPUT_PLACEHOLDER => input.as_os_str(),
+                    OUTPUT_PLACEHOLDER => output.as_os_str(),
+                    _ => OsStr::new(argument),
+                }),
+        );
         command
     }
 }
@@ -133,23 +129,20 @@ impl Drop for EditorProcessGroup {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::ImageEditorCommand;
 
-    fn arguments(command: &tokio::process::Command) -> Vec<String> {
-        command
-            .as_std()
-            .get_args()
-            .map(|value| value.to_string_lossy().into_owned())
-            .collect()
-    }
-
     #[tokio::test]
-    async fn editor_exit_status_and_output_are_observable() {
+    async fn editor_requires_placeholders_and_passes_paths_literally_to_the_process() {
+        for invalid in [
+            r#"["editor","{input}"]"#,
+            r#"["editor","{output}"]"#,
+            r#""editor --in {input}""#,
+        ] {
+            assert!(ImageEditorCommand::from_json(invalid).is_err(), "{invalid}");
+        }
         let directory = tempfile::tempdir().expect("temporary directory");
-        let input = directory.path().join("input.png");
-        let output = directory.path().join("output.png");
+        let input = directory.path().join("input image; $.png");
+        let output = directory.path().join("output image; $.png");
         std::fs::write(&input, b"input").expect("write input");
         let success = ImageEditorCommand::from_json(
             r#"["sh","-c","cp \"$1\" \"$2\"","editor","{input}","{output}"]"#,
@@ -161,27 +154,5 @@ mod tests {
             ImageEditorCommand::from_json(r#"["sh","-c","exit 9","editor","{input}","{output}"]"#)
                 .expect("failure editor");
         assert!(failure.run(&input, &output).await.is_err());
-    }
-
-    #[test]
-    fn editor_commands_require_placeholders_and_substitute_paths_without_a_shell() {
-        let editor = ImageEditorCommand::from_json(
-            r#"["image-tool","edit","{input}","--return","{output}"]"#,
-        )
-        .unwrap();
-        let arguments =
-            arguments(&editor.command(Path::new("input image.png"), Path::new("edited image.png")));
-        assert_eq!(
-            arguments,
-            ["edit", "input image.png", "--return", "edited image.png"]
-        );
-
-        for invalid in [
-            r#"["editor","{input}"]"#,
-            r#"["editor","{output}"]"#,
-            r#""editor --in {input}""#,
-        ] {
-            assert!(ImageEditorCommand::from_json(invalid).is_err(), "{invalid}");
-        }
     }
 }

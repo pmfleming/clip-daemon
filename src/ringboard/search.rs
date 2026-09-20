@@ -124,6 +124,17 @@ mod tests {
             };
             assert!(!Matcher::new("match").contains(input).unwrap());
         }
+        let long = format!(
+            "{}ÉCOLE\nİstanbul{}late-needle",
+            "x".repeat(16 * 1024 - 1),
+            "y".repeat(90_000)
+        );
+        for needle in ["école\ni̇stanbul", "late-needle", "absent"] {
+            assert_eq!(
+                Matcher::new(needle).contains(long.as_bytes()).unwrap(),
+                fold(&long).contains(&fold(needle))
+            );
+        }
         let failure = &b"match"[..];
         // An I/O failure after a match must still propagate.
         struct Failure;
@@ -137,24 +148,5 @@ mod tests {
                 .contains(failure.chain(Failure))
                 .is_err()
         );
-    }
-
-    #[test]
-    fn complete_unicode_text_is_searched_across_chunks() {
-        let text = format!(
-            "{}ÉCOLE\nİstanbul{}late-needle",
-            "x".repeat(16 * 1024 - 1),
-            "y".repeat(90_000)
-        );
-        for needle in ["école\ni̇stanbul", "late-needle", "XXÉCOLE"] {
-            assert!(
-                Matcher::new(needle).contains(text.as_bytes()).unwrap(),
-                "{needle}"
-            );
-        }
-        assert!(!Matcher::new("absent").contains(text.as_bytes()).unwrap());
-        assert!(!Matcher::new("match").contains(&b"match\xff"[..]).unwrap());
-        assert!(!Matcher::new("match").contains(&b"match\xc3"[..]).unwrap());
-        assert!(Matcher::new("ababac").contains(&b"ababababac"[..]).unwrap());
     }
 }

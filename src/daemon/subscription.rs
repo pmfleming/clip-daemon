@@ -387,20 +387,7 @@ async fn emit_requested(
 mod tests {
     use serde_json::json;
 
-    use super::{HistoryState, HistoryUpdate, RequestedStreams};
-    use crate::protocol;
-
-    #[test]
-    fn requested_streams_reject_empty_and_unknown_subscriptions() {
-        assert!(RequestedStreams::parse(&[]).is_none());
-        assert!(RequestedStreams::parse(&["unknown".into()]).is_none());
-        let requested = RequestedStreams::parse(&[
-            protocol::stream::HISTORY.into(),
-            protocol::stream::CURRENT.into(),
-        ])
-        .expect("supported streams");
-        assert!(requested.history && requested.current && requested.watches_clipboard());
-    }
+    use super::{HistoryState, HistoryUpdate};
 
     #[test]
     fn history_state_emits_initial_changes_outages_and_recovery_once() {

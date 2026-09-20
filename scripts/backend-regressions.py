@@ -210,6 +210,11 @@ def privacy_retry(desktop):
 
 
 def subscription_baselines(desktop):
+    invalid = Client(desktop)
+    for request_id, streams in [("empty", []), ("unknown", ["unknown"])]:
+        invalid.send({"op": "subscribe", "id": request_id, "streams": streams})
+        reply = invalid.until(lambda message: message.get("id") == request_id)["response"]
+        assert not reply["ok"] and reply["error"]["code"] == "unsupported-stream", reply
     for index in range(2):
         messages = queue.Queue()
         client = subprocess.Popen([str(BINARY), "client"], stdin=subprocess.PIPE,

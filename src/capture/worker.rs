@@ -307,18 +307,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_engine_never_claims_running_and_pause_joins_workers() {
+    async fn unavailable_capture_can_pause_and_shutdown_but_never_restart_after_shutdown() {
         let controller = Controller::new(Arc::new(Unavailable));
         assert!(controller.is_paused().await.unwrap());
         assert!(controller.set_paused(false, 65536).await.is_err());
         assert!(controller.is_paused().await.is_err());
         controller.set_paused(true, 65536).await.unwrap();
         assert!(controller.is_paused().await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn shutdown_cannot_be_undone_by_a_late_resume() {
-        let controller = Controller::new(Arc::new(Unavailable));
         controller.shutdown().await.unwrap();
         assert!(controller.set_paused(false, 65536).await.is_err());
         assert!(controller.is_paused().await.is_err());

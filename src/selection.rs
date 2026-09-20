@@ -125,7 +125,7 @@ impl SelectionService {
         gnome_payload.extend_from_slice(operation.as_bytes());
         gnome_payload.push(b'\n');
         gnome_payload.extend_from_slice(&uri_list);
-        validate_size(uri_list.len() as u64, configured_limit)?;
+        // This payload includes the entire URI list plus its operation header.
         validate_size(gnome_payload.len() as u64, configured_limit)?;
         self.publisher.publish_files(gnome_payload, uri_list)
     }
@@ -139,15 +139,26 @@ impl SelectionService {
         validate_mime(mime)?;
         let file = File::open(path).map_err(selection_io_error)?;
         let size = file.metadata().map_err(selection_io_error)?.len();
-        validate_size(size, configured_limit)?;
-        let limit = effective_limit(configured_limit);
-        let mut bytes = Vec::with_capacity(size.min(limit) as usize);
-        file.take(limit.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(selection_io_error)?;
-        validate_size(bytes.len() as u64, configured_limit)?;
-        self.publisher.publish(mime, bytes)
+        self.publisher
+            .publish(mime, read_selection(file, size, configured_limit)?)
     }
+}
+
+/// Enforce both the advertised size and the bytes actually read (files may grow).
+pub(crate) fn read_selection(
+    source: impl Read,
+    size: u64,
+    configured_limit: u64,
+) -> BackendResult<Vec<u8>> {
+    validate_size(size, configured_limit)?;
+    let limit = effective_limit(configured_limit);
+    let mut bytes = Vec::with_capacity(size as usize);
+    source
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .map_err(selection_io_error)?;
+    validate_size(bytes.len() as u64, configured_limit)?;
+    Ok(bytes)
 }
 
 pub fn effective_limit(configured_limit: u64) -> u64 {
@@ -204,7 +215,7 @@ fn valid_mime_token(value: &str) -> bool {
         })
 }
 
-fn selection_io_error(error: impl std::fmt::Display) -> BackendError {
+pub(crate) fn selection_io_error(error: impl std::fmt::Display) -> BackendError {
     BackendError::new(BackendErrorKind::OperationFailed, error.to_string())
 }
 
@@ -235,58 +246,12 @@ mod tests {
             Ok(())
         }
 
-        fn publish_file_link(&self, uri: Vec<u8>) -> BackendResult<()> {
-            let text = uri.strip_suffix(b"\r\n").unwrap_or(&uri).to_vec();
-            let mut values = self.values.lock().unwrap();
-            values.push(("text/uri-list".into(), uri));
-            values.push(("text/plain".into(), text));
-            Ok(())
-        }
-
         fn publish_files(&self, gnome_payload: Vec<u8>, uri_list: Vec<u8>) -> BackendResult<()> {
             let mut values = self.values.lock().unwrap();
             values.push(("x-special/gnome-copied-files".into(), gnome_payload));
             values.push(("text/uri-list".into(), uri_list));
             Ok(())
         }
-    }
-
-    #[test]
-    fn exact_mime_and_bytes_reach_the_publisher() {
-        let publisher = Arc::new(RecordingPublisher::default());
-        let service = SelectionService::with_publisher(publisher.clone());
-        service.publish("image/png", vec![1, 2, 3], 1024).unwrap();
-        service
-            .publish_file_link(b"file:///tmp/image.png\r\n".to_vec(), 1024)
-            .unwrap();
-        service
-            .publish_files(
-                "cut",
-                b"file:///tmp/one.txt\r\nfile:///tmp/two.txt\r\n".to_vec(),
-                1024,
-            )
-            .unwrap();
-        let values = publisher.values.lock().unwrap();
-        let mimes = values
-            .iter()
-            .map(|value| value.0.as_str())
-            .collect::<Vec<_>>()
-            .join(",");
-        assert_eq!(
-            mimes,
-            "image/png,text/uri-list,text/plain,x-special/gnome-copied-files,text/uri-list"
-        );
-        assert_eq!(values[0].1, vec![1, 2, 3]);
-        assert_eq!(values[1].1, b"file:///tmp/image.png\r\n");
-        assert_eq!(values[2].1, b"file:///tmp/image.png");
-        assert_eq!(
-            values[3].1,
-            b"cut\nfile:///tmp/one.txt\r\nfile:///tmp/two.txt\r\n"
-        );
-        assert_eq!(
-            values[4].1,
-            b"file:///tmp/one.txt\r\nfile:///tmp/two.txt\r\n"
-        );
     }
 
     #[test]
@@ -306,8 +271,37 @@ mod tests {
     }
 
     #[test]
+    fn bounded_reads_check_metadata_growth_and_io_failures() {
+        use super::read_selection;
+        use std::io;
+        for (bytes, advertised, limit, accepted) in [
+            (b"abcd".as_slice(), 4, 4, true),
+            (b"abcde", 4, 4, false), // grew after metadata
+            (b"a", 5, 4, false),     // reject oversized metadata before reading
+            (b"", 0, 0, true),
+            (b"a", 0, 0, false),
+        ] {
+            let result = read_selection(bytes, advertised, limit);
+            assert_eq!(result.is_ok(), accepted);
+            if let Ok(actual) = result {
+                assert_eq!(actual, bytes);
+            }
+        }
+        let mut source = io::Cursor::new(b"abcdef");
+        assert!(read_selection(&mut source, 0, 4).is_err());
+        assert_eq!(source.position(), 5); // Never drain an unbounded producer.
+        let directory = tempfile::tempdir().unwrap();
+        let unreadable = std::fs::File::open(directory.path()).unwrap();
+        assert_eq!(
+            read_selection(unreadable, 0, 4).unwrap_err().kind,
+            crate::backend::BackendErrorKind::OperationFailed
+        );
+    }
+
+    #[test]
     fn mime_and_size_policy_rejects_unsafe_offers() {
-        let service = SelectionService::with_publisher(Arc::new(RecordingPublisher::default()));
+        let publisher = Arc::new(RecordingPublisher::default());
+        let service = SelectionService::with_publisher(publisher.clone());
         for (mime, bytes) in [
             ("not-a-mime", vec![]),
             ("text/plain\nimage/png", vec![]),
@@ -315,6 +309,19 @@ mod tests {
         ] {
             assert!(service.publish(mime, bytes, 1024).is_err());
         }
+        let uri = b"file:///tmp/file\r\n";
+        let size = (uri.len() + b"cut\n".len()) as u64;
+        assert!(
+            service
+                .publish_files("cut", uri.to_vec(), size - 1)
+                .is_err()
+        );
+        assert!(publisher.values.lock().unwrap().is_empty());
+        service.publish_files("cut", uri.to_vec(), size).unwrap();
+        assert_eq!(
+            publisher.values.lock().unwrap()[0].1,
+            [b"cut\n".as_slice(), uri].concat()
+        );
         assert_eq!(effective_limit(u64::MAX), MAX_WAYLAND_SELECTION_BYTES);
     }
 }

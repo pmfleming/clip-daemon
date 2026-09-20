@@ -67,14 +67,7 @@ fn semantic_text_kind(bytes: &[u8]) -> EntryKind {
 }
 
 fn truncate_utf8(mut value: String, limit: usize) -> String {
-    if value.len() <= limit {
-        return value;
-    }
-    let boundary = (0..=limit)
-        .rev()
-        .find(|index| value.is_char_boundary(*index))
-        .unwrap_or_default();
-    value.truncate(boundary);
+    value.truncate(value.floor_char_boundary(limit));
     value
 }
 
@@ -132,5 +125,9 @@ mod tests {
             assert_eq!(bounded_preview(input.as_bytes(), 1024), expected);
         }
         assert!(bounded_preview(&vec![b'a'; 1024], 1024).len() <= 256);
+        for width in ["é", "€", "😀"] {
+            let text = format!("{}{}suffix", "a".repeat(255), width);
+            assert_eq!(bounded_preview(text.as_bytes(), 1024), "a".repeat(255));
+        }
     }
 }
