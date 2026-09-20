@@ -28,7 +28,7 @@ use wayland_protocols_wlr::data_control::v1::client::{
 use super::{
     Generation,
     policy::{MAX_OFFERS, MAX_SEATS, OfferedMimes},
-    transfer::{Budget, MAX_TRANSFERS, Received, Transfer},
+    transfer::{MAX_TRANSFERS, Received, Transfer},
     worker::{Job, Session},
 };
 
@@ -112,7 +112,6 @@ struct State {
     seats: HashMap<u32, Seat>,
     offers: HashMap<u32, Pending>,
     transfers: Vec<Receiving>,
-    budget: Arc<Budget>,
     ready: bool,
     skip_initial: bool,
     error: Option<&'static str>,
@@ -169,7 +168,7 @@ impl State {
         if self.transfers.len() >= MAX_TRANSFERS {
             return;
         }
-        let Some(generation) = self.session.gate.admit() else {
+        let Some(generation) = self.session.control.gate.admit() else {
             return;
         };
         let Some(mime) = pending.mimes.next() else {
@@ -177,7 +176,7 @@ impl State {
             return;
         };
         let limit = self.session.limit;
-        let Some(reservation) = self.budget.reserve(limit + 1) else {
+        let Some(reservation) = self.session.budget.reserve(limit + 1) else {
             return;
         };
         let result = (|| {
@@ -201,7 +200,7 @@ impl State {
     fn receive(&mut self) {
         // Move out only the small bounded transfer list; blank fallback may append.
         for mut receiving in std::mem::take(&mut self.transfers) {
-            if !self.session.gate.accepts(receiving.generation) {
+            if !self.session.control.gate.accepts(receiving.generation) {
                 continue;
             }
             match receiving.transfer.receive(Instant::now()) {
@@ -242,7 +241,7 @@ pub(super) fn run(session: Arc<Session>, skip_initial: bool) -> Result<(), Strin
     let mut queue = connection.new_event_queue();
     let qh = queue.handle();
     let mut state = State {
-        session: session.clone(),
+        session,
         registry: Some(connection.display().get_registry(&qh, ())),
         ext: None,
         wlr: None,
@@ -250,14 +249,13 @@ pub(super) fn run(session: Arc<Session>, skip_initial: bool) -> Result<(), Strin
         seats: HashMap::new(),
         offers: HashMap::new(),
         transfers: Vec::new(),
-        budget: session.budget.clone(),
         ready: false,
         skip_initial,
         error: None,
     };
     connection.display().sync(&qh, Barrier::Registry);
     let started = Instant::now();
-    while !session.stopped() {
+    while !state.session.stopped() {
         queue
             .dispatch_pending(&mut state)
             .map_err(|_| "Wayland event dispatch failed")?;
@@ -272,24 +270,29 @@ pub(super) fn run(session: Arc<Session>, skip_initial: bool) -> Result<(), Strin
         let Some(guard) = queue.prepare_read() else {
             continue;
         };
-        let mut fds = vec![PollFd::new(&connection, PollFlags::IN)];
-        for receiving in &state.transfers {
-            fds.push(PollFd::new(&receiving.transfer, PollFlags::IN));
-        }
-        let timeout = Timespec {
-            tv_sec: 0,
-            tv_nsec: 25_000_000,
-        };
-        match poll(&mut fds, Some(&timeout)) {
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(_) => return Err("Wayland capture poll failed".into()),
-            Ok(_) => {}
-        }
-        if !fds[0].revents().is_empty() {
+        if wait_readable(&connection, &state.transfers)? {
             guard.read().map_err(|_| "Wayland capture disconnected")?;
         }
     }
     Ok(())
+}
+
+fn wait_readable(connection: &Connection, transfers: &[Receiving]) -> Result<bool, String> {
+    let mut fds = vec![PollFd::new(connection, PollFlags::IN)];
+    fds.extend(
+        transfers
+            .iter()
+            .map(|receiving| PollFd::new(&receiving.transfer, PollFlags::IN)),
+    );
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 25_000_000,
+    };
+    match poll(&mut fds, Some(&timeout)) {
+        Ok(_) => Ok(!fds[0].revents().is_empty()),
+        Err(rustix::io::Errno::INTR) => Ok(false),
+        Err(_) => Err("Wayland capture poll failed".into()),
+    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
@@ -373,7 +376,7 @@ impl Dispatch<wl_callback::WlCallback, Barrier> for State {
                     return;
                 }
                 state.ready = true;
-                state.session.running();
+                state.session.report(Ok(()));
             }
         }
     }

@@ -3,7 +3,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, SyncSender},
+        mpsc::{self, Receiver, SyncSender},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -30,46 +30,96 @@ pub(super) struct Job {
     pub _reservation: Reservation,
 }
 
+pub(super) struct Control {
+    pub gate: Admission,
+    stop: AtomicBool,
+    status: Mutex<Result<bool, String>>,
+}
+
 pub(super) struct Session {
-    pub gate: Arc<Admission>,
+    pub control: Arc<Control>,
     pub jobs: SyncSender<Job>,
     pub budget: Arc<Budget>,
     pub limit: u64,
-    stop: Arc<AtomicBool>,
-    status: Arc<Mutex<Result<bool, String>>>,
     ready: Mutex<Option<oneshot::Sender<Result<(), String>>>>,
 }
 
 impl Session {
     pub fn stopped(&self) -> bool {
-        self.stop.load(Ordering::SeqCst) || self.gate.admit().is_none()
+        self.control.stop.load(Ordering::SeqCst) || self.control.gate.admit().is_none()
     }
 
-    pub fn running(&self) {
-        self.set_status(Ok(false));
-        self.ack(Ok(()));
-    }
-
-    fn set_status(&self, value: Result<bool, String>) {
-        if let Ok(mut status) = self.status.lock() {
-            *status = value;
+    pub fn report(&self, result: Result<(), String>) {
+        if let Ok(mut status) = self.control.status.lock() {
+            *status = result.clone().map(|()| false);
         }
-    }
-
-    fn ack(&self, result: Result<(), String>) {
         if let Ok(mut ready) = self.ready.lock()
             && let Some(ready) = ready.take()
         {
             let _ = ready.send(result);
         }
     }
+
+    fn run(
+        self: Arc<Self>,
+        sink: Arc<dyn CaptureSink>,
+        incoming: Receiver<Job>,
+        skip_initial: bool,
+    ) {
+        let control = self.control.clone();
+        let ingest = sink.clone();
+        let sink_thread = std::thread::Builder::new()
+            .name("clip-ingest".into())
+            .spawn(move || {
+                while let Ok(job) = incoming.recv() {
+                    if control
+                        .gate
+                        .submit(job.generation, || ingest.ingest(&job.mime, &job.file))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        let Ok(sink_thread) = sink_thread else {
+            self.report(Err("Could not start capture ingest worker".into()));
+            return;
+        };
+        self.reconnect(sink.as_ref(), skip_initial);
+        // Control has no sender: dropping the session disconnects and drains the
+        // queue even while Worker retains control for the final submission fence.
+        drop(self);
+        let _ = sink_thread.join();
+    }
+
+    fn reconnect(self: &Arc<Self>, sink: &dyn CaptureSink, mut skip_initial: bool) {
+        let mut backoff = Duration::from_millis(250);
+        while !self.control.stop.load(Ordering::SeqCst) {
+            let result = sink
+                .ready(self.limit)
+                .and_then(|()| self.control.gate.resume())
+                .and_then(|()| super::wayland::run(self.clone(), skip_initial));
+            self.control.gate.close();
+            if let Err(error) = self.control.gate.fence() {
+                self.report(Err(error));
+                break;
+            }
+            if result.is_err() {
+                self.report(result);
+            }
+            skip_initial = true;
+            let deadline = Instant::now() + backoff;
+            while !self.control.stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            backoff = (backoff * 2).min(Duration::from_secs(10));
+        }
+    }
 }
 
 struct Worker {
     thread: JoinHandle<()>,
-    gate: Arc<Admission>,
-    stop: Arc<AtomicBool>,
-    status: Arc<Mutex<Result<bool, String>>>,
+    control: Arc<Control>,
     limit: u64,
 }
 
@@ -81,13 +131,13 @@ impl Worker {
     ) -> Result<(Self, oneshot::Receiver<Result<(), String>>), String> {
         let (jobs, incoming) = mpsc::sync_channel::<Job>(1);
         let (ready, acknowledged) = oneshot::channel();
-        let gate = Arc::new(Admission::default());
-        let stop = Arc::new(AtomicBool::new(false));
-        let status = Arc::new(Mutex::new(Err("Capture is starting".into())));
+        let control = Arc::new(Control {
+            gate: Admission::default(),
+            stop: AtomicBool::new(false),
+            status: Mutex::new(Err("Capture is starting".into())),
+        });
         let session = Arc::new(Session {
-            gate: gate.clone(),
-            stop: stop.clone(),
-            status: status.clone(),
+            control: control.clone(),
             budget: Arc::new(Budget::default()),
             ready: Mutex::new(Some(ready)),
             jobs,
@@ -95,62 +145,12 @@ impl Worker {
         });
         let thread = std::thread::Builder::new()
             .name("clip-capture".into())
-            .spawn(move || {
-                let sink_gate = session.gate.clone();
-                let ingest = sink.clone();
-                let sink_thread = std::thread::Builder::new()
-                    .name("clip-ingest".into())
-                    .spawn(move || {
-                        while let Ok(job) = incoming.recv() {
-                            if sink_gate
-                                .submit(job.generation, || ingest.ingest(&job.mime, &job.file))
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    });
-                let Ok(sink_thread) = sink_thread else {
-                    let error = "Could not start capture ingest worker".to_owned();
-                    session.set_status(Err(error.clone()));
-                    session.ack(Err(error));
-                    return;
-                };
-                let mut skip_initial = skip_initial;
-                let mut backoff = Duration::from_millis(250);
-                while !session.stop.load(Ordering::SeqCst) {
-                    let result = sink
-                        .ready(limit)
-                        .and_then(|()| session.gate.resume())
-                        .and_then(|()| super::wayland::run(session.clone(), skip_initial));
-                    session.gate.close();
-                    if let Err(error) = session.gate.fence() {
-                        session.set_status(Err(error.clone()));
-                        session.ack(Err(error));
-                        break;
-                    }
-                    if let Err(error) = result {
-                        session.set_status(Err(error.clone()));
-                        session.ack(Err(error));
-                    }
-                    skip_initial = true;
-                    let deadline = Instant::now() + backoff;
-                    while !session.stop.load(Ordering::SeqCst) && Instant::now() < deadline {
-                        std::thread::sleep(Duration::from_millis(25));
-                    }
-                    backoff = (backoff * 2).min(Duration::from_secs(10));
-                }
-                // Drop the last sender before joining, draining invalid generations.
-                drop(session);
-                let _ = sink_thread.join();
-            })
+            .spawn(move || session.run(sink, incoming, skip_initial))
             .map_err(|_| "Could not start capture worker")?;
         Ok((
             Self {
                 thread,
-                gate,
-                stop,
-                status,
+                control,
                 limit,
             },
             acknowledged,
@@ -161,24 +161,25 @@ impl Worker {
         if self.thread.is_finished() {
             return Err("Capture worker exited".into());
         }
-        if self.gate.admit().is_none() {
+        if self.control.gate.admit().is_none() {
             return Err("Capture is unavailable or transitioning".into());
         }
-        self.status
+        self.control
+            .status
             .lock()
             .map_err(|_| "Capture state is unavailable")?
             .clone()
     }
 
     fn close(&self) {
-        self.stop.store(true, Ordering::SeqCst);
-        self.gate.close();
+        self.control.stop.store(true, Ordering::SeqCst);
+        self.control.gate.close();
     }
 
     fn finish(self) -> Result<(), String> {
         self.close();
         self.thread.join().map_err(|_| "Capture worker panicked")?;
-        self.gate.fence()
+        self.control.gate.fence()
     }
 }
 
@@ -288,7 +289,12 @@ impl CaptureControl for Controller {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{CaptureControl, CaptureSink, Control, Controller, Worker};
+    use crate::capture::Admission;
+    use std::{
+        fs::File,
+        sync::{Arc, Mutex, atomic::AtomicBool},
+    };
 
     struct Unavailable;
     impl CaptureSink for Unavailable {
@@ -320,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn uncertain_shutdown_is_latched_across_repeated_privacy_requests() {
-        let gate = Arc::new(Admission::default());
+        let gate = Admission::default();
         gate.resume().unwrap();
         let generation = gate.admit().unwrap();
         assert!(
@@ -330,9 +336,11 @@ mod tests {
         let controller = Controller::new(Arc::new(Unavailable));
         controller.runtime.lock().await.worker = Some(Worker {
             thread: std::thread::spawn(|| {}),
-            gate,
-            stop: Arc::new(AtomicBool::new(false)),
-            status: Arc::new(Mutex::new(Ok(false))),
+            control: Arc::new(Control {
+                gate,
+                stop: AtomicBool::new(false),
+                status: Mutex::new(Ok(false)),
+            }),
             limit: 65536,
         });
         for paused in [true, true, false] {

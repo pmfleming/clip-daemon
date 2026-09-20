@@ -11,14 +11,7 @@ pub const MAX_QUERY_LIMIT: usize = 200;
 pub const MAX_QUERY_BYTES: usize = 4096;
 pub const MAX_WAYLAND_SELECTION_BYTES: u64 = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HistoryQuery {
-    pub query: String,
-    pub generation: u64,
-    pub offset: usize,
-    pub limit: usize,
-    pub collapse_self_echoes: bool,
-}
+pub use crate::model::HistoryQuery;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct EntryTarget {

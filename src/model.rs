@@ -25,6 +25,16 @@ pub struct EntrySummary {
     pub preview: String,
 }
 
+/// Shared history request; storage and native search use the same paging policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryQuery {
+    pub query: String,
+    pub generation: u64,
+    pub offset: usize,
+    pub limit: usize,
+    pub collapse_self_echoes: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryPage {
     pub revision: u64,

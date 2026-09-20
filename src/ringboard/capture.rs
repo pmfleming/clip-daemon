@@ -11,17 +11,7 @@ use sha2::Digest;
 use super::{RingboardBackend, ipc, load_entry, stored_mime_type};
 use crate::{backend::BackendResult, capture::CaptureSink};
 
-pub struct RingboardCapture {
-    backend: RingboardBackend,
-}
-
-impl RingboardCapture {
-    pub fn new(backend: RingboardBackend) -> Self {
-        Self { backend }
-    }
-}
-
-impl CaptureSink for RingboardCapture {
+impl CaptureSink for RingboardBackend {
     fn ready(&self, max_bytes: u64) -> Result<(), String> {
         let limits = ipc::capture_ready().map_err(|error| error.to_string())?;
         if limits.max_entry_bytes != Some(max_bytes) {
@@ -32,50 +22,47 @@ impl CaptureSink for RingboardCapture {
 
     fn ingest(&self, mime: &str, file: &File) -> Result<(), String> {
         // Retain the backend's SDK read panic-containment boundary.
-        catch_unwind(AssertUnwindSafe(|| self.ingest_inner(mime, file)))
+        catch_unwind(AssertUnwindSafe(|| ingest_admitted(self, mime, file)))
             .map_err(|_| "Ringboard capture SDK failed; ingestion stopped".to_owned())?
     }
 }
 
-impl RingboardCapture {
-    fn ingest_inner(&self, mime: &str, mut file: &File) -> Result<(), String> {
-        let _transaction = self
-            .backend
-            .transaction
-            .lock()
-            .map_err(|_| "History transaction unavailable")?;
-        let size = file
-            .metadata()
-            .map_err(|_| "Could not inspect captured bytes")?
-            .len();
-        if size > crate::backend::MAX_WAYLAND_SELECTION_BYTES {
-            return Ok(());
-        }
-        file.rewind()
-            .map_err(|_| "Could not rewind captured bytes")?;
-        let mut digest = super::content_hasher();
-        std::io::copy(&mut file.take(size + 1), &mut digest)
-            .map_err(|_| "Could not hash captured bytes")?;
-        let stored_mime = super::storage_mime(mime);
-        let proof = ipc::content_proof(&digest.finalize().into(), stored_mime);
-        let candidate = candidate(file, size, stored_mime).map_err(|error| error.to_string())?;
-        file.rewind()
-            .map_err(|_| "Could not rewind captured bytes")?;
-        if ipc::capture(candidate, &proof, mime, file)
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            self.backend
-                .clear_identity_state()
-                .map_err(|error| error.to_string())?;
-        } else {
-            tracing::debug!(
-                reason = "engine-admission",
-                "capture rejected without persistence"
-            );
-        }
-        Ok(())
+fn ingest_admitted(backend: &RingboardBackend, mime: &str, mut file: &File) -> Result<(), String> {
+    let _transaction = backend
+        .transaction
+        .lock()
+        .map_err(|_| "History transaction unavailable")?;
+    let size = file
+        .metadata()
+        .map_err(|_| "Could not inspect captured bytes")?
+        .len();
+    if size > crate::backend::MAX_WAYLAND_SELECTION_BYTES {
+        return Ok(());
     }
+    file.rewind()
+        .map_err(|_| "Could not rewind captured bytes")?;
+    let mut digest = super::content_hasher();
+    std::io::copy(&mut file.take(size + 1), &mut digest)
+        .map_err(|_| "Could not hash captured bytes")?;
+    let stored_mime = super::storage_mime(mime);
+    let proof = ipc::content_proof(&digest.finalize().into(), stored_mime);
+    let candidate = candidate(file, size, stored_mime).map_err(|error| error.to_string())?;
+    file.rewind()
+        .map_err(|_| "Could not rewind captured bytes")?;
+    if ipc::capture(candidate, &proof, mime, file)
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        backend
+            .clear_identity_state()
+            .map_err(|error| error.to_string())?;
+    } else {
+        tracing::debug!(
+            reason = "engine-admission",
+            "capture rejected without persistence"
+        );
+    }
+    Ok(())
 }
 
 /// A hint, not a mutation proof: v2 revalidates full content and MIME in one
@@ -131,7 +118,7 @@ fn equal_candidate(source: &mut impl Read, file: &File, size: u64, budget: &mut 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::equal_candidate;
     use std::io::{Seek, Write};
 
     #[test]

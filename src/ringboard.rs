@@ -37,7 +37,7 @@ use crate::{
 mod artifacts;
 #[cfg(all(test, feature = "benchmarks"))]
 mod benchmarks;
-pub mod capture;
+mod capture;
 mod content;
 pub(crate) mod ipc;
 mod mutation;
@@ -137,6 +137,30 @@ struct QueryProjection {
 }
 
 impl QueryCandidate {
+    fn matches(
+        &self,
+        needle: &str,
+        matcher: &search::Matcher,
+        database: &DatabaseReader,
+        reader: &mut EntryReader,
+    ) -> BackendResult<bool> {
+        let summary = &self.resolved.summary;
+        if matches_query(summary, needle) {
+            return Ok(true);
+        }
+        if summary.mime.starts_with("image/") || summary.kind == crate::model::EntryKind::Binary {
+            return Ok(false);
+        }
+        let entry = database
+            .get_raw(self.raw_id)
+            .map_err(|_| BackendError::stale("History changed during search"))?;
+        let unreadable = |_| invalid_entry("Could not search clipboard entry");
+        let mut file = entry.to_file(reader).map_err(unreadable)?;
+        matcher
+            .contains(&mut *file)
+            .map_err(|_| invalid_entry("Could not search clipboard entry"))
+    }
+
     fn collapsed_source(&self, collapse_echoes: bool, ids: &HashSet<&str>) -> Option<&str> {
         collapse_echoes
             .then_some(self.resolved.echo_source_id.as_deref())
@@ -673,47 +697,37 @@ fn project_query(
     }
     let projection = cache.projection.as_ref().ok_or_else(lock_error)?;
     let needle = search::fold(query.query.trim());
-    if !needle.is_empty()
+    let filtering = !needle.is_empty();
+    if filtering
         && cache
             .search
             .as_ref()
             .is_none_or(|(previous, _)| previous != &needle)
     {
         let matcher = search::Matcher::new(&needle);
-        let mut matches = HashSet::new();
-        for candidate in &projection.candidates {
-            let summary = &candidate.resolved.summary;
-            if matches_query(summary, &needle) {
-                matches.insert(candidate.raw_id);
-                continue;
-            }
-            if summary.mime.starts_with("image/") || summary.kind == crate::model::EntryKind::Binary
-            {
-                continue;
-            }
-            let entry = database
-                .get_raw(candidate.raw_id)
-                .map_err(|_| BackendError::stale("History changed during search"))?;
-            let mut file = entry
-                .to_file(reader)
-                .map_err(|_| invalid_entry("Could not search clipboard entry"))?;
-            if matcher
-                .contains(&mut *file)
-                .map_err(|_| invalid_entry("Could not search clipboard entry"))?
-            {
-                matches.insert(candidate.raw_id);
-            }
-        }
-        cache.search = Some((needle.clone(), matches));
+        let matches = projection
+            .candidates
+            .iter()
+            .filter_map(|candidate| {
+                // Keep read failures as errors, not silent non-matches.
+                candidate
+                    .matches(&needle, &matcher, database, reader)
+                    .map(|matched| matched.then_some(candidate.raw_id))
+                    .transpose()
+            })
+            .collect::<BackendResult<_>>()?;
+        cache.search = Some((needle, matches));
     }
     if history_token(database)? != token {
         return Err(BackendError::stale(
             "History changed while it was being read; retry the query",
         ));
     }
-    let matches = (!needle.is_empty())
-        .then(|| cache.search.as_ref().map(|(_, matches)| matches))
-        .flatten();
+    let matches = cache
+        .search
+        .as_ref()
+        .filter(|_| filtering)
+        .map(|(_, matches)| matches);
     Ok(projection.project_matches(query, matches))
 }
 

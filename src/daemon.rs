@@ -22,12 +22,6 @@ pub struct ClipDaemon {
     subscriptions: Arc<OwnedTaskRegistry>,
 }
 
-impl ClipDaemon {
-    fn next_id(&self, prefix: &str) -> String {
-        self.subscriptions.next_id(prefix)
-    }
-}
-
 #[zbus::interface(name = "org.laufan.ClipDaemon1")]
 impl ClipDaemon {
     async fn call(
@@ -124,10 +118,9 @@ async fn emit_event(
 }
 
 pub async fn run(backend: crate::ringboard::RingboardBackend) -> Result<()> {
-    let capture = crate::capture::Controller::new(Arc::new(
-        crate::ringboard::capture::RingboardCapture::new(backend.clone()),
-    ));
-    run_with_capture(Arc::new(backend), Arc::new(capture)).await
+    let backend = Arc::new(backend);
+    let capture = crate::capture::Controller::new(backend.clone());
+    run_with_capture(backend, Arc::new(capture)).await
 }
 
 pub async fn run_with_capture(

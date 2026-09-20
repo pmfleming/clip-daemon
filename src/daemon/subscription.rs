@@ -162,7 +162,7 @@ pub(super) async fn start(
         )
         .to_string();
     };
-    let id = daemon.next_id("subscription");
+    let id = daemon.subscriptions.next_id("subscription");
     let destination = emitter.set_destination(owner.clone().into()).to_owned();
     let connection = destination.connection().clone();
     let task = SubscriptionTask {

@@ -47,7 +47,7 @@ impl OfferedMimes {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::OfferedMimes;
 
     #[test]
     fn overflow_never_truncates_away_sensitive_markers() {

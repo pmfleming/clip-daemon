@@ -1,6 +1,6 @@
 //! Capture lifecycle contracts. Publication has an independent lifetime.
 use std::sync::{
-    Mutex,
+    Mutex, MutexGuard,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
@@ -62,20 +62,18 @@ impl Admission {
 
     /// Call off the async executor: this waits for any submitted IPC request.
     pub fn fence(&self) -> Result<(), String> {
-        let _guard = self
-            .submission
-            .lock()
-            .map_err(|_| "Capture sink panicked")?;
-        if self.uncertain.load(Ordering::SeqCst) {
-            return Err(
-                "Capture submission outcome is uncertain; engine recovery is required".into(),
-            );
-        }
-        Ok(())
+        self.verified_submission().map(drop)
     }
 
     pub fn resume(&self) -> Result<(), String> {
-        let _guard = self
+        let _guard = self.verified_submission()?;
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.open.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn verified_submission(&self) -> Result<MutexGuard<'_, ()>, String> {
+        let guard = self
             .submission
             .lock()
             .map_err(|_| "Capture sink panicked")?;
@@ -84,9 +82,7 @@ impl Admission {
                 "Capture submission outcome is uncertain; engine recovery is required".into(),
             );
         }
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        self.open.store(true, Ordering::SeqCst);
-        Ok(())
+        Ok(guard)
     }
 
     pub fn admit(&self) -> Option<Generation> {

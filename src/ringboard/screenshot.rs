@@ -44,28 +44,26 @@ pub(super) fn launch(
             .operations
             .lock()
             .is_ok_and(|mut jobs| jobs.remove(&task_id).is_some());
+        let (status, message) = match result {
+            Ok(true) => ("completed", "Screenshot copied".to_owned()),
+            Ok(false) => ("cancelled", "Screenshot cancelled".to_owned()),
+            Err(error) => ("failed", error.to_string()),
+        };
         if claimed {
-            let (status, message) = match result {
-                Ok(true) => ("completed", "Screenshot copied".to_owned()),
-                Ok(false) => ("cancelled", "Screenshot cancelled".to_owned()),
-                Err(error) => ("failed", error.to_string()),
-            };
             let _ = worker.operation_events.send(OperationResult::with_id(
                 task_id,
                 "screenshot",
                 status,
                 &message,
             ));
-            guard.finish();
-            if status != "cancelled" {
-                let mut notification = Command::new("notify-send");
-                notification
-                    .args(["-a", "clip-daemon", "Screenshot", &message])
-                    .kill_on_drop(true);
-                let _ = tokio::time::timeout(Duration::from_secs(3), notification.status()).await;
-            }
-        } else {
-            guard.finish();
+        }
+        guard.finish();
+        if claimed && status != "cancelled" {
+            let mut notification = Command::new("notify-send");
+            notification
+                .args(["-a", "clip-daemon", "Screenshot", &message])
+                .kill_on_drop(true);
+            let _ = tokio::time::timeout(Duration::from_secs(3), notification.status()).await;
         }
     });
     active.insert(
@@ -106,22 +104,10 @@ async fn capture(
     if !status.success() {
         return Err(operation_error("Screenshot capture failed"));
     }
-    let chosen = if request.annotate {
-        let path = input.to_owned();
-        if !run_blocking(move || Ok(valid_edited_image(&path, max_bytes))).await? {
-            return Err(operation_error("Screenshot is not a valid bounded PNG"));
-        }
-        tokio::time::timeout(Duration::from_secs(1800), backend.editor.run(input, output))
-            .await
-            .map_err(operation_error)?
-            .map_err(operation_error)?;
-        if !output.exists() {
-            return Ok(false);
-        }
-        output.to_owned()
-    } else {
-        input.to_owned()
-    };
+    if request.annotate && !edit_capture(backend, input, output, max_bytes).await? {
+        return Ok(false);
+    }
+    let chosen = if request.annotate { output } else { input }.to_owned();
     if !control.begin_commit() {
         return Ok(false);
     }
@@ -141,6 +127,23 @@ async fn capture(
         Ok(true)
     })
     .await
+}
+
+async fn edit_capture(
+    backend: &RingboardBackend,
+    input: &Path,
+    output: &Path,
+    max_bytes: u64,
+) -> BackendResult<bool> {
+    let path = input.to_owned();
+    if !run_blocking(move || Ok(valid_edited_image(&path, max_bytes))).await? {
+        return Err(operation_error("Screenshot is not a valid bounded PNG"));
+    }
+    tokio::time::timeout(Duration::from_secs(1800), backend.editor.run(input, output))
+        .await
+        .map_err(operation_error)?
+        .map_err(operation_error)?;
+    Ok(output.exists())
 }
 
 async fn select_region(program: &str) -> BackendResult<Option<String>> {
@@ -182,20 +185,10 @@ async fn select_region(program: &str) -> BackendResult<Option<String>> {
 fn parse_geometry(value: &str) -> BackendResult<String> {
     let invalid = || operation_error("Invalid screenshot region");
     let (position, size) = value.trim().split_once(' ').ok_or_else(invalid)?;
-    let (x, y) = position.split_once(',').ok_or_else(invalid)?;
-    let (width, height) = size.split_once('x').ok_or_else(invalid)?;
-    let (x, y) = (
-        x.parse::<i32>().map_err(|_| invalid())?,
-        y.parse::<i32>().map_err(|_| invalid())?,
-    );
-    let (width, height) = (
-        width.parse::<u32>().map_err(|_| invalid())?,
-        height.parse::<u32>().map_err(|_| invalid())?,
-    );
-    if width == 0
-        || height == 0
-        || width > 16384
-        || height > 16384
+    let (x, y) = parse_pair::<i32>(position, ',')?;
+    let (width, height) = parse_pair::<u32>(size, 'x')?;
+    if !(1..=16384).contains(&width)
+        || !(1..=16384).contains(&height)
         || u64::from(width) * u64::from(height) > 32 * 1024 * 1024
     {
         return Err(invalid());
@@ -203,9 +196,19 @@ fn parse_geometry(value: &str) -> BackendResult<String> {
     Ok(format!("{x},{y} {width}x{height}"))
 }
 
+fn parse_pair<T: std::str::FromStr>(value: &str, separator: char) -> BackendResult<(T, T)> {
+    let invalid = || operation_error("Invalid screenshot region");
+    let (a, b) = value.split_once(separator).ok_or_else(invalid)?;
+    Ok((
+        a.parse().map_err(|_| invalid())?,
+        b.parse().map_err(|_| invalid())?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{parse_geometry, select_region};
+    use crate::backend::InteractiveScreenshot;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]

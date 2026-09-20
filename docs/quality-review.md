@@ -201,3 +201,96 @@ cargo clippy --all-targets --locked -- -D warnings
 Formatting, compilation, Clippy, tests, doctests, and rustdoc pass. Escape-hatch and production reliability findings remain zero. Locality was already at the tool's ceiling; it is preserved, not claimed as improved. Artifact pruning's individual hotspot rises from 30.80 to 36.62 in exchange for removing the temporary cloned-path collection; aggregate complexity and effort still fall. Remaining duplication findings are low-risk token windows, not justification for more macros.
 
 Review limitations: these are static/coverage results, not measured runtime speedups or live Wayland/Ringboard acceptance. The SDK panic-containment boundary remains intentional. RQLens still reports missing MSRV, contribution, conduct, security-policy, and changelog declarations; optional audit, unused-dependency, mutation, and other advanced gates were not enabled. The informational architecture threshold remains exceeded by the Ringboard adapter and mutation module; no thresholds or exclusions were relaxed.
+
+## Post-capture-migration review
+
+Baseline: `aaffdbc`, measured with local Rust Quality Lens `d23a6e7`, Rust 1.95,
+architecture model v4 and complexity model v2. Both measurements use the same
+configuration and extractor. Added explicit fingerprints for fixtures, packaging,
+scripts and build recipes **before** taking the baseline. No thresholds, source
+exclusions or waivers were relaxed.
+
+Evidence remains local under `target/analysis-capture-baseline/`,
+`target/analysis/`, and `target/capture-quality-comparison.json`.
+
+| Signal | Before | After |
+| --- | ---: | ---: |
+| Maximum function effort/hotspot score | 130.70 | 87.08 |
+| Sum of function hotspot scores | 5902.66 | 5816.31 |
+| Maximum cognitive complexity | 19 | 12 |
+| Sum of cognitive complexity | 608 | 579 |
+| Maximum cyclomatic complexity | 18 | 17 |
+| Sum of cyclomatic complexity | 1730 | 1742 |
+| Average leverage | 66.8788 | 67.0000 |
+| Average locality | 99.8409 | 99.8864 |
+| Daemon leverage | 60.5 | 63.5 |
+| Backend locality | 97.75 | 99.25 |
+| Clone records / duplicated lines | 10 / 152 | 7 / 108 |
+| Direct `.clone()` call sites, all Rust source/tests/examples | 125 | 113 |
+| Escape-hatch records | 6 | 0 |
+| Production reliability findings | 4 | 0 |
+| Physical Rust lines, including tests/examples | 10973 | 10970 |
+| Nonblank lines measured under `src/` | 9375 | 9403 |
+| Line coverage | 56.03% | 56.17% |
+
+### Changes
+
+- **Search:** separate bounded catalog acquisition from authenticated cursor/ranking
+  orchestration; retain revision checks before and after ranking. Return owned
+  request parameters from the blocking task instead of cloning the query, and
+  reuse ranked item keys when building the result map. Replace four production
+  `expect` paths for HMAC/serialization invariants with explicit API errors.
+- **Projection:** isolate per-candidate metadata/full-text matching, retain read
+  failures as errors, and move rather than clone the cached search needle.
+- **Capture:** group shared gate/stop/status ownership into one `Arc`, separate
+  worker setup from reconnect supervision, and preserve sender-drop-before-join.
+  Share the verified submission guard, drop redundant budget/session references,
+  and separate socket polling from protocol dispatch. No fence or panic-containment
+  boundary was removed.
+- **Backend locality:** implement ingestion directly on the shared backend instead
+  of retaining the one-field `RingboardCapture` adapter. The facade and collector
+  now share one backend `Arc`. Put `HistoryQuery` beside `HistoryPage` in `model`,
+  retaining the public `backend::HistoryQuery` re-export; search/benchmark consumers
+  no longer depend on the storage trait module merely for that request type.
+- **IPC and screenshots:** share exact-length/magic response validation, separate
+  negotiation from request encoding, factor annotation preparation and numeric
+  geometry parsing, and keep cancellation/event ordering intact. Add a packet
+  regression covering valid, short, oversized, wrong-magic and empty replies.
+- **Cleanup:** reuse saved settings by ownership, centralize checked settings
+  locking, remove redundant forwarding helpers and the obsolete pre-cutover
+  capture driver, and replace six wildcard test imports with explicit imports.
+
+### Trade-offs and remaining findings
+
+These are heuristic improvements, not measured runtime speedups. Aggregate
+cyclomatic complexity **increased by 12**: explicit error propagation and helper
+boundaries are counted, although the maximum function complexity fell. Source
+nonblank lines also increased; retiring the unused prototype makes the overall
+Rust line reduction only three lines. This is not a claim of a large size reduction.
+Minimum leverage/locality remain 52.5/97; averages improved modestly near the
+locality ceiling. A separate resource-constants module was tried and rejected
+because it increased coupling. A merged API dispatcher was likewise rejected
+because it raised peak cyclomatic complexity.
+
+All six removed escape findings were wildcard imports in tests, not unsafe Rust.
+The SDK's scoped `RUSTC_BOOTSTRAP` exception and justified panic containment remain.
+Contributing, conduct, security-policy and changelog warnings are unchanged;
+RustSec still reports the known unmaintained transitive `paste` dependency.
+Informational architecture thresholds still flag actions, Ringboard and its
+mutation module. The next substantive targets are native search orchestration,
+Wayland receive/registry handling, and the remaining mutation-module coupling.
+
+### Validation
+
+RQLens `measure all`, `verify`, changed-line `review`, and `check --fail-on partial
+--fail-on test-failure --fail-on practice-failure` passed. Strict all-target,
+all-feature Clippy passed. There are **70 passing Rust tests**, one intentionally
+ignored benchmark, and no unknown results; optional disabled tools are not passes.
+All 12 backend regressions, 12 integrated capture checks and 15 standard nested
+desktop checks passed. The Nix package and installed smoke/rollback checks passed.
+The API contract and privacy semantics remain unchanged; the obsolete prototype
+Rust adapter/example are intentionally retired.
+
+This review does not close the previously recorded combined Shelllist/Satty timing,
+wlr-only, multi-seat or physical login/activation gates. No production service,
+history, remote branch or shared framework checkout was changed.

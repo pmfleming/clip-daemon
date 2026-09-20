@@ -1,6 +1,7 @@
 project_name = "clip-daemon"
 project_root = "."
 source_roots = ["src"]
+fingerprint_inputs = ["test_support", "packaging", "scripts", "flake.nix", "justfile"]
 output_dir = "target/analysis"
 
 [rust]

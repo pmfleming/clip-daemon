@@ -11,8 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     actions::{ApiError, Backend},
-    backend::HistoryQuery,
-    model::EntrySummary,
+    model::{EntrySummary, HistoryQuery},
 };
 
 const MAX_ENTRIES: usize = 5000;
@@ -48,14 +47,13 @@ impl HistorySearch {
         generation: u64,
         owner: Option<&str>,
         collapse: bool,
-    ) -> Hmac<Sha256> {
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(&self.key).expect("HMAC accepts any key length");
+    ) -> Result<Hmac<Sha256>, ApiError> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.key).map_err(search_failed)?;
         mac.update(
             &serde_json::to_vec(&(cursor, query, generation, owner, collapse))
-                .expect("serialize cursor context"),
+                .map_err(search_failed)?,
         );
-        mac
+        Ok(mac)
     }
     fn decode(
         &self,
@@ -69,7 +67,7 @@ impl HistorySearch {
             return Err(stale());
         }
         let (body, tag) = value.rsplit_once('|').ok_or_else(stale)?;
-        self.mac(body, query, generation, owner, collapse)
+        self.mac(body, query, generation, owner, collapse)?
             .verify_slice(&hex::decode(tag).map_err(|_| stale())?)
             .map_err(|_| stale())?;
         let cursor: Cursor = serde_json::from_str(body).map_err(|_| stale())?;
@@ -85,13 +83,13 @@ impl HistorySearch {
         generation: u64,
         owner: Option<&str>,
         collapse: bool,
-    ) -> String {
-        let body = serde_json::to_string(&cursor).expect("serialize cursor");
+    ) -> Result<String, ApiError> {
+        let body = serde_json::to_string(&cursor).map_err(search_failed)?;
         let tag = self
-            .mac(&body, query, generation, owner, collapse)
+            .mac(&body, query, generation, owner, collapse)?
             .finalize()
             .into_bytes();
-        format!("{body}|{}", hex::encode(tag))
+        Ok(format!("{body}|{}", hex::encode(tag)))
     }
     pub(crate) async fn query(
         &self,
@@ -111,78 +109,51 @@ impl HistorySearch {
             .try_acquire_owned()
             .map_err(|_| ApiError::new("busy", "Clipboard search is busy"))?;
         let token = backend.change_token().await?;
-        let cursor = params
-            .cursor
-            .as_deref()
-            .map(|value| self.decode(value, &params.query, params.generation, owner, collapse))
-            .transpose()?;
-        if cursor.as_ref().is_some_and(|cursor| cursor.token != token) {
+        let cursor = match params.cursor.as_deref() {
+            Some(value) => self.decode(value, &params.query, params.generation, owner, collapse)?,
+            None => Cursor {
+                token,
+                offset: 0,
+                expires: self.started.elapsed().as_secs() + CURSOR_SECONDS,
+            },
+        };
+        if cursor.token != token {
             return Err(stale());
         }
-        let offset = cursor.as_ref().map_or(0, |cursor| cursor.offset);
-        let expires = cursor.as_ref().map_or(
-            self.started.elapsed().as_secs() + CURSOR_SECONDS,
-            |cursor| cursor.expires,
-        );
-        let mut entries = Vec::new();
-        let mut current = None;
-        let mut limited = false;
-        loop {
-            let page = backend
-                .query(HistoryQuery {
-                    query: String::new(),
-                    generation: params.generation,
-                    offset: entries.len(),
-                    limit: 200,
-                    collapse_self_echoes: collapse,
-                })
-                .await?;
-            if current.is_none() {
-                current = page.current;
-            }
-            if page.has_more && page.entries.is_empty() {
-                return Err(stale());
-            }
-            entries.extend(page.entries);
-            if !page.has_more {
-                break;
-            }
-            if entries.len() >= MAX_ENTRIES {
-                limited = true;
-                break;
-            }
-        }
+        let (entries, current, limited) = catalog(backend, params.generation, collapse).await?;
         if backend.change_token().await? != token {
             return Err(stale());
         }
-        let query = params.query.clone();
-        let ranked = tokio::task::spawn_blocking(move || {
+        let (ranked, params) = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            rank_entries(entries, &query)
+            Ok::<_, ApiError>((rank_entries(entries, &params.query)?, params))
         })
         .await
-        .map_err(|_| ApiError::new("search-failed", "Clipboard search failed"))?;
+        .map_err(search_failed)??;
         // Never return a stale page after expensive ranking, either.
         if backend.change_token().await? != token {
             return Err(stale());
         }
         let total = ranked.len();
+        let offset = cursor.offset;
         let page: Vec<_> = ranked.into_iter().skip(offset).take(params.limit).collect();
         let consumed = offset + page.len();
         let has_more = consumed < total;
-        let next = has_more.then(|| {
-            self.encode(
-                Cursor {
-                    token,
-                    offset: consumed,
-                    expires,
-                },
-                &params.query,
-                params.generation,
-                owner,
-                collapse,
-            )
-        });
+        let next = has_more
+            .then(|| {
+                self.encode(
+                    Cursor {
+                        token,
+                        offset: consumed,
+                        expires: cursor.expires,
+                    },
+                    &params.query,
+                    params.generation,
+                    owner,
+                    collapse,
+                )
+            })
+            .transpose()?;
         Ok(
             json!({ "history": { "revision": token, "snapshot_revision": token.to_string(), "generation": params.generation,
             "current": current, "entries": page, "has_more": has_more, "next_cursor": next,
@@ -197,14 +168,46 @@ fn stale() -> ApiError {
     )
 }
 
-fn rank_entries(entries: Vec<EntrySummary>, query: &str) -> Vec<EntrySummary> {
+async fn catalog(
+    backend: &Backend,
+    generation: u64,
+    collapse: bool,
+) -> Result<(Vec<EntrySummary>, Option<EntrySummary>, bool), ApiError> {
+    let mut entries = Vec::new();
+    let mut current = None;
+    loop {
+        let page = backend
+            .query(HistoryQuery {
+                query: String::new(),
+                generation,
+                offset: entries.len(),
+                limit: 200,
+                collapse_self_echoes: collapse,
+            })
+            .await?;
+        current = current.or(page.current);
+        if page.has_more && page.entries.is_empty() {
+            return Err(stale());
+        }
+        entries.extend(page.entries);
+        if !page.has_more || entries.len() >= MAX_ENTRIES {
+            return Ok((entries, current, page.has_more));
+        }
+    }
+}
+
+fn search_failed(_: impl std::fmt::Display) -> ApiError {
+    ApiError::new("search-failed", "Clipboard search failed")
+}
+
+fn rank_entries(entries: Vec<EntrySummary>, query: &str) -> Result<Vec<EntrySummary>, ApiError> {
     let count = entries.len();
-    let items: Vec<_> = entries
+    let items = entries
         .iter()
         .enumerate()
         .map(|(index, entry)| {
             let kind = serde_json::to_value(entry.kind)
-                .expect("serialize kind")
+                .map_err(search_failed)?
                 .as_str()
                 .unwrap_or("binary")
                 .to_owned();
@@ -214,43 +217,47 @@ fn rank_entries(entries: Vec<EntrySummary>, query: &str) -> Vec<EntrySummary> {
             } else {
                 entry.preview.clone()
             };
-            shelllist_search::SearchItem {
+            Ok(shelllist_search::SearchItem {
                 key: entry.id.clone(),
                 title: title.clone(),
                 subtitle: format!("{label} · {} · {} bytes", entry.mime, entry.byte_size),
                 keywords: vec![title, entry.mime.clone(), kind],
                 score: (count - index) as i64,
                 provider_priority: 100,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, ApiError>>()?;
     let keys = shelllist_search::rank(String::new(), 0, query, &items).keys;
-    let mut by_id: HashMap<_, _> = entries
+    let mut by_id: HashMap<_, _> = items
         .into_iter()
-        .map(|entry| (entry.id.clone(), entry))
+        .zip(entries)
+        .map(|(item, entry)| (item.key, entry))
         .collect();
-    keys.into_iter()
+    Ok(keys
+        .into_iter()
         .filter_map(|key| by_id.remove(&key))
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Cursor, HistorySearch};
     #[test]
     fn cursors_bind_owner_query_generation_policy_and_process_lifetime() {
         let search = HistorySearch::default();
-        let cursor = search.encode(
-            Cursor {
-                token: 9,
-                offset: 200,
-                expires: 120,
-            },
-            "cafe",
-            7,
-            Some(":1.2"),
-            true,
-        );
+        let cursor = search
+            .encode(
+                Cursor {
+                    token: 9,
+                    offset: 200,
+                    expires: 120,
+                },
+                "cafe",
+                7,
+                Some(":1.2"),
+                true,
+            )
+            .unwrap();
         assert_eq!(
             search
                 .decode(&cursor, "cafe", 7, Some(":1.2"), true)
@@ -275,17 +282,19 @@ mod tests {
                 .decode(&cursor, "cafe", 7, Some(":1.2"), true)
                 .is_err()
         );
-        let expired = search.encode(
-            Cursor {
-                token: 9,
-                offset: 200,
-                expires: 0,
-            },
-            "cafe",
-            7,
-            None,
-            true,
-        );
+        let expired = search
+            .encode(
+                Cursor {
+                    token: 9,
+                    offset: 200,
+                    expires: 0,
+                },
+                "cafe",
+                7,
+                None,
+                true,
+            )
+            .unwrap();
         assert!(search.decode(&expired, "cafe", 7, None, true).is_err());
         assert!(
             search

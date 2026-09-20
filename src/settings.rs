@@ -2,7 +2,7 @@ use std::{
     fs, io,
     num::NonZeroU32,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, MutexGuard},
 };
 
 use clipboard_history_client_sdk::config;
@@ -155,13 +155,7 @@ impl SettingsManager {
 
     /// Legacy booleans never assert privacy unless service state is verified.
     pub fn get(&self) -> Result<ClipboardSettings, String> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| "Clipboard settings are unavailable")?;
-        if let Some(error) = &state.load_error {
-            return Err(error.clone());
-        }
+        let state = self.validated_state()?;
         let mut settings = state.value.clone();
         if !state.capture_verified {
             settings.capture_paused = false;
@@ -171,25 +165,31 @@ impl SettingsManager {
     }
 
     fn preferences(&self) -> Result<ClipboardSettings, String> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| "Clipboard settings are unavailable")?;
-        match &state.load_error {
-            Some(error) => Err(error.clone()),
-            None => Ok(state.value.clone()),
+        Ok(self.validated_state()?.value.clone())
+    }
+
+    fn lock_state(&self, error: &str) -> Result<MutexGuard<'_, SettingsState>, String> {
+        self.state.lock().map_err(|_| error.to_owned())
+    }
+
+    fn validated_state(&self) -> Result<MutexGuard<'_, SettingsState>, String> {
+        let state = self.lock_state("Clipboard settings are unavailable")?;
+        if let Some(error) = &state.load_error {
+            return Err(error.clone());
         }
+        Ok(state)
     }
 
     pub async fn update(&self, update: SettingsUpdate) -> Result<ClipboardSettings, String> {
         let _transaction = self.transaction.lock().await;
         let current = self.preferences()?;
-        let updated = update.apply(&current)?;
+        let mut updated = update.apply(&current)?;
         if retention_changed(&current, &updated) {
             self.quiesce_locked().await?;
         }
         if updated != current {
-            self.save(updated.clone(), persist_config_pair, SETTINGS_SAVED)
+            updated = self
+                .save(updated, persist_config_pair, SETTINGS_SAVED)
                 .await?;
         }
         // Compare effective engine state even on a no-op retry after a failed
@@ -210,8 +210,8 @@ impl SettingsManager {
 
     pub(crate) async fn initialize_retention(&self) -> Result<(), String> {
         let _transaction = self.transaction.lock().await;
-        let desired = self.preferences()?;
-        self.save(desired.clone(), persist_config_pair, SETTINGS_SAVED)
+        let desired = self
+            .save(self.preferences()?, persist_config_pair, SETTINGS_SAVED)
             .await?;
         self.apply_retention(&desired).await
     }
@@ -292,10 +292,7 @@ impl SettingsManager {
     }
 
     fn commit(&self, value: ClipboardSettings) -> Result<ClipboardSettings, String> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "Clipboard settings are unavailable")?;
+        let mut state = self.lock_state("Clipboard settings are unavailable")?;
         if state.value.capture_paused != value.capture_paused
             || state.value.private_mode != value.private_mode
         {
@@ -334,10 +331,7 @@ impl SettingsManager {
     }
 
     pub fn capture_state(&self) -> Result<CaptureState, String> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| "Capture state is unavailable")?;
+        let state = self.lock_state("Capture state is unavailable")?;
         Ok(CaptureState {
             desired_paused: state.value.capture_paused,
             desired_private_mode: state.value.private_mode,
@@ -349,10 +343,7 @@ impl SettingsManager {
     }
 
     fn record_capture(&self, result: Result<(), String>) -> Result<(), String> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "Capture state is unavailable")?;
+        let mut state = self.lock_state("Capture state is unavailable")?;
         state.capture_verified = result.is_ok();
         state.capture_error = result.as_ref().err().cloned();
         result
@@ -408,11 +399,10 @@ fn validated_update<T: Copy + PartialOrd>(
     current: T,
     range: std::ops::RangeInclusive<T>,
 ) -> Result<T, String> {
-    match update {
-        Some(value) if range.contains(&value) => Ok(value),
-        Some(_) => Err("Clipboard setting is outside the supported range".into()),
-        None => Ok(current),
+    if update.is_some_and(|value| !range.contains(&value)) {
+        return Err("Clipboard setting is outside the supported range".into());
     }
+    Ok(update.unwrap_or(current))
 }
 
 fn retention_changed(a: &ClipboardSettings, b: &ClipboardSettings) -> bool {

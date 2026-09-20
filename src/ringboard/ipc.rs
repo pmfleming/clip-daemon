@@ -68,7 +68,7 @@ pub(crate) struct EngineLimits {
 }
 
 pub(crate) fn limits() -> BackendResult<EngineLimits> {
-    read_limits(send_request(7, 0, &[0; 32], "", None)?)
+    read_limits(send_request_version(0xc1, 7, 0, &[0; 32], "", None)?)
 }
 
 pub(super) fn capture_ready() -> BackendResult<EngineLimits> {
@@ -76,13 +76,11 @@ pub(super) fn capture_ready() -> BackendResult<EngineLimits> {
 }
 
 fn read_limits(socket: OwnedFd) -> BackendResult<EngineLimits> {
-    let mut response = [0; 20];
-    let (_, length) = recv(&socket, &mut response, RecvFlags::TRUNC).map_err(ipc_error)?;
-    if length != response.len() || &response[..4] != b"CDS1" {
-        return Err(ipc_error(
-            "Engine does not expose effective retention limits",
-        ));
-    }
+    let response: [u8; 20] = read_response(
+        socket,
+        b"CDS1",
+        "Engine does not expose effective retention limits",
+    )?;
     let max_bytes = u64::from_le_bytes(response[12..20].try_into().map_err(ipc_error)?);
     Ok(EngineLimits {
         max_entries: u32::from_le_bytes(response[4..8].try_into().map_err(ipc_error)?),
@@ -100,13 +98,11 @@ pub(super) fn capture(
     file: &File,
 ) -> BackendResult<Option<u64>> {
     let socket = send_request_version(0xc2, 8, id.unwrap_or(u64::MAX), proof, mime, Some(file))?;
-    let mut response = [0; 13];
-    let (_, length) = recv(&socket, &mut response, RecvFlags::TRUNC).map_err(ipc_error)?;
-    if length != response.len() || &response[..4] != b"CDR1" {
-        return Err(ipc_error(
-            "Capture outcome is unknown; do not retry automatically",
-        ));
-    }
+    let response: [u8; 13] = read_response(
+        socket,
+        b"CDR1",
+        "Capture outcome is unknown; do not retry automatically",
+    )?;
     match response[4] {
         0 => Ok(Some(u64::from_le_bytes(
             response[5..].try_into().map_err(ipc_error)?,
@@ -123,14 +119,12 @@ fn request(
     mime: &str,
     file: Option<&File>,
 ) -> BackendResult<()> {
-    let socket = send_request(op, id, proof, mime, file)?;
-    let mut response = [0; 5];
-    let (_, length) = recv(&socket, &mut response, RecvFlags::TRUNC).map_err(ipc_error)?;
-    if length != response.len() || &response[..4] != b"CDR1" {
-        return Err(ipc_error(
-            "Invalid policy response; refresh history before retrying",
-        ));
-    }
+    let socket = send_request_version(0xc1, op, id, proof, mime, file)?;
+    let response: [u8; 5] = read_response(
+        socket,
+        b"CDR1",
+        "Invalid policy response; refresh history before retrying",
+    )?;
     match response[4] {
         0 => Ok(()),
         1 => Err(BackendError::stale(
@@ -142,14 +136,17 @@ fn request(
     }
 }
 
-fn send_request(
-    op: u8,
-    id: u64,
-    proof: &[u8; 32],
-    mime: &str,
-    file: Option<&File>,
-) -> BackendResult<OwnedFd> {
-    send_request_version(0xc1, op, id, proof, mime, file)
+fn read_response<const N: usize>(
+    socket: OwnedFd,
+    magic: &[u8; 4],
+    error: &str,
+) -> BackendResult<[u8; N]> {
+    let mut response = [0; N];
+    let (_, length) = recv(&socket, &mut response, RecvFlags::TRUNC).map_err(ipc_error)?;
+    if length != N || response.get(..4) != Some(magic.as_slice()) {
+        return Err(ipc_error(error));
+    }
+    Ok(response)
 }
 
 fn send_request_version(
@@ -164,6 +161,30 @@ fn send_request_version(
         .ok()
         .filter(|length| *length <= 96)
         .ok_or_else(|| BackendError::unavailable("Replacement MIME exceeds Ringboard's limit"))?;
+    let socket = connect_policy(version)?;
+    let mut request = Vec::from(&b"CDP1"[..]);
+    request.push(op);
+    request.extend_from_slice(&id.to_le_bytes());
+    request.extend_from_slice(proof);
+    request.push(mime_len);
+    request.extend_from_slice(mime.as_bytes());
+    let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+    let mut ancillary = SendAncillaryBuffer::new(&mut space);
+    let fds: Vec<_> = file.into_iter().map(AsFd::as_fd).collect();
+    if !fds.is_empty() && !ancillary.push(SendAncillaryMessage::ScmRights(&fds)) {
+        return Err(ipc_error("Could not attach policy file"));
+    }
+    sendmsg(
+        &socket,
+        &[IoSlice::new(&request)],
+        &mut ancillary,
+        SendFlags::NOSIGNAL,
+    )
+    .map_err(ipc_error)?;
+    Ok(socket)
+}
+
+fn connect_policy(version: u8) -> BackendResult<OwnedFd> {
     let socket = socket_with(
         AddressFamily::UNIX,
         SocketType::SEQPACKET,
@@ -187,28 +208,33 @@ fn send_request_version(
             "Safe mutations require the clip-daemon Ringboard policy package; no history was changed",
         ));
     }
-    let mut request = Vec::from(&b"CDP1"[..]);
-    request.push(op);
-    request.extend_from_slice(&id.to_le_bytes());
-    request.extend_from_slice(proof);
-    request.push(mime_len);
-    request.extend_from_slice(mime.as_bytes());
-    let mut space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
-    let mut ancillary = SendAncillaryBuffer::new(&mut space);
-    let fds: Vec<_> = file.into_iter().map(AsFd::as_fd).collect();
-    if !fds.is_empty() && !ancillary.push(SendAncillaryMessage::ScmRights(&fds)) {
-        return Err(ipc_error("Could not attach policy file"));
-    }
-    sendmsg(
-        &socket,
-        &[IoSlice::new(&request)],
-        &mut ancillary,
-        SendFlags::NOSIGNAL,
-    )
-    .map_err(ipc_error)?;
     Ok(socket)
 }
 
 fn ipc_error(error: impl std::fmt::Display) -> BackendError {
     BackendError::unavailable(format!("Ringboard policy IPC failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_response;
+    use std::os::unix::net::UnixDatagram;
+
+    #[test]
+    fn policy_frames_require_exact_length_and_magic() {
+        for (wire, valid) in [
+            (b"CDR1\0".as_slice(), true),
+            (b"CDR1", false),
+            (b"CDR1\0\0", false),
+            (b"CDS1\0", false),
+            (b"", false),
+        ] {
+            let (server, client) = UnixDatagram::pair().unwrap();
+            server.send(wire).unwrap();
+            assert_eq!(
+                read_response::<5>(client.into(), b"CDR1", "invalid frame").is_ok(),
+                valid
+            );
+        }
+    }
 }

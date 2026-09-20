@@ -125,7 +125,14 @@ impl Transfer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{Budget, IDLE, Received, TOTAL_BYTES, Transfer};
+    use rustix::fs::{MemfdFlags, memfd_create};
+    use std::{
+        fs::File,
+        io::{Seek, Write},
+        sync::Arc,
+        time::Instant,
+    };
 
     fn source(bytes: &[u8]) -> File {
         let mut file = File::from(memfd_create(c"capture-test", MemfdFlags::CLOEXEC).unwrap());

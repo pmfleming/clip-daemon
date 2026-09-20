@@ -141,7 +141,7 @@ impl RingboardBackend {
         let (summary, bytes) = selected_bytes(self, opaque_id, expected_revision, max_bytes)?;
         publish_entry(self, &summary, &bytes, max_bytes)?;
         self.selection_changed()?;
-        Ok(completed(
+        Ok(OperationResult::completed(
             "copy",
             "Entry published to the Wayland clipboard",
         ))
@@ -292,7 +292,10 @@ impl RingboardBackend {
         let (entry, _, resolved) = self.selected_proven(opaque_id, expected_revision)?;
         super::ipc::remove(entry.id(), &resolved.proof)?;
         self.clear_identity_state()?;
-        Ok(completed("delete", "Clipboard entry deleted"))
+        Ok(OperationResult::completed(
+            "delete",
+            "Clipboard entry deleted",
+        ))
     }
 
     pub(super) fn remove_entries(&self, targets: &[EntryTarget]) -> BackendResult<OperationResult> {
@@ -308,7 +311,7 @@ impl RingboardBackend {
         super::ipc::remove_many(&proven)?;
         self.clear_identity_state()?;
         let count = targets.len();
-        Ok(completed(
+        Ok(OperationResult::completed(
             "delete-many",
             &format!(
                 "{count} clipboard {} deleted",
@@ -332,7 +335,7 @@ impl RingboardBackend {
 
     pub(super) fn cleanup_artifacts(&self) -> BackendResult<OperationResult> {
         let removed = cleanup_backend(self)?;
-        Ok(completed(
+        Ok(OperationResult::completed(
             "cleanup",
             &format!("Clipboard caches cleared; {removed} unreferenced generated files removed"),
         ))
@@ -361,7 +364,10 @@ impl RingboardBackend {
         cleanup_backend(self)?;
         self.artifact_registry()?.clear_all()?;
         self.clear_identity_state()?;
-        Ok(completed("wipe", "Clipboard history cleared"))
+        Ok(OperationResult::completed(
+            "wipe",
+            "Clipboard history cleared",
+        ))
     }
 }
 
@@ -397,7 +403,7 @@ fn capture_and_publish(
     backend
         .selection
         .publish_file("image/png", path, max_bytes.min(MAX_THUMBNAIL_BYTES))?;
-    Ok(completed(
+    Ok(OperationResult::completed(
         "screenshot",
         "Screenshot published to the Wayland clipboard",
     ))
@@ -676,10 +682,6 @@ fn image_extension(mime: &str) -> &'static str {
         "image/svg+xml" => "svg",
         _ => "png",
     }
-}
-
-fn completed(action: &str, message: &str) -> OperationResult {
-    OperationResult::completed(action, message)
 }
 
 pub(super) fn operation_error(error: impl std::fmt::Display) -> BackendError {
