@@ -2,8 +2,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use shelllist_daemon_core::DaemonEndpoint;
 use shelllist_daemon_tokio::{
-    CallFailure, CancelMode, CorrelationPolicy, JsonlClientConfig, TrackedId, TrackedKind,
-    run_jsonl_client,
+    CallFailure, CancelMode, CorrelationPolicy, JsonlClientConfig, run_jsonl_client,
 };
 
 use crate::{
@@ -18,17 +17,8 @@ const ENDPOINT: DaemonEndpoint =
 struct ClipCorrelation;
 
 impl CorrelationPolicy for ClipCorrelation {
-    fn response_id(&self, response: &Value) -> Option<TrackedId> {
-        tracked(
-            response.pointer("/data/operation/id"),
-            TrackedKind::Operation,
-        )
-        .or_else(|| {
-            tracked(
-                response.pointer("/data/subscription/id"),
-                TrackedKind::Subscription,
-            )
-        })
+    fn operation_id<'a>(&self, response: &'a Value) -> Option<&'a str> {
+        response.pointer("/data/operation/id")?.as_str()
     }
 
     fn event_id(&self, stream: &str, event: &Value) -> Option<String> {
@@ -48,13 +38,6 @@ impl CorrelationPolicy for ClipCorrelation {
                 Some("completed" | "failed" | "cancelled")
             )
     }
-}
-
-fn tracked(value: Option<&Value>, kind: TrackedKind) -> Option<TrackedId> {
-    value.and_then(Value::as_str).map(|id| TrackedId {
-        id: id.to_owned(),
-        kind,
-    })
 }
 
 fn call_failure(_method: &str, _error: &anyhow::Error) -> CallFailure {
