@@ -68,7 +68,7 @@ long-run leak freedom, or improvement over the previous watcher.
 Inside the current-source development shell:
 
 ```sh
-python3 ../daemon-framework/tools/local-build.py develop .
+../daemon-framework/tools/local-build develop .
 just check
 just backend-regressions
 just capture-acceptance

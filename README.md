@@ -20,7 +20,7 @@ consume that current worktree, never a private framework pin or vendored copy.
 ```sh
 direnv allow
 # or
-python3 ../daemon-framework/tools/local-build.py develop .
+../daemon-framework/tools/local-build develop .
 just check                 # locked tests, Clippy, unused dependencies, RustSec
 just quality               # full RQLens evidence and verification
 just live-acceptance       # disposable nested desktop; never wipes normal history
@@ -83,7 +83,7 @@ See [`docs/phase4-safety.md`](docs/phase4-safety.md) for enforced privacy behavi
 Run the local quality review with:
 
 ```sh
-python3 ../daemon-framework/tools/local-build.py develop . --command ../rust-quality-lens/target/debug/rqlens measure all --config rqlens.toml
+../daemon-framework/tools/local-build develop . --command ../rust-quality-lens/target/debug/rqlens measure all --config rqlens.toml
 ```
 
 See [`docs/adr-0001-ringboard-facade.md`](docs/adr-0001-ringboard-facade.md), [`docs/adr-0002-wayland-selection-ownership.md`](docs/adr-0002-wayland-selection-ownership.md), and [`docs/quality-review.md`](docs/quality-review.md).

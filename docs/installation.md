@@ -17,8 +17,8 @@ running; the API stays available for diagnostics.
 ## Build
 
 ```sh
-package=$(python3 ../daemon-framework/tools/local-build.py build . --no-link --print-out-paths)
-ringboard=$(python3 ../daemon-framework/tools/local-build.py build --attr ringboard . --no-link --print-out-paths)
+package=$(../daemon-framework/tools/local-build build . --no-link --print-out-paths)
+ringboard=$(../daemon-framework/tools/local-build build --attr ringboard . --no-link --print-out-paths)
 nix profile install "$package" "$ringboard"
 ```
 
@@ -95,8 +95,8 @@ engine health/history before deliberately restarting the facade to recover.
 ## Verify without touching production
 
 ```sh
-package=$(python3 ../daemon-framework/tools/local-build.py build . --no-link --print-out-paths)
-python3 ../daemon-framework/tools/local-build.py develop . --command python3 scripts/package-smoke.py "$package"
+package=$(../daemon-framework/tools/local-build build . --no-link --print-out-paths)
+../daemon-framework/tools/local-build develop . --command python3 scripts/package-smoke.py "$package"
 just live-acceptance
 ```
 
@@ -124,7 +124,7 @@ eviction. Restore backups only deliberately with all writers stopped.
 
 Clone `https://github.com/pmfleming/daemon-framework` alongside this repository and
 use its current worktree; do not reset it to a compatibility pin. Enter with
-`python3 ../daemon-framework/tools/local-build.py develop .`, then `just check`.
+`../daemon-framework/tools/local-build develop .`, then `just check`.
 
 Stock Ringboard is read-compatible only. Capture ingestion requires the packaged
 v2 protocol; safe mutations and server pre-write admission remain mandatory.
