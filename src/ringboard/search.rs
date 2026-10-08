@@ -62,20 +62,25 @@ impl Matcher {
                 return Ok(found && carry == 0);
             }
             let end = carry + length;
-            let (valid, incomplete) = match std::str::from_utf8(&buffer[..end]) {
-                Ok(text) => (text, 0),
-                Err(error) if error.error_len().is_none() => (
-                    std::str::from_utf8(&buffer[..error.valid_up_to()])
-                        .map_err(io::Error::other)?,
-                    end - error.valid_up_to(),
-                ),
-                Err(_) => return Ok(false),
+            let Some(valid) = utf8_prefix(&buffer[..end]) else {
+                return Ok(false);
             };
             // A match is not success until the entire input is valid UTF-8.
             self.feed(valid, &mut matched, &mut found);
-            buffer.copy_within(end - incomplete..end, 0);
-            carry = incomplete;
+            carry = end - valid.len();
+            buffer.copy_within(end - carry..end, 0);
         }
+    }
+}
+
+// Only an incomplete trailing code point may carry into the next read.
+fn utf8_prefix(bytes: &[u8]) -> Option<&str> {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => Some(text),
+        Err(error) if error.error_len().is_none() => {
+            std::str::from_utf8(&bytes[..error.valid_up_to()]).ok()
+        }
+        Err(_) => None,
     }
 }
 

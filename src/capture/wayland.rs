@@ -131,6 +131,22 @@ struct State {
 }
 
 impl State {
+    fn add_global(&mut self, name: u32, interface: &str, version: u32, qh: &QueueHandle<Self>) {
+        match interface {
+            "ext_data_control_manager_v1" => self.ext = Some(name),
+            "zwlr_data_control_manager_v1" if version >= 2 => self.wlr = Some(name),
+            "wl_seat" if self.seats.len() < MAX_SEATS => {
+                let mut seat = Seat {
+                    proxy: self.registry.bind(name, version.min(7), qh, ()),
+                    device: None,
+                };
+                seat.attach(&self.manager, name, qh);
+                self.seats.insert(name, seat);
+            }
+            _ => {}
+        }
+    }
+
     fn remove_seat(&mut self, name: u32) {
         self.offers.retain(|_, pending| pending.seat != name);
         self.transfers
@@ -313,7 +329,7 @@ fn wait_readable(connection: &Connection, transfers: &[Receiving]) -> Result<boo
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
     fn event(
         state: &mut Self,
-        registry: &wl_registry::WlRegistry,
+        _: &wl_registry::WlRegistry,
         event: wl_registry::Event,
         _: &(),
         _: &Connection,
@@ -324,20 +340,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 name,
                 interface,
                 version,
-            } => match interface.as_str() {
-                "ext_data_control_manager_v1" => state.ext = Some(name),
-                "zwlr_data_control_manager_v1" if version >= 2 => state.wlr = Some(name),
-                "wl_seat" if state.seats.len() < MAX_SEATS => {
-                    let proxy = registry.bind(name, version.min(7), qh, ());
-                    let mut seat = Seat {
-                        proxy,
-                        device: None,
-                    };
-                    seat.attach(&state.manager, name, qh);
-                    state.seats.insert(name, seat);
-                }
-                _ => {}
-            },
+            } => state.add_global(name, &interface, version, qh),
             wl_registry::Event::GlobalRemove { name } => {
                 state.remove_seat(name);
                 if state.ready && state.seats.is_empty() {

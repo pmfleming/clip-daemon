@@ -1,84 +1,49 @@
 //! Explicit user captures: no shell, clipboard subprocess, or history-entry race.
-use std::{path::Path, process::Stdio, sync::Arc, time::Duration};
+use std::{path::Path, process::Stdio, time::Duration};
 
-use tokio::{io::AsyncReadExt, process::Command, sync::oneshot};
+use tokio::{io::AsyncReadExt, process::Command};
 
-use super::mutation::{
-    operation_error, private_file, runtime_directory, unique_path, valid_edited_image,
-};
-use super::{OperationControl, OperationTask, RingboardBackend, run_blocking};
+use super::mutation::{private_file, runtime_directory, unique_path, valid_edited_image};
+use super::operation::{OperationCompletion, OperationControl, operation_error};
+use super::{RingboardBackend, run_blocking};
 use crate::{
     backend::{BackendResult, InteractiveScreenshot, ScreenshotMode, ScreenshotRegion},
     model::OperationResult,
 };
 
 pub(super) fn launch(
-    backend: RingboardBackend,
+    backend: &RingboardBackend,
     request: InteractiveScreenshot,
     max_bytes: u64,
 ) -> BackendResult<OperationResult> {
-    let mut active = backend.operations.lock().map_err(|_| super::lock_error())?;
-    if active.values().any(|job| job.action == "screenshot") {
+    if backend.operations.contains("screenshot")? {
         return Err(operation_error("A screenshot is already in progress"));
     }
     let directory = runtime_directory("clip-daemon/screenshots")?;
     let input = unique_path(&directory, "png");
     let output = unique_path(&directory, "png");
     drop(private_file(&input)?);
-    let mut operation = OperationResult::completed("screenshot", "Screenshot started");
-    operation.status = "started".into();
-    let id = operation.id.clone();
-    let control = Arc::new(OperationControl::default());
-    let (start, ready) = oneshot::channel();
     let worker = backend.clone();
-    let guard = control.clone();
-    let files = vec![input.clone(), output.clone()];
-    let task_id = id.clone();
-    let handle = tokio::spawn(async move {
-        let result = async {
-            ready.await.map_err(operation_error)?;
-            capture(&worker, request, &input, &output, max_bytes, &guard).await
-        }
-        .await;
-        let claimed = worker
-            .operations
-            .lock()
-            .is_ok_and(|mut jobs| jobs.remove(&task_id).is_some());
-        let (status, message) = match result {
-            Ok(true) => ("completed", "Screenshot copied".to_owned()),
-            Ok(false) => ("cancelled", "Screenshot cancelled".to_owned()),
-            Err(error) => ("failed", error.to_string()),
-        };
-        if claimed {
-            let _ = worker.operation_events.send(OperationResult::with_id(
-                task_id,
-                "screenshot",
-                status,
-                &message,
-            ));
-        }
-        guard.finish();
-        if claimed && status != "cancelled" {
-            let mut notification = Command::new("notify-send");
-            notification
-                .args(["-a", "clip-daemon", "Screenshot", &message])
-                .kill_on_drop(true);
-            let _ = tokio::time::timeout(Duration::from_secs(3), notification.status()).await;
-        }
-    });
-    active.insert(
-        id,
-        OperationTask {
-            action: "screenshot",
-            control,
-            handle,
-            files,
+    backend.operations.launch(
+        "screenshot",
+        "Screenshot started",
+        vec![input.clone(), output.clone()],
+        move |control| async move {
+            capture(&worker, request, &input, &output, max_bytes, &control).await
         },
-    );
-    drop(active);
-    let _ = backend.operation_events.send(operation.clone());
-    let _ = start.send(());
-    Ok(operation)
+        notify,
+    )
+}
+
+async fn notify(event: OperationResult) {
+    if event.status == "cancelled" {
+        return;
+    }
+    let mut notification = Command::new("notify-send");
+    notification
+        .args(["-a", "clip-daemon", "Screenshot", &event.message])
+        .kill_on_drop(true);
+    let _ = tokio::time::timeout(Duration::from_secs(3), notification.status()).await;
 }
 
 async fn capture(
@@ -88,16 +53,21 @@ async fn capture(
     output: &Path,
     max_bytes: u64,
     control: &OperationControl,
-) -> BackendResult<bool> {
+) -> BackendResult<OperationCompletion> {
+    let cancelled = OperationCompletion {
+        status: "cancelled",
+        message: "Screenshot cancelled",
+        warning: None,
+    };
     if !grab(request.mode, input).await? {
-        return Ok(false);
+        return Ok(cancelled);
     }
     if request.annotate && !edit_capture(backend, input, output, max_bytes).await? {
-        return Ok(false);
+        return Ok(cancelled);
     }
     let chosen = if request.annotate { output } else { input }.to_owned();
     if !control.begin_commit() {
-        return Ok(false);
+        return Ok(cancelled);
     }
     let backend = backend.clone();
     run_blocking(move || {
@@ -112,7 +82,11 @@ async fn capture(
             .selection
             .publish_file("image/png", &chosen, max_bytes)?;
         backend.selection_changed()?;
-        Ok(true)
+        Ok(OperationCompletion {
+            status: "completed",
+            message: "Screenshot copied",
+            warning: None,
+        })
     })
     .await
 }

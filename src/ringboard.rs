@@ -8,10 +8,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use tokio::{
-    sync::broadcast,
-    task::{JoinHandle, spawn_blocking},
-};
+use tokio::{sync::broadcast, task::spawn_blocking};
 
 use async_trait::async_trait;
 use clipboard_history_client_sdk::{DatabaseReader, Entry, EntryReader, LoadedEntry};
@@ -44,7 +41,7 @@ mod mutation;
 mod operation;
 mod screenshot;
 mod search;
-use operation::OperationControl;
+use operation::Operations;
 
 use artifacts::ArtifactRegistry;
 use content::{
@@ -97,19 +94,6 @@ impl SummaryCache {
             self.search = None;
         }
         self.token = Some(token);
-    }
-}
-
-struct OperationTask {
-    action: &'static str,
-    control: Arc<OperationControl>,
-    handle: JoinHandle<()>,
-    files: Vec<PathBuf>,
-}
-
-impl Drop for OperationTask {
-    fn drop(&mut self) {
-        mutation::remove_files(&self.files);
     }
 }
 
@@ -241,7 +225,14 @@ impl CachedProjection {
             ..QueryProjection::default()
         };
         let needle = query.query.trim().to_lowercase();
-        let matches: Vec<_> = self
+        let mut matched = 0;
+        let page = query.offset
+            ..query
+                .offset
+                .saturating_add(query.limit.clamp(1, MAX_QUERY_LIMIT));
+        // Visit every candidate for identity bindings and totals, but retain only
+        // the requested page rather than allocating an all-matches vector.
+        projection.entries = self
             .candidates
             .iter()
             .filter(|candidate| {
@@ -256,19 +247,21 @@ impl CachedProjection {
                     |matches| matches.contains(&candidate.raw_id),
                 )
             })
-            .map(|candidate| &candidate.resolved.summary)
-            .collect();
-        projection.matched = matches.len();
-        projection.entries = matches
+            .enumerate()
+            .filter(|(index, _)| {
+                matched += 1;
+                page.contains(index)
+            })
+            .map(|(_, candidate)| &candidate.resolved.summary)
+            .collect::<Vec<_>>()
             .into_iter()
-            .skip(query.offset)
-            .take(query.limit.clamp(1, MAX_QUERY_LIMIT))
             .map(|summary| {
                 let mut summary = summary.clone();
                 summary.current = current_id == Some(summary.id.as_str());
                 summary
             })
             .collect();
+        projection.matched = matched;
         projection
     }
 }
@@ -280,8 +273,7 @@ pub struct RingboardBackend {
     ids: Arc<Mutex<HashMap<String, IdentityBinding>>>,
     revision: Arc<Mutex<RevisionState>>,
     summaries: Arc<Mutex<SummaryCache>>,
-    operations: Arc<Mutex<HashMap<String, OperationTask>>>,
-    operation_events: broadcast::Sender<OperationResult>,
+    operations: Arc<Operations>,
     artifacts: Arc<Mutex<ArtifactRegistry>>,
     editor: ImageEditorCommand,
     selection: SelectionService,
@@ -289,16 +281,14 @@ pub struct RingboardBackend {
 
 impl Default for RingboardBackend {
     fn default() -> Self {
-        let (operation_events, _) = broadcast::channel(64);
         Self {
-            transaction: Arc::new(Mutex::new(())),
-            operation_gate: Arc::new(tokio::sync::Mutex::new(())),
-            ids: Arc::new(Mutex::new(HashMap::new())),
-            revision: Arc::new(Mutex::new(RevisionState::default())),
-            summaries: Arc::new(Mutex::new(SummaryCache::default())),
-            operations: Arc::new(Mutex::new(HashMap::new())),
-            operation_events,
-            artifacts: Arc::new(Mutex::new(ArtifactRegistry::default())),
+            transaction: Arc::default(),
+            operation_gate: Arc::default(),
+            ids: Arc::default(),
+            revision: Arc::default(),
+            summaries: Arc::default(),
+            operations: Arc::default(),
+            artifacts: Arc::default(),
             editor: ImageEditorCommand::configured(),
             selection: SelectionService::default(),
         }
@@ -322,21 +312,6 @@ impl RingboardBackend {
 
     fn artifact_registry(&self) -> BackendResult<MutexGuard<'_, ArtifactRegistry>> {
         self.artifacts.lock().map_err(|_| lock_error())
-    }
-
-    fn status_sync(&self) -> BackendStatus {
-        match Self::open_database() {
-            Ok(_) => BackendStatus {
-                available: true,
-                engine: "ringboard".into(),
-                detail: "database-readable".into(),
-            },
-            Err(error) => BackendStatus {
-                available: false,
-                engine: "ringboard".into(),
-                detail: error.to_string(),
-            },
-        }
     }
 
     fn change_token_sync(&self) -> BackendResult<u64> {
@@ -758,18 +733,18 @@ fn finalize_query(
 #[async_trait]
 impl ClipboardBackend for RingboardBackend {
     fn operation_events(&self) -> broadcast::Receiver<OperationResult> {
-        self.operation_events.subscribe()
+        self.operations.subscribe()
     }
 
     async fn status(&self) -> BackendStatus {
-        let backend = self.clone();
-        spawn_blocking(move || backend.status_sync())
+        let result = spawn_blocking(|| Self::open_database().map(|_| ()))
             .await
-            .unwrap_or_else(|_| BackendStatus {
-                available: false,
-                engine: "ringboard".into(),
-                detail: "Ringboard status task failed".into(),
-            })
+            .unwrap_or_else(|_| Err(BackendError::unavailable("Ringboard status task failed")));
+        BackendStatus {
+            available: result.is_ok(),
+            engine: "ringboard".into(),
+            detail: result.map_or_else(|error| error.to_string(), |()| "database-readable".into()),
+        }
     }
 
     async fn change_token(&self) -> BackendResult<u64> {
@@ -814,7 +789,7 @@ impl ClipboardBackend for RingboardBackend {
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
         let _gate = self.operation_gate.lock().await;
-        screenshot::launch(self.clone(), request, max_bytes)
+        screenshot::launch(self, request, max_bytes)
     }
 
     async fn publish(
@@ -845,7 +820,7 @@ impl ClipboardBackend for RingboardBackend {
         // Exclude new annotation launches while cleanup/wipe drains old jobs.
         let _gate = self.operation_gate.lock().await;
         if matches!(mutation, BackendMutation::Wipe | BackendMutation::Cleanup) {
-            self.stop_operations().await?;
+            self.operations.stop().await?;
         }
         if let BackendMutation::Annotate { max_bytes } = mutation {
             let opaque_id = opaque_id.to_owned();
@@ -881,34 +856,7 @@ impl ClipboardBackend for RingboardBackend {
     }
 
     async fn cancel_operation(&self, operation_id: &str) -> BackendResult<bool> {
-        let operation = {
-            let mut operations = self.operations.lock().map_err(|_| lock_error())?;
-            if !operations
-                .get(operation_id)
-                .is_some_and(|operation| operation.control.cancel())
-            {
-                // A committing job cannot be aborted. It retains its files and
-                // emits its real committed/failed outcome; callers may wait.
-                return Ok(false);
-            }
-            operations.remove(operation_id)
-        };
-        let Some(mut operation) = operation else {
-            return Ok(false);
-        };
-        operation.handle.abort();
-        let _ = (&mut operation.handle).await;
-        let control = Arc::clone(&operation.control);
-        let action = operation.action;
-        drop(operation);
-        let _ = self.operation_events.send(OperationResult::with_id(
-            operation_id.to_owned(),
-            action,
-            "cancelled",
-            "Image operation cancelled",
-        ));
-        control.finish();
-        Ok(true)
+        self.operations.cancel(operation_id).await
     }
 }
 

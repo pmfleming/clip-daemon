@@ -230,13 +230,15 @@ impl SettingsManager {
         })
     }
 
-    async fn apply_retention(&self, desired: &ClipboardSettings) -> Result<(), String> {
-        if self
-            .services
+    async fn retention_matches(&self, desired: &ClipboardSettings) -> bool {
+        self.services
             .limits()
             .await
             .is_ok_and(|limits| limits_match(&limits, desired))
-        {
+    }
+
+    async fn apply_retention(&self, desired: &ClipboardSettings) -> Result<(), String> {
+        if self.retention_matches(desired).await {
             return Ok(());
         }
         self.quiesce_locked().await?;
@@ -245,12 +247,7 @@ impl SettingsManager {
             .await?;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if self
-                    .services
-                    .limits()
-                    .await
-                    .is_ok_and(|limits| limits_match(&limits, desired))
-                {
+                if self.retention_matches(desired).await {
                     return Ok(());
                 }
                 sleep(Duration::from_millis(50)).await;
@@ -359,13 +356,7 @@ impl SettingsManager {
     async fn apply_capture(&self, updated: &ClipboardSettings) -> Result<(), String> {
         let _ = self.record_capture(Err("Capture transition is not yet verified".into()));
         let result = async {
-            if !updated.capture_paused
-                && !self
-                    .services
-                    .limits()
-                    .await
-                    .is_ok_and(|limits| limits_match(&limits, updated))
-            {
+            if !updated.capture_paused && !self.retention_matches(updated).await {
                 self.capture.set_paused(true, 0).await?;
                 return Err(
                     "Capture is disabled until engine retention/limits are synchronized".into(),

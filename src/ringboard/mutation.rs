@@ -1,33 +1,29 @@
 use std::{
-    collections::HashMap,
     env,
     fs::{self, File, OpenOptions},
-    future::Future,
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command as StdCommand,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use image::ImageReader;
-use tokio::sync::{broadcast, oneshot};
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    backend::{
-        BackendError, BackendErrorKind, BackendResult, ClipboardBackend, EntryTarget,
-        MAX_WAYLAND_SELECTION_BYTES, ScreenshotRegion,
-    },
+    backend::{BackendResult, EntryTarget, MAX_WAYLAND_SELECTION_BYTES, ScreenshotRegion},
     model::{EntryKind, OperationResult},
 };
 
 use super::{
-    MAX_THUMBNAIL_BYTES, OperationControl, OperationTask, RingboardBackend,
+    MAX_THUMBNAIL_BYTES, RingboardBackend,
     content::{Publication, ResolvedContent, ResolvedImage, read_entry, read_path},
-    invalid_entry, run_blocking,
+    invalid_entry,
+    operation::{OperationCompletion, OperationControl, operation_error},
+    run_blocking,
 };
 
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -38,53 +34,6 @@ pub(super) struct AnnotationStage {
     opaque_id: String,
     revision: u64,
     max_bytes: u64,
-}
-
-struct OperationCompletion {
-    message: &'static str,
-    warning: Option<String>,
-}
-
-impl OperationCompletion {
-    fn event(self, id: String, action: &str) -> OperationResult {
-        let mut event = OperationResult::with_id(id, action, "completed", self.message);
-        event.warning = self.warning;
-        event
-    }
-}
-
-async fn complete_annotation(
-    id: String,
-    ready: oneshot::Receiver<()>,
-    operations: Arc<Mutex<HashMap<String, OperationTask>>>,
-    events: broadcast::Sender<OperationResult>,
-    control: Arc<OperationControl>,
-    run: impl Future<Output = BackendResult<OperationCompletion>>,
-) {
-    let result = if ready.await.is_ok() {
-        run.await
-    } else {
-        Err(operation_error("Clipboard operation could not start"))
-    };
-    if !claim_terminal_event(&operations, &id) {
-        control.finish();
-        return;
-    }
-    let event = match result {
-        Ok(completion) => completion.event(id, "annotate"),
-        Err(error) => OperationResult::with_id(id, "annotate", "failed", &error.to_string()),
-    };
-    let _ = events.send(event);
-    control.finish();
-}
-
-fn claim_terminal_event(
-    operations: &Mutex<HashMap<String, OperationTask>>,
-    operation_id: &str,
-) -> bool {
-    operations
-        .lock()
-        .is_ok_and(|mut active| active.remove(operation_id).is_some())
 }
 
 impl RingboardBackend {
@@ -176,43 +125,14 @@ impl RingboardBackend {
         &self,
         staged: AnnotationStage,
     ) -> BackendResult<OperationResult> {
-        let files = vec![staged.input.clone(), staged.output.clone()];
-        let mut operation = OperationResult::completed("annotate", "Image editor started");
-        operation.status = "started".into();
-        let operation_id = operation.id.clone();
-        let (start, ready) = oneshot::channel();
-        let control = Arc::new(OperationControl::default());
-        let handle = tokio::spawn(complete_annotation(
-            operation_id.clone(),
-            ready,
-            Arc::clone(&self.operations),
-            self.operation_events.clone(),
-            Arc::clone(&control),
-            run_annotation(self.clone(), staged, Arc::clone(&control)),
-        ));
-        let mut active = match self.operations.lock() {
-            Ok(active) => active,
-            Err(_) => {
-                handle.abort();
-                remove_files(&files);
-                return Err(operation_error("Clipboard operation state is unavailable"));
-            }
-        };
-        active.insert(
-            operation_id,
-            OperationTask {
-                action: "annotate",
-                control,
-                handle,
-                files,
-            },
-        );
-        drop(active);
-        let _ = self.operation_events.send(operation.clone());
-        start
-            .send(())
-            .map_err(|_| operation_error("Annotation task could not be started"))?;
-        Ok(operation)
+        let backend = self.clone();
+        self.operations.launch(
+            "annotate",
+            "Image editor started",
+            vec![staged.input.clone(), staged.output.clone()],
+            move |control| run_annotation(backend, staged, control),
+            |_| async {},
+        )
     }
 
     pub(super) fn stage_annotation(
@@ -340,24 +260,6 @@ impl RingboardBackend {
         ))
     }
 
-    pub(super) async fn stop_operations(&self) -> BackendResult<()> {
-        let active: Vec<_> = self
-            .operations
-            .lock()
-            .map_err(|_| super::lock_error())?
-            .iter()
-            .map(|(id, task)| (id.clone(), Arc::clone(&task.control)))
-            .collect();
-        for (id, control) in active {
-            if !self.cancel_operation(&id).await? {
-                // Never hold the backend transaction lock while waiting: the
-                // committing job needs it to complete and release staged files.
-                control.wait().await;
-            }
-        }
-        Ok(())
-    }
-
     pub(super) fn wipe_entries(&self) -> BackendResult<OperationResult> {
         super::ipc::wipe()?;
         cleanup_backend(self)?;
@@ -422,28 +324,25 @@ async fn run_annotation(
     } = staged;
     // Give the picker time to hide so the editor becomes focused when it maps.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    match backend
+    backend
         .editor
         .run(&input, &output)
         .await
-        .map_err(operation_error)
-    {
-        Ok(()) if output.is_file() => {
-            if !control.begin_commit() {
-                return Err(operation_error("Image edit was cancelled before commit"));
-            }
-            run_blocking(move || {
-                let _transaction = backend
-                    .transaction
-                    .lock()
-                    .map_err(|_| super::lock_error())?;
-                apply_annotation(&backend, &opaque_id, revision, &output, max_bytes)
-            })
-            .await
-        }
-        Ok(()) => Err(operation_error("Image edit was cancelled")),
-        Err(error) => Err(error),
+        .map_err(operation_error)?;
+    if !output.is_file() {
+        return Err(operation_error("Image edit was cancelled"));
     }
+    if !control.begin_commit() {
+        return Err(operation_error("Image edit was cancelled before commit"));
+    }
+    run_blocking(move || {
+        let _transaction = backend
+            .transaction
+            .lock()
+            .map_err(|_| super::lock_error())?;
+        apply_annotation(&backend, &opaque_id, revision, &output, max_bytes)
+    })
+    .await
 }
 
 fn command_status_with_timeout(
@@ -477,6 +376,7 @@ fn apply_annotation(
     }
     let raw_id = backend.replace_file_entry(opaque_id, Some(revision), output, "image/png")?;
     let mut completion = OperationCompletion {
+        status: "completed",
         message: "Image edit completed",
         warning: None,
     };
@@ -590,12 +490,6 @@ pub(super) fn valid_edited_image(path: &Path, max_bytes: u64) -> bool {
     reader.decode().is_ok()
 }
 
-pub(super) fn remove_files(paths: &[impl AsRef<Path>]) {
-    for path in paths {
-        let _ = fs::remove_file(path.as_ref());
-    }
-}
-
 fn image_directory() -> BackendResult<PathBuf> {
     let home = env::var_os("HOME").ok_or_else(|| operation_error("HOME is unavailable"))?;
     private_directory(PathBuf::from(home).join("Pictures/Screenshots/clipboard-history"))
@@ -648,123 +542,11 @@ fn image_extension(mime: &str) -> &'static str {
     }
 }
 
-pub(super) fn operation_error(error: impl std::fmt::Display) -> BackendError {
-    BackendError::new(BackendErrorKind::OperationFailed, error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
 
-    use super::{OperationTask, command_status_with_timeout, valid_edited_image};
-
-    #[tokio::test]
-    async fn annotation_cancellation_removes_files_and_emits_one_terminal_event() {
-        use crate::backend::ClipboardBackend;
-        for start_first in [false, true] {
-            let backend = super::RingboardBackend::default();
-            let mut events = backend.operation_events.subscribe();
-            let directory = tempfile::tempdir().unwrap();
-            let staged = directory.path().join("staged.png");
-            fs::write(&staged, b"fixture").unwrap();
-            let (start, ready) = tokio::sync::oneshot::channel();
-            let (started, running) = tokio::sync::oneshot::channel();
-            let control = std::sync::Arc::new(super::OperationControl::default());
-            let handle = tokio::spawn(super::complete_annotation(
-                "cancel-me".into(),
-                ready,
-                backend.operations.clone(),
-                backend.operation_events.clone(),
-                control.clone(),
-                async move {
-                    let _ = started.send(());
-                    std::future::pending().await
-                },
-            ));
-            backend.operations.lock().unwrap().insert(
-                "cancel-me".into(),
-                OperationTask {
-                    action: "annotate",
-                    control,
-                    handle,
-                    files: vec![staged.clone()],
-                },
-            );
-            if start_first {
-                start.send(()).unwrap();
-                running.await.unwrap();
-            }
-            assert!(backend.cancel_operation("cancel-me").await.unwrap());
-            assert!(!backend.cancel_operation("cancel-me").await.unwrap());
-            let event = events.try_recv().unwrap();
-            assert_eq!(event.status, "cancelled");
-            assert_eq!(event.id, "cancel-me");
-            assert!(events.try_recv().is_err());
-            assert!(!staged.exists());
-            assert!(backend.operations.lock().unwrap().is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn cleanup_waits_for_a_blocking_commit_and_keeps_its_real_outcome() {
-        use std::sync::Arc;
-        let backend = super::RingboardBackend::default();
-        let mut events = backend.operation_events.subscribe();
-        let directory = tempfile::tempdir().unwrap();
-        let staged = directory.path().join("staged.png");
-        fs::write(&staged, b"fixture").unwrap();
-        let control = Arc::new(super::OperationControl::default());
-        assert!(control.begin_commit());
-        let (release, blocked) = std::sync::mpsc::channel();
-        let (entered, running) = tokio::sync::oneshot::channel();
-        let (start, ready) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(super::complete_annotation(
-            "committing".into(),
-            ready,
-            backend.operations.clone(),
-            backend.operation_events.clone(),
-            control.clone(),
-            async move {
-                tokio::task::spawn_blocking(move || {
-                    let _ = entered.send(());
-                    blocked.recv().unwrap();
-                })
-                .await
-                .unwrap();
-                Ok(super::OperationCompletion {
-                    message: "Committed",
-                    warning: None,
-                })
-            },
-        ));
-        backend.operations.lock().unwrap().insert(
-            "committing".into(),
-            OperationTask {
-                action: "annotate",
-                control,
-                handle,
-                files: vec![staged.clone()],
-            },
-        );
-        start.send(()).unwrap();
-        running.await.unwrap();
-        assert!(
-            !super::ClipboardBackend::cancel_operation(&backend, "committing")
-                .await
-                .unwrap()
-        );
-        assert!(staged.exists());
-        assert!(events.try_recv().is_err());
-        let other = backend.clone();
-        let cleanup = tokio::spawn(async move { other.stop_operations().await });
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        assert!(!cleanup.is_finished());
-        release.send(()).unwrap();
-        cleanup.await.unwrap().unwrap();
-        assert_eq!(events.try_recv().unwrap().status, "completed");
-        assert!(events.try_recv().is_err());
-        assert!(!staged.exists());
-    }
+    use super::{command_status_with_timeout, valid_edited_image};
 
     #[test]
     fn screenshot_commands_are_bounded() {

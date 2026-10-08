@@ -372,3 +372,102 @@ claims. No production service, user history or shared framework source was chang
 The subsequent [test-suite reduction](test-suite-reduction.md) records the current
 48-test inventory, selection rationale and coverage trade-off. The measurements
 above are the historical baseline before that test-only pass.
+
+## Shared operation ownership and bounded paging
+
+Baseline: `6e878c3`, using the same local `../rust-quality-lens/target/debug/rqlens`
+binary for both measurements (SHA-256
+`09b72768d645f97886ae4b22ced05553bbcac988fac290745e66f97405e94053`).
+Configuration, source roots, thresholds and exclusions are unchanged. Evidence:
+`target/quality-pass-before/`, `target/quality-pass-after/`,
+`target/quality-pass-comparison.json` and `target/quality-pass-allocations.json`.
+
+| Signal | Before | After |
+| --- | ---: | ---: |
+| Function cognitive complexity: sum / maximum | 556 / 11 | 547 / 9 |
+| Function cyclomatic complexity: sum / maximum | 1714 / 16 | 1711 / 16 |
+| Function Halstead effort sum | 4,120,187 | 4,026,317 |
+| Non-test function Halstead effort maximum | 88,882 | 56,640 |
+| Minimum / average locality | 79 / 99.2500 | 82 / 99.3182 |
+| Average module leverage (observed-reuse-v2) | 23.3333 | 23.0303 |
+| Token-clone records / duplicated lines | 5 / 86 | 5 / 90 |
+| Explicit clone calls under `src/` (`.clone()` + `Arc::clone`) | 109 | 97 |
+| Source nonblank lines measured by RQLens | 9131 | 9108 |
+| Physical Rust lines (`src`, `tests`, `examples`) | 10557 | 10551 |
+| Escape-hatch / production reliability findings | 0 / 0 | 0 / 0 |
+
+Effort is the current syntax-token **Halstead** metric, not the historical hotspot
+score proxy. Function totals include inline tests and the opt-in benchmark;
+non-test maxima exclude qualified names containing `::tests::` or `::benchmarks::`.
+The size reduction is only six lines; no test cases were deleted to manufacture a
+larger reduction.
+
+### Review and changes
+
+- Screenshot and annotation tasks duplicated registration, event claiming, file
+  cleanup and cancellation. `ringboard/operation.rs` now owns the registry and
+  broadcast channel together, and both actions use one launcher. The start barrier,
+  atomic commit fence, terminal-event ownership and event-before-wakeup ordering
+  remain. Screenshot notification stays in the screenshot adapter. Tests now use
+  the real launcher, cover cancellation before execution and while running, and
+  verify that draining a blocking commit preserves its publication warning.
+- History projection retained references to **all** matching rows before paging.
+  It now visits every row for bindings/totals but retains only page references,
+  then allocates the cloned output exactly. This preserves off-page current-entry
+  identity, echo collapsing, artifact references, limit clamping and overflow-safe
+  offsets. The obsolete status wrapper and its whole-backend clone are removed;
+  backend defaults use the existing field defaults directly.
+- Streaming UTF-8 prefix validation is separate from the KMP read loop. Invalid
+  tails still reject a prior match, incomplete code points carry across reads,
+  and post-match I/O failures still propagate. Registry additions have a separate
+  Wayland policy boundary without changing manager precedence or seat limits.
+- Retention verification is shared by restart polling and capture admission.
+  Annotation errors use early returns instead of a nested success/error match.
+
+This improves lifecycle reuse and locality, but **not every heuristic improves**:
+module leverage falls slightly because the facade no longer consumes mutation's
+file-cleanup helper. The five remaining low-risk token clones include test setup;
+reported duplicated lines rise by four. Peak cyclomatic complexity remains 16 in
+native search. No dead dependencies were found by cargo-machete, and escape hatches
+were already zero. SDK panic containment and scoped bootstrap remain intentional.
+
+### Validation
+
+RQLens `verify` reports 16 passed checks, no failed errors, four existing project
+policy warnings and eight skipped optional checks. Formatting, strict all-target /
+all-feature Clippy, compilation, rustdoc, doctests and three repeated test runs
+pass: **47 tests**, with the opt-in benchmark ignored in normal runs. The benchmark
+was also run explicitly on both revisions, using identical debug tooling and
+synthetic fixtures: all **12 semantic fingerprints match**. At 20,000 entries,
+first-page/pagination allocated bytes fall from 4,570,589 to 4,048,349 (11.4%);
+allocation count falls from 20,333 to 20,325. None of the 12 scenarios increases
+allocated bytes. These are allocation results, not release-runtime speedup claims.
+
+The **12 backend regressions**, **12 isolated capture checks** and **15 standard
+nested-desktop checks** pass. The patched Ringboard fixture must be selected with
+`RINGBOARD_SERVER=$(command -v ringboard-server)`; without it the backend harness
+mistakenly chooses the legacy-server rejection case. Satty completion/cancellation,
+privacy fences, reconnects, full-text search and targeted paste are covered.
+Shelllist layer-shell, wlr-only, multi-seat, physical-session and interactive
+screenshot UI qualification were not run. No production services or user history
+were changed.
+
+Reproduction (from the project root, with the configured development tools):
+
+```sh
+for tool in hotspots clones escape-hatches reliability locality leverage; do
+  ../rust-quality-lens/target/debug/rqlens measure "$tool" --config rqlens.toml
+done
+../rust-quality-lens/target/debug/rqlens verify --config rqlens.toml
+cargo build --locked
+RINGBOARD_SERVER=$(command -v ringboard-server) python3 scripts/backend-regressions.py
+python3 scripts/capture-acceptance.py
+python3 scripts/isolated-acceptance.py
+```
+
+The current extractor marks both measurements **partial** for cross-file impl
+ownership and unexpanded Wayland macros, despite resolving all collected semantic
+dependency references. These are comparable authored-source observations, not a
+complete compiler-expanded inventory or a passing strict partial-evidence gate.
+Coverage was not remeasured. Contribution/conduct/security-policy/changelog warnings
+remain; optional skipped tools are not counted as passes.
