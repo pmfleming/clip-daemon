@@ -109,7 +109,8 @@
         "name": "clipboard.entry.edit.commit",
         "params_example": {
           "edit_id": "edit-opaque",
-          "value": "replacement"
+          "value": "replacement",
+          "paste_session_id": "session-opaque"
         },
         "response_key": "entry",
         "stream": "clipboard.history.changed"

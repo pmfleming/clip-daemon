@@ -385,6 +385,14 @@ impl ClipboardService {
         params: EditCommitParams,
         max_entry_bytes: u64,
     ) -> Result<Value, ApiError> {
+        let paste_target = match params.paste_session_id.as_deref() {
+            Some(id) => self
+                .sessions
+                .validate_paste(id)
+                .await
+                .map_err(stale_target)?,
+            None => false,
+        };
         let lease = self
             .edits
             .lock()
@@ -408,13 +416,28 @@ impl ClipboardService {
                 params.value.as_bytes(),
             )
             .await?;
-        Ok(json!({
+        let mut result = json!({
             "entry": replacement.entry,
             "publication": {
                 "published": replacement.selection_published,
                 "message": replacement.publication_message
             }
-        }))
+        });
+        if let Some(session_id) = params.paste_session_id {
+            // A saved edit is not evidence of successful selection publication.
+            // Arming does not inject input: the existing hidden handshake owns it.
+            let prepared = replacement.selection_published
+                && paste_target
+                && self.sessions.arm_paste(&session_id).await;
+            result["paste"] = json!({
+                "session_id": session_id,
+                "prepared": prepared,
+                "message": if prepared { "Paste prepared; hide the picker" }
+                    else if replacement.selection_published { "Text saved and copied; paste manually" }
+                    else { "Text saved, but clipboard publication failed; paste was not prepared" }
+            });
+        }
+        Ok(result)
     }
 
     async fn cancel_edit(&self, params: EditCancelParams) -> Result<Value, ApiError> {
@@ -487,6 +510,8 @@ pub(crate) struct PublishFilesParams {
 struct EditCommitParams {
     edit_id: String,
     value: String,
+    #[serde(default)]
+    paste_session_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -762,6 +787,67 @@ mod tests {
                 .unwrap_err()
                 .code,
             "edit-error"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_and_prepare_paste_is_single_use_and_requires_publication() {
+        for published in [true, false] {
+            let backend = FakeBackend::with_entries(vec![text_details(false)]);
+            let backend = if published {
+                backend
+            } else {
+                backend.with_failed_publication()
+            };
+            let service = ClipboardService::new(Arc::new(backend));
+            let session = service.sessions.test_target().await;
+            let begun = service
+                .dispatch_entry(
+                    "clipboard.entry.edit.begin",
+                    json!({"entry_id":"entry", "revision":1}),
+                    1024,
+                )
+                .await
+                .unwrap();
+            let params = json!({"edit_id":begun["edit"]["id"], "value":"replacement", "paste_session_id": session});
+            let result = service
+                .dispatch_entry("clipboard.entry.edit.commit", params.clone(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(result["entry"]["text"], "replacement");
+            assert_eq!(result["paste"]["prepared"], published);
+            assert_eq!(service.sessions.test_is_armed(&session).await, published);
+            assert!(
+                service
+                    .dispatch_entry("clipboard.entry.edit.commit", params, 1024)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_paste_session_rejects_before_editing() {
+        let backend = Arc::new(FakeBackend::with_entries(vec![text_details(false)]));
+        let service = ClipboardService::new(backend.clone());
+        let begun = service
+            .dispatch_entry(
+                "clipboard.entry.edit.begin",
+                json!({"entry_id":"entry", "revision":1}),
+                1024,
+            )
+            .await
+            .unwrap();
+        let result = service.dispatch_entry("clipboard.entry.edit.commit", json!({"edit_id":begun["edit"]["id"], "value":"replacement", "paste_session_id":"expired"}), 1024).await;
+        assert!(result.is_err());
+        assert_eq!(
+            backend
+                .details("entry", 1024)
+                .await
+                .unwrap()
+                .text
+                .as_deref(),
+            Some("https://example.test")
         );
     }
 
