@@ -13,6 +13,21 @@ pub enum EntryKind {
     Binary,
 }
 
+impl EntryKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Text => "Text",
+            Self::Link => "Link",
+            Self::Image => "Image",
+            Self::Files => "Files",
+            Self::Html => "Html",
+            Self::Json => "Json",
+            Self::Color => "Color",
+            Self::Binary => "Binary",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntrySummary {
     pub id: String,
@@ -145,7 +160,26 @@ impl OperationResult {
 
 #[cfg(test)]
 mod tests {
-    use super::paginate;
+    use super::{EntryKind, paginate};
+
+    #[test]
+    fn kind_labels_preserve_search_keywords() {
+        for kind in [
+            EntryKind::Text,
+            EntryKind::Link,
+            EntryKind::Image,
+            EntryKind::Files,
+            EntryKind::Html,
+            EntryKind::Json,
+            EntryKind::Color,
+            EntryKind::Binary,
+        ] {
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                kind.label().to_ascii_lowercase()
+            );
+        }
+    }
 
     #[test]
     fn paging_visits_every_row_once_even_with_empty_or_overflowing_pages() {

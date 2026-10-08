@@ -139,11 +139,11 @@ impl HistorySearch {
         cursor.check(backend.change_token().await?)?;
         let (catalog, params) = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            catalog.entries = rank_entries(catalog.entries, &params.query)?;
-            Ok::<_, ApiError>((catalog, params))
+            catalog.entries = rank_entries(catalog.entries, &params.query);
+            (catalog, params)
         })
         .await
-        .map_err(search_failed)??;
+        .map_err(search_failed)?;
         // Never return a stale page after expensive ranking, either.
         cursor.check(backend.change_token().await?)?;
         self.page(catalog, cursor, params, owner, collapse)
@@ -220,44 +220,38 @@ fn search_failed(_: impl std::fmt::Display) -> ApiError {
     ApiError::new("search-failed", "Clipboard search failed")
 }
 
-fn rank_entries(entries: Vec<EntrySummary>, query: &str) -> Result<Vec<EntrySummary>, ApiError> {
+fn rank_entries(entries: Vec<EntrySummary>, query: &str) -> Vec<EntrySummary> {
     let count = entries.len();
     let items = entries
         .iter()
         .enumerate()
         .map(|(index, entry)| {
-            let kind = serde_json::to_value(entry.kind)
-                .map_err(search_failed)?
-                .as_str()
-                .unwrap_or("binary")
-                .to_owned();
-            let label = format!("{}{}", kind[..1].to_uppercase(), &kind[1..]);
+            let label = entry.kind.label();
             let title = if entry.preview.is_empty() {
                 format!("{label} clipboard entry")
             } else {
                 entry.preview.clone()
             };
-            Ok(shelllist_search::SearchItem {
+            shelllist_search::SearchItem {
                 key: entry.id.clone(),
                 title,
                 subtitle: format!("{label} · {} · {} bytes", entry.mime, entry.byte_size),
                 // The matcher always gives title matches a higher weight than keywords.
-                keywords: vec![entry.mime.clone(), kind],
+                keywords: vec![entry.mime.clone(), label.to_ascii_lowercase()],
                 score: (count - index) as i64,
                 provider_priority: 100,
-            })
+            }
         })
-        .collect::<Result<Vec<_>, ApiError>>()?;
+        .collect::<Vec<_>>();
     let keys = shelllist_search::rank(String::new(), 0, query, &items).keys;
     let mut by_id: HashMap<_, _> = items
         .into_iter()
         .zip(entries)
         .map(|(item, entry)| (item.key, entry))
         .collect();
-    Ok(keys
-        .into_iter()
+    keys.into_iter()
         .filter_map(|key| by_id.remove(&key))
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
