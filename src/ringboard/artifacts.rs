@@ -197,17 +197,14 @@ impl ArtifactRegistry {
         const MAX_LINE_BYTES: u64 = 32 * 1024;
         let mut references = HashSet::new();
         let mut line = Vec::new();
-        loop {
-            line.clear();
-            let length = source
-                .by_ref()
-                .take(MAX_LINE_BYTES)
-                .read_until(b'\n', &mut line)
-                .map_err(artifact_error)?;
-            if length == 0 {
-                break;
-            }
-            if length as u64 == MAX_LINE_BYTES && !line.ends_with(b"\n") {
+        while source
+            .by_ref()
+            .take(MAX_LINE_BYTES)
+            .read_until(b'\n', &mut line)
+            .map_err(artifact_error)?
+            != 0
+        {
+            if line.len() as u64 == MAX_LINE_BYTES && !line.ends_with(b"\n") {
                 // An uninspectable line must never authorize deletion. Keep all
                 // registered files until the ambiguous history entry is gone.
                 return Ok(self.records.keys().cloned().collect());
@@ -216,9 +213,8 @@ impl ArtifactRegistry {
                 .ok()
                 .and_then(|line| Url::parse(line.trim()).ok())
                 .and_then(|uri| uri.to_file_path().ok());
-            if let Some(path) = path.filter(|path| self.records.contains_key(path)) {
-                references.insert(path);
-            }
+            references.extend(path.filter(|path| self.records.contains_key(path)));
+            line.clear();
         }
         Ok(references)
     }
@@ -349,6 +345,44 @@ fn artifact_error(error: impl std::fmt::Display) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::ArtifactRegistry;
+
+    #[test]
+    fn reference_scan_distinguishes_bounded_lines_from_ambiguous_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry = ArtifactRegistry::load(Some(directory.path().to_owned()), None);
+        let paths: Vec<_> = (0..2)
+            .map(|_| {
+                directory
+                    .path()
+                    .join(format!("clipboard-{}.png", uuid::Uuid::new_v4()))
+            })
+            .collect();
+        for path in &paths {
+            registry
+                .register(path, "source", "image/png", b"image")
+                .unwrap();
+        }
+        let uri = url::Url::from_file_path(&paths[0]).unwrap();
+        for prefix in [
+            b"\xff\n# comment\n".to_vec(),
+            [vec![b'x'; 32 * 1024 - 1], vec![b'\n']].concat(),
+        ] {
+            let bytes = [prefix, format!("{uri}\r\n{uri}").into_bytes()].concat();
+            assert_eq!(
+                registry.references_in(bytes.as_slice()).unwrap(),
+                [paths[0].clone()].into()
+            );
+        }
+        for length in [32 * 1024, 32 * 1024 + 1] {
+            assert_eq!(
+                registry
+                    .references_in(vec![b'x'; length].as_slice())
+                    .unwrap(),
+                paths.iter().cloned().collect()
+            );
+        }
+        assert!(registry.references_in(b"".as_slice()).unwrap().is_empty());
+    }
 
     #[test]
     fn annotation_echoes_match_duplicates_but_not_the_replacement_source() {
