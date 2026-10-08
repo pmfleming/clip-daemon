@@ -90,18 +90,7 @@ impl Transfer {
         let remaining = (self.limit + 1 - self.length).min(bytes.len() as u64) as usize;
         match self.source.read(&mut bytes[..remaining]) {
             Ok(0) => Ok(true),
-            Ok(count) => {
-                self.length += count as u64;
-                if self.length > self.limit {
-                    return Err(io::ErrorKind::FileTooLarge.into());
-                }
-                self.progress = now;
-                self.nonblank |= bytes[..count]
-                    .iter()
-                    .any(|byte| !byte.is_ascii_whitespace());
-                self.data.write_all(&bytes[..count])?;
-                Ok(false)
-            }
+            Ok(count) => self.append(&bytes[..count], now).map(|()| false),
             Err(error)
                 if matches!(
                     error.kind(),
@@ -112,6 +101,16 @@ impl Transfer {
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn append(&mut self, bytes: &[u8], now: Instant) -> io::Result<()> {
+        self.length += bytes.len() as u64;
+        if self.length > self.limit {
+            return Err(io::ErrorKind::FileTooLarge.into());
+        }
+        self.progress = now;
+        self.nonblank |= bytes.iter().any(|byte| !byte.is_ascii_whitespace());
+        self.data.write_all(bytes)
     }
 
     pub fn finish(mut self) -> io::Result<Received> {
@@ -125,11 +124,11 @@ impl Transfer {
 
 #[cfg(test)]
 mod tests {
-    use super::{Budget, IDLE, Received, TOTAL_BYTES, Transfer};
+    use super::{Budget, IDLE, Received, TOTAL, TOTAL_BYTES, Transfer};
     use rustix::fs::{MemfdFlags, memfd_create};
     use std::{
         fs::File,
-        io::{Seek, Write},
+        io::{Read, Seek, Write},
         sync::Arc,
         time::{Duration, Instant},
     };
@@ -139,6 +138,47 @@ mod tests {
         file.write_all(bytes).unwrap();
         file.rewind().unwrap();
         file
+    }
+
+    #[test]
+    fn nonblocking_reads_preserve_progress_and_total_deadline() {
+        use rustix::pipe::{PipeFlags, pipe_with};
+        let budget = Arc::new(Budget::default());
+        let (read, write) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).unwrap();
+        let mut writer = File::from(write);
+        let mut transfer = Transfer::new(File::from(read), 4, budget.reserve(5).unwrap()).unwrap();
+        let progress = transfer.progress;
+        assert!(!transfer.receive(progress).unwrap()); // WouldBlock is not EOF or progress.
+        assert_eq!(transfer.progress, progress);
+        writer.write_all(b"data").unwrap();
+        assert!(
+            !transfer
+                .receive(progress + Duration::from_millis(1))
+                .unwrap()
+        );
+        drop(writer);
+        assert!(
+            transfer
+                .receive(progress + Duration::from_millis(2))
+                .unwrap()
+        );
+        let Received::Complete(mut file, reservation) = transfer.finish().unwrap() else {
+            panic!("nonblank transfer")
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"data");
+        drop(reservation);
+
+        let mut transfer = Transfer::new(source(b"data"), 4, budget.reserve(5).unwrap()).unwrap();
+        transfer.progress = transfer.started + TOTAL - Duration::from_millis(1);
+        assert_eq!(
+            transfer
+                .receive(transfer.started + TOTAL)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
     }
 
     #[test]
