@@ -471,3 +471,86 @@ dependency references. These are comparable authored-source observations, not a
 complete compiler-expanded inventory or a passing strict partial-evidence gate.
 Coverage was not remeasured. Contribution/conduct/security-policy/changelog warnings
 remain; optional skipped tools are not counted as passes.
+
+## Next five improvements
+
+Fresh baseline: `fa5ef3c` (including the subsequent paste-on-edit feature, which is
+unchanged by this pass). The local RQLens binary and configuration are unchanged.
+Evidence is under `target/next-five-before/`, `target/next-five-after/`,
+`target/next-five-comparison.json` and `target/next-five-allocations.json`.
+
+1. **Shared bounded paging.** `model::paginate` retains only the requested page
+   while exhausting the iterator for totals and per-row effects. Real, fake and
+   native-search paging use it. Real-backend limit clamping stays at its boundary;
+   the fake backend retains its zero-limit semantics. Exhaustion preserves
+   off-page identity bindings, including empty and overflowing-offset requests.
+2. **Infallible search metadata.** Exhaustive `EntryKind` labels replace JSON
+   serialization, a silent binary fallback and manual string slicing during
+   ranking. Ranking no longer returns a synthetic serialization error. A test
+   compares all eight label-derived keywords with their existing wire names;
+   cursor authentication, revision checks and admission ownership are unchanged.
+3. **Transfer state separation.** Pipe polling/deadlines are separate from bounded
+   byte accumulation. A nonblocking-pipe regression checks WouldBlock, progress,
+   EOF/content preservation and the total deadline despite recent progress.
+4. **Simpler conservative artifact scanning.** A bounded while-read loop and
+   optional-path insertion replace nested branches. Regressions distinguish valid
+   32-KiB newline-terminated lines from ambiguous overlong history, and cover
+   invalid UTF-8, comments, duplicate URIs, CRLF and EOF without a final newline.
+5. **Bounded image re-reads.** Echo inspection and annotation publication now reuse
+   `read_path`, which checks both metadata and actual bytes. The former `fs::read`
+   calls could read unbounded data if a file grew after its earlier size check.
+   Missing, oversized and symlink sources are covered; the shared reader's existing
+   growth/bounded-consumption tests also remain. This does not claim to eliminate
+   all filesystem path-replacement races.
+
+### Measurements and trade-offs
+
+| Signal | Before | After |
+| --- | ---: | ---: |
+| Non-test cognitive complexity sum / maximum | 497 / 9 | 492 / 8 |
+| Non-test cyclomatic complexity sum / maximum | 1616 / 16 | 1619 / 15 |
+| Non-test Halstead effort sum / maximum | 3,225,753 / 56,640 | 3,189,793 / 47,473 |
+| Transfer receive effort | 46,628 | 26,220 |
+| Artifact reference-scan cognitive complexity | 9 | 5 |
+| Native search orchestration cyclomatic complexity | 16 | 14 |
+| Minimum / average locality | 82 / 99.3182 | 82 / 99.3182 |
+| Average module leverage | 23.0303 | 23.0303 |
+| Token clones / duplicated lines | 7 / 132 | 7 / 132 |
+| Production explicit clone calls | 83 | 83 |
+| Escape hatches / production reliability findings | 0 / 0 | 0 / 0 |
+| Physical Rust lines, including tests/examples | 10637 | 10793 |
+
+The exhaustive label match adds explicit decisions, so aggregate cyclomatic
+complexity increases despite lower peaks. Five added regression tests account for
+155 of the 156 additional lines; source before inline test modules (excluding the
+benchmark module) is 8552 → 8553 lines. This is **not** a total-size reduction.
+Including tests/benchmarks, cognitive totals are 554 → 559, cyclomatic totals are
+1721 → 1736 and Halstead effort is 4,079,828 → 4,143,780. Production metrics exclude
+qualified names containing `::tests::` or `::benchmarks::`; clone-call counts use
+`.clone()` plus `Arc::clone` before inline test modules. Shared-function reuse
+improves, but the module-level leverage/locality scores do not change.
+
+### Validation
+
+RQLens `verify` reports 16 passing checks with no failed errors;
+four existing project-policy warnings and eight optional skips remain. There are
+**54 passing tests**, with three repeat runs passing, plus the explicitly executed
+opt-in benchmark. Strict all-target/all-feature Clippy, formatting and rustdoc
+pass. All **12 projection benchmark fingerprints and allocation totals** match the
+fresh baseline; no timing speedup is claimed. All **12 backend**, **12 isolated
+capture** and **15 standard nested-desktop** checks pass, including the existing
+paste/edit, annotation and privacy behavior.
+
+Use the focused measurement and validation commands in the preceding section.
+The same macro/cross-file-impl partial-evidence caveat applies. Coverage and the
+previously excluded Shelllist layer-shell, wlr-only, multi-seat, physical-session
+and interactive screenshot UI qualifications were not run. No policy thresholds,
+source exclusions, shared-framework code, production services or user history
+were changed.
+
+Each of the five changes was also checked independently before its separate
+commit, using an archive of the staged tree. The first snapshot hit one transient
+`Text file busy` failure in the unchanged screenshot-selector fixture; its full
+rerun passed. The failure log is retained at
+`target/next-five-commit-1-tests-initial-failure.log`. No test was skipped or
+suppressed to obtain a passing snapshot.

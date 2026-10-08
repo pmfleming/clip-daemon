@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::backend::{BackendError, BackendErrorKind, BackendResult, MAX_WAYLAND_SELECTION_BYTES};
 
-use super::content::{LocalImageSource, image_identity};
+use super::content::{LocalImageSource, image_identity, read_path};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ArtifactRecord {
@@ -293,11 +293,11 @@ fn inline_image_identity(mime: &str, digest: &[u8; 32]) -> String {
 }
 
 fn read_registered_image(source: &LocalImageSource) -> Option<String> {
-    let metadata = source.path.symlink_metadata().ok()?;
-    if !metadata.file_type().is_file() || metadata.len() > MAX_WAYLAND_SELECTION_BYTES {
+    if !source.path.symlink_metadata().ok()?.is_file() {
         return None;
     }
-    let bytes = fs::read(&source.path).ok()?;
+    // Reuse both metadata and actual-byte bounds: the file can grow after stat.
+    let bytes = read_path(&source.path, MAX_WAYLAND_SELECTION_BYTES).ok()?;
     Some(image_identity(source.mime, &bytes))
 }
 
@@ -344,7 +344,41 @@ fn artifact_error(error: impl std::fmt::Display) -> BackendError {
 
 #[cfg(test)]
 mod tests {
-    use super::ArtifactRegistry;
+    use super::{
+        ArtifactRegistry, LocalImageSource, MAX_WAYLAND_SELECTION_BYTES, image_identity,
+        read_registered_image,
+    };
+
+    #[test]
+    fn registered_image_reads_reject_missing_oversized_and_symlink_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        let mut source = LocalImageSource {
+            path: path.clone(),
+            mime: "image/png",
+            dimensions: crate::model::ImageMetadata {
+                width: 1,
+                height: 1,
+            },
+        };
+        assert!(read_registered_image(&source).is_none());
+        std::fs::write(&path, b"image").unwrap();
+        assert_eq!(
+            read_registered_image(&source),
+            Some(image_identity("image/png", b"image"))
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_WAYLAND_SELECTION_BYTES + 1)
+            .unwrap();
+        assert!(read_registered_image(&source).is_none());
+        std::fs::write(&path, b"image").unwrap();
+        source.path = directory.path().join("link.png");
+        std::os::unix::fs::symlink(&path, &source.path).unwrap();
+        assert!(read_registered_image(&source).is_none());
+    }
 
     #[test]
     fn reference_scan_distinguishes_bounded_lines_from_ambiguous_history() {

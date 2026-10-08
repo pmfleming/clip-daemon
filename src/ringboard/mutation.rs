@@ -394,7 +394,7 @@ fn publish_annotation(
     max_bytes: u64,
 ) -> BackendResult<()> {
     let source = backend.details_raw_sync(raw_id, super::MAX_DETAILS_BYTES)?;
-    let bytes = fs::read(output).map_err(operation_error)?;
+    let bytes = read_path(output, max_bytes)?;
     backend
         .artifact_registry()?
         .register_inline_echo(&source.entry.id, "image/png", &bytes)?;
