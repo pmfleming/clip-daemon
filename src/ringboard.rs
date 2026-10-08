@@ -26,7 +26,7 @@ use crate::{
     editor::ImageEditorCommand,
     model::{
         BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
-        ReplacementResult,
+        ReplacementResult, paginate,
     },
     selection::SelectionService,
 };
@@ -225,14 +225,7 @@ impl CachedProjection {
             ..QueryProjection::default()
         };
         let needle = query.query.trim().to_lowercase();
-        let mut matched = 0;
-        let page = query.offset
-            ..query
-                .offset
-                .saturating_add(query.limit.clamp(1, MAX_QUERY_LIMIT));
-        // Visit every candidate for identity bindings and totals, but retain only
-        // the requested page rather than allocating an all-matches vector.
-        projection.entries = self
+        let matches = self
             .candidates
             .iter()
             .filter(|candidate| {
@@ -247,13 +240,10 @@ impl CachedProjection {
                     |matches| matches.contains(&candidate.raw_id),
                 )
             })
-            .enumerate()
-            .filter(|(index, _)| {
-                matched += 1;
-                page.contains(index)
-            })
-            .map(|(_, candidate)| &candidate.resolved.summary)
-            .collect::<Vec<_>>()
+            .map(|candidate| &candidate.resolved.summary);
+        let (page, matched) =
+            paginate(matches, query.offset, query.limit.clamp(1, MAX_QUERY_LIMIT));
+        projection.entries = page
             .into_iter()
             .map(|summary| {
                 let mut summary = summary.clone();

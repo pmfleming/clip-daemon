@@ -14,7 +14,7 @@ use crate::{
     classification::{bounded_preview, classify},
     model::{
         BackendStatus, EntryDetails, EntryThumbnail, HistoryPage, OperationResult,
-        ReplacementResult,
+        ReplacementResult, paginate,
     },
 };
 
@@ -135,25 +135,18 @@ impl ClipboardBackend for FakeBackend {
             .iter()
             .find(|item| item.entry.current)
             .map(|item| item.entry.clone());
-        let matches: Vec<_> = entries
+        let matches = entries
             .iter()
             .map(|item| &item.entry)
-            .filter(|item| needle.is_empty() || item.preview.to_lowercase().contains(&needle))
-            .collect();
-        let matched = matches.len();
-        let page: Vec<_> = matches
-            .into_iter()
-            .skip(query.offset)
-            .take(query.limit)
-            .cloned()
-            .collect();
+            .filter(|item| needle.is_empty() || item.preview.to_lowercase().contains(&needle));
+        let (page, matched) = paginate(matches, query.offset, query.limit);
         let consumed = query.offset.saturating_add(page.len());
         let has_more = matched > consumed;
         Ok(HistoryPage {
             revision: 1,
             generation: query.generation,
             current,
-            entries: page,
+            entries: page.into_iter().cloned().collect(),
             has_more,
             next_offset: has_more.then_some(consumed),
         })

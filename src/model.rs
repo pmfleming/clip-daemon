@@ -35,6 +35,25 @@ pub struct HistoryQuery {
     pub collapse_self_echoes: bool,
 }
 
+/// Retain only the page, but exhaust the input for totals and per-row effects.
+/// The caller supplies its limit policy; zero limits and overflowing offsets
+/// must still visit every row. Items can be borrowed, with no `Clone` bound.
+pub(crate) fn paginate<T>(
+    mut matches: impl Iterator<Item = T>,
+    offset: usize,
+    limit: usize,
+) -> (Vec<T>, usize) {
+    let mut matched = 0;
+    let page = matches
+        .by_ref()
+        .inspect(|_| matched += 1)
+        .skip(offset)
+        .take(limit)
+        .collect();
+    matched += matches.count();
+    (page, matched)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryPage {
     pub revision: u64,
@@ -120,6 +139,30 @@ impl OperationResult {
             message: message.into(),
             path: None,
             warning: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paginate;
+
+    #[test]
+    fn paging_visits_every_row_once_even_with_empty_or_overflowing_pages() {
+        for length in [0, 5] {
+            for offset in [0, 2, 5, usize::MAX] {
+                for limit in [0, 1, 3, usize::MAX] {
+                    let mut visited = Vec::new();
+                    let (page, total) =
+                        paginate((0..length).inspect(|row| visited.push(*row)), offset, limit);
+                    assert_eq!(
+                        page,
+                        (0..length).skip(offset).take(limit).collect::<Vec<_>>()
+                    );
+                    assert_eq!(total, length);
+                    assert_eq!(visited, (0..length).collect::<Vec<_>>());
+                }
+            }
         }
     }
 }

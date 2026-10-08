@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     actions::{ApiError, Backend},
-    model::{EntrySummary, HistoryQuery},
+    model::{EntrySummary, HistoryQuery, paginate},
 };
 
 const MAX_ENTRIES: usize = 5000;
@@ -157,15 +157,9 @@ impl HistorySearch {
         owner: Option<&str>,
         collapse: bool,
     ) -> Result<Value, ApiError> {
-        let total = catalog.entries.len();
         let offset = cursor.offset;
         let token = cursor.token;
-        let page: Vec<_> = catalog
-            .entries
-            .into_iter()
-            .skip(offset)
-            .take(params.limit)
-            .collect();
+        let (page, total) = paginate(catalog.entries.into_iter(), offset, params.limit);
         let consumed = offset + page.len();
         let has_more = consumed < total;
         let next = has_more
