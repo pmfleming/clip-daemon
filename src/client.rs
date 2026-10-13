@@ -2,14 +2,10 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use shelllist_daemon_core::{DaemonEndpoint, MAX_JSONL_REQUEST_BYTES};
 use shelllist_daemon_tokio::{
-    CallFailure, CancelMode, CorrelationPolicy, JsonlClientConfig,
-    run_jsonl_client_with_input_limit,
+    CorrelationPolicy, JsonlClientConfig, run_jsonl_client_with_input_limit,
 };
 
-use crate::{
-    api,
-    daemon::{BUS_NAME, INTERFACE, OBJECT_PATH},
-};
+use crate::daemon::{BUS_NAME, INTERFACE, OBJECT_PATH};
 
 const ENDPOINT: DaemonEndpoint =
     DaemonEndpoint::new("clip-daemon", BUS_NAME, OBJECT_PATH, INTERFACE);
@@ -39,13 +35,6 @@ impl CorrelationPolicy for ClipCorrelation {
                 Some("completed" | "failed" | "cancelled")
             )
     }
-}
-
-fn call_failure(_method: &str, _error: &anyhow::Error) -> CallFailure {
-    CallFailure::Api(api::error(
-        "daemon-unavailable",
-        "clip-daemon session service is unavailable".into(),
-    ))
 }
 
 pub async fn publish(mime: &str, bytes: Vec<u8>) -> Result<()> {
@@ -102,8 +91,6 @@ pub async fn run() -> Result<()> {
         JsonlClientConfig {
             endpoint: ENDPOINT,
             correlation: ClipCorrelation,
-            cancel_mode: CancelMode::Json,
-            call_failure,
             pending_event_limit: 32,
             max_in_flight_requests: 64,
             shutdown_timeout: None,
