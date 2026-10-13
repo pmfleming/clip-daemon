@@ -31,7 +31,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
-zbus = { version = "5", features = ["tokio"] }
+zbus = { version = "5.18", features = ["tokio"] }
 wl-clipboard-rs = "=0.9.3"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }

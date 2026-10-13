@@ -16,7 +16,10 @@
       daemonFramework,
     }:
     let
-      systems = [ "x86_64-linux" ];
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f system nixpkgs.legacyPackages.${system});
     in
     {
@@ -134,32 +137,30 @@
       devShells = forAllSystems (
         system: pkgs: {
           default = pkgs.mkShell {
-            packages = with pkgs; [
-              cargo
-              cargo-audit
-              cargo-machete
-              cargo-llvm-cov
-              clippy
-              dbus
-              ghostty
-              gobject-introspection
-              grim
-              gtk3
-              hyprland
-              jq
-              just
-              llvmPackages.llvm
-              pkg-config
-              (python3.withPackages (ps: [ ps.pygobject3 ]))
-              quickshell
-              self.packages.${system}.ringboard
-              rust-analyzer
-              rustc
-              rustfmt
-              self.packages.${system}.imageEditor
-              wayland-utils
-              wl-clipboard
-            ];
+            packages =
+              (daemonFramework.lib.toolchain pkgs).packages
+              ++ (with pkgs; [
+                cargo-audit
+                cargo-machete
+                cargo-llvm-cov
+                dbus
+                ghostty
+                gobject-introspection
+                grim
+                gtk3
+                hyprland
+                jq
+                just
+                llvmPackages.llvm
+                pkg-config
+                (python3.withPackages (ps: [ ps.pygobject3 ]))
+                quickshell
+                self.packages.${system}.ringboard
+                rust-analyzer
+                self.packages.${system}.imageEditor
+                wayland-utils
+                wl-clipboard
+              ]);
             GI_TYPELIB_PATH = pkgs.lib.makeSearchPath "lib/girepository-1.0" [
               pkgs.gtk3
               pkgs.glib
