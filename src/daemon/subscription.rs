@@ -7,6 +7,10 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use shelllist_daemon_core::{
+    ApiError,
+    wire::{EventBody, Gap},
+};
 use shelllist_daemon_tokio::{BroadcastEvent, forward_broadcast};
 use tokio::{sync::broadcast::error::RecvError, time::MissedTickBehavior};
 use zbus::{names::UniqueName, object_server::SignalEmitter};
@@ -215,11 +219,11 @@ async fn observe_history_tick(
     let update = match update {
         HistoryUpdate::Changed(history_revision) => {
             let revision = event_revision.fetch_add(1, Ordering::Relaxed) + 1;
-            HistoryUpdate::Changed(json!({ "data": {
+            HistoryUpdate::Changed(json!({
                 "revision": revision,
                 "history_revision": history_revision,
                 "change": "reset"
-            } }))
+            }))
         }
         unavailable => unavailable,
     };
@@ -234,9 +238,9 @@ async fn receive_history(
     requested: RequestedStreams,
 ) {
     let initial = match api_service.change_token().await {
-        Ok(token) => HistoryUpdate::Changed(json!({ "data": {
+        Ok(token) => HistoryUpdate::Changed(json!({
             "change": "reset", "reason": "initial", "history_revision": token
-        } })),
+        })),
         Err(error) => HistoryUpdate::Unavailable(error),
     };
     emit_update(&emitter, &subscription_id, requested, initial).await;
@@ -250,7 +254,7 @@ async fn receive_history(
                     &subscription_id,
                     requested,
                     HistoryUpdate::Changed(json!({
-                        "data": { "change": "reset", "reason": "lagged", "skipped": skipped }
+                        "change": "reset", "reason": "lagged", "skipped": skipped.to_string()
                     })),
                 )
                 .await;
@@ -276,7 +280,7 @@ async fn poll_operations(
                     protocol::stream::OPERATION,
                     &event,
                     subscription_id,
-                    Some(json!({ "data": { "operation": operation } })),
+                    Some(EventBody::data(json!({ "operation": operation }))),
                 )
                 .await;
             }
@@ -285,7 +289,7 @@ async fn poll_operations(
                 emit_event(
                     emitter,
                     protocol::stream::OPERATION,
-                    "failed",
+                    "gap",
                     subscription_id,
                     Some(lag_data(skipped)),
                 )
@@ -317,7 +321,7 @@ impl LifecycleSubscription {
             update.stream,
             &update.event,
             &self.id,
-            Some(json!({ "data": update.data })),
+            Some(EventBody::data(update.data)),
         )
         .await;
     }
@@ -338,19 +342,15 @@ impl LifecycleSubscription {
 }
 
 fn lag_event(stream: &str) -> Option<(&str, &'static str)> {
-    let event = match stream {
-        protocol::stream::OPERATION => "failed",
-        protocol::stream::CAPTURE => "changed",
-        protocol::stream::SESSION => "fallback",
-        _ => return None,
-    };
-    Some((stream, event))
+    matches!(
+        stream,
+        protocol::stream::OPERATION | protocol::stream::CAPTURE | protocol::stream::SESSION
+    )
+    .then_some((stream, "gap"))
 }
 
-fn lag_data(skipped: u64) -> Value {
-    json!({
-        "data": { "resync_required": true, "reason": "lagged", "skipped": skipped }
-    })
+fn lag_data(skipped: u64) -> EventBody {
+    EventBody::data(serde_json::to_value(Gap::lagged(skipped)).expect("gap"))
 }
 
 async fn emit_update(
@@ -360,8 +360,15 @@ async fn emit_update(
     update: HistoryUpdate,
 ) {
     let (events, data) = match update {
-        HistoryUpdate::Changed(data) => (("reset", "changed"), data),
-        HistoryUpdate::Unavailable(error) => (("unavailable", "unavailable"), error),
+        HistoryUpdate::Changed(data) => (("reset", "changed"), EventBody::data(data)),
+        HistoryUpdate::Unavailable(error) => (
+            ("unavailable", "unavailable"),
+            EventBody::error(
+                serde_json::from_value(error["error"].clone()).unwrap_or_else(|_| {
+                    ApiError::new("clipboard-unavailable", "Clipboard history unavailable")
+                }),
+            ),
+        ),
     };
     emit_requested(emitter, subscription_id, requested, events, data).await;
 }
@@ -371,7 +378,7 @@ async fn emit_requested(
     subscription_id: &str,
     requested: RequestedStreams,
     events: (&str, &str),
-    data: Value,
+    data: EventBody,
 ) {
     for (enabled, stream, event) in [
         (requested.history, protocol::stream::HISTORY, events.0),

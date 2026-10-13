@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 pub const NAME: &str = "clip-api";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = shelllist_daemon_core::CONTRACT_VERSION as u8;
 
 pub mod stream {
     pub const HISTORY: &str = "clipboard.history.changed";

@@ -227,14 +227,16 @@
           "progress",
           "completed",
           "failed",
-          "cancelled"
+          "cancelled",
+          "gap"
         ],
         "name": "clipboard.operation"
       },
       {
         "events": [
           "subscribed",
-          "changed"
+          "changed",
+          "gap"
         ],
         "name": "clipboard.capture.changed"
       },
@@ -243,12 +245,13 @@
           "subscribed",
           "paste-prepared",
           "completed",
-          "fallback"
+          "fallback",
+          "gap"
         ],
         "name": "clipboard.session"
       }
     ],
-    "version": 1
+    "version": 2
   },
-  "version": 1
+  "version": 2
 }

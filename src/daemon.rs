@@ -14,7 +14,7 @@ mod subscription;
 
 pub const BUS_NAME: &str = "org.laufan.ClipDaemon";
 pub const OBJECT_PATH: &str = "/org/laufan/ClipDaemon";
-pub const INTERFACE: &str = "org.laufan.ClipDaemon1";
+pub const INTERFACE: &str = "org.laufan.ClipDaemon2";
 
 pub struct ClipDaemon {
     api: Arc<ApiService>,
@@ -22,7 +22,7 @@ pub struct ClipDaemon {
     subscriptions: Arc<OwnedTaskRegistry>,
 }
 
-#[zbus::interface(name = "org.laufan.ClipDaemon1")]
+#[zbus::interface(name = "org.laufan.ClipDaemon2")]
 impl ClipDaemon {
     async fn call(
         &self,
@@ -100,16 +100,16 @@ async fn emit_event(
     stream: &str,
     event: &str,
     subscription_id: &str,
-    extra: Option<Value>,
+    body: Option<shelllist_daemon_core::wire::EventBody>,
 ) {
-    let result = shelllist_daemon_tokio::emit_json_event(
+    let result = shelllist_daemon_tokio::emit_event_body(
         emitter,
         INTERFACE,
         shelllist_daemon_core::ApiIdentity::new(api::PROTOCOL, api::VERSION as u32),
         stream,
         event,
         shelllist_daemon_core::Correlation::Subscription(subscription_id),
-        extra.unwrap_or(Value::Null),
+        body.unwrap_or_else(|| shelllist_daemon_core::wire::EventBody::data(json!({}))),
     )
     .await;
     if let Err(error) = result {
