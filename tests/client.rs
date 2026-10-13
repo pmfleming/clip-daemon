@@ -45,7 +45,7 @@ fn escaped_clipboard_text_can_exceed_the_small_rpc_frame_default() {
         .unwrap();
     assert_eq!(response["route"], request["route"]);
     assert_eq!(
-        response["response"]["error"]["code"], "daemon-unavailable",
+        response["outcome"], "rejected-before-dispatch",
         "The frame must reach the transport, never a real clipboard service"
     );
 }
@@ -57,7 +57,7 @@ fn routed_client_churn_preserves_addresses_and_drains_after_eof() {
 
     const REQUESTS: usize = 4000;
     // Exercise the real binary and framing without contacting the user's
-    // clipboard service. API-unavailable and overload replies must both route.
+    // clipboard service. Pre-dispatch rejection and overload replies must both route.
     let mut child = Command::new(env!("CARGO_BIN_EXE_clip-daemon"))
         .arg("client")
         .env(
