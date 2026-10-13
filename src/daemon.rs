@@ -17,6 +17,7 @@ pub const OBJECT_PATH: &str = "/org/laufan/ClipDaemon";
 pub const INTERFACE: &str = "org.laufan.ClipDaemon2";
 
 pub struct ClipDaemon {
+    boundary: shelllist_daemon_tokio::ServiceBoundary,
     api: Arc<ApiService>,
     history_events: tokio::sync::broadcast::Sender<subscription::HistoryUpdate>,
     subscriptions: Arc<OwnedTaskRegistry>,
@@ -30,6 +31,14 @@ impl ClipDaemon {
         params_json: &str,
         #[zbus(header)] header: Header<'_>,
     ) -> String {
+        let admitted =
+            match self
+                .boundary
+                .call(header.sender().map(|s| s.as_str()), method, params_json)
+            {
+                Ok(admitted) => admitted,
+                Err(response) => return response,
+            };
         let params: Value = match serde_json::from_str(params_json) {
             Ok(value) => value,
             Err(error) => {
@@ -37,10 +46,12 @@ impl ClipDaemon {
                     .to_string();
             }
         };
-        self.api
-            .dispatch_owned(method, params, header.sender().map(ToString::to_string))
-            .await
-            .to_string()
+        admitted.encode(
+            &self
+                .api
+                .dispatch_owned(method, params, header.sender().map(ToString::to_string))
+                .await,
+        )
     }
 
     async fn subscribe(
@@ -49,6 +60,13 @@ impl ClipDaemon {
         #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> String {
+        let admitted = match self
+            .boundary
+            .subscribe(header.sender().map(|s| s.as_str()), &streams)
+        {
+            Ok(admitted) => admitted,
+            Err(response) => return response,
+        };
         let Some(owner) = header.sender().map(|sender| sender.to_owned()) else {
             return api::error(
                 "subscription-unavailable",
@@ -56,15 +74,35 @@ impl ClipDaemon {
             )
             .to_string();
         };
-        subscription::start(self, streams, owner, emitter).await
+        admitted.encoded(subscription::start(self, streams, owner, emitter).await)
     }
 
     /// Publish raw bytes while keeping Wayland selection ownership in the daemon.
-    async fn publish(&self, mime: &str, bytes: Vec<u8>) -> String {
-        self.api.publish_selection(mime, bytes).await.to_string()
+    async fn publish(
+        &self,
+        mime: &str,
+        bytes: Vec<u8>,
+        #[zbus(header)] header: Header<'_>,
+    ) -> String {
+        let admitted =
+            match self
+                .boundary
+                .raw(header.sender().map(|s| s.as_str()), mime, bytes.len())
+            {
+                Ok(admitted) => admitted,
+                Err(response) => return response,
+            };
+        admitted.encode(&self.api.publish_selection(mime, bytes).await)
     }
 
     async fn cancel(&self, request_id: &str, #[zbus(header)] header: Header<'_>) -> String {
+        let _admitted = match self
+            .boundary
+            .cancel(header.sender().map(|s| s.as_str()), request_id)
+        {
+            Ok(admitted) => admitted,
+            Err(response) => return response,
+        };
         let owner = header.sender().map(ToString::to_string);
         if self
             .subscriptions
@@ -146,6 +184,14 @@ async fn serve(api: Arc<ApiService>) -> Result<()> {
     );
     let subscriptions = Arc::new(OwnedTaskRegistry::default());
     let daemon = ClipDaemon {
+        // Large clipboard bodies are intentional; bound their concurrency as well.
+        boundary: shelllist_daemon_tokio::ServiceBoundary::with_limits(
+            shelllist_daemon_core::ApiIdentity::new(api::PROTOCOL, api::VERSION as u32),
+            4,
+            16,
+            shelllist_daemon_core::MAX_JSONL_REQUEST_BYTES,
+            shelllist_daemon_core::MAX_JSONL_REQUEST_BYTES,
+        ),
         api: api.clone(),
         history_events,
         subscriptions: Arc::clone(&subscriptions),
