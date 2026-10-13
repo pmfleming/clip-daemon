@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
-use shelllist_daemon_core::DaemonEndpoint;
+use shelllist_daemon_core::{DaemonEndpoint, MAX_JSONL_REQUEST_BYTES};
 use shelllist_daemon_tokio::{
-    CallFailure, CancelMode, CorrelationPolicy, JsonlClientConfig, run_jsonl_client,
+    CallFailure, CancelMode, CorrelationPolicy, JsonlClientConfig,
+    run_jsonl_client_with_input_limit,
 };
 
 use crate::{
@@ -95,15 +96,20 @@ pub async fn screenshot(screen: bool, annotate: bool) -> Result<()> {
 }
 
 pub async fn run() -> Result<()> {
-    run_jsonl_client(JsonlClientConfig {
-        endpoint: ENDPOINT,
-        correlation: ClipCorrelation,
-        cancel_mode: CancelMode::Json,
-        call_failure,
-        pending_event_limit: 32,
-        max_in_flight_requests: 64,
-        shutdown_timeout: None,
-    })
+    // Text publication supports large selections, and JSON escaping can expand
+    // the default 16 MiB selection sixfold. Do not apply the small RPC default.
+    run_jsonl_client_with_input_limit(
+        JsonlClientConfig {
+            endpoint: ENDPOINT,
+            correlation: ClipCorrelation,
+            cancel_mode: CancelMode::Json,
+            call_failure,
+            pending_event_limit: 32,
+            max_in_flight_requests: 64,
+            shutdown_timeout: None,
+        },
+        MAX_JSONL_REQUEST_BYTES,
+    )
     .await
 }
 
