@@ -142,6 +142,7 @@
                 cargo-llvm-cov
                 dbus
                 ghostty
+                git
                 gobject-introspection
                 grim
                 gtk3
