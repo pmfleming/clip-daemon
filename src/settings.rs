@@ -38,7 +38,7 @@ pub(crate) struct RetentionState {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ClipboardSettings {
     pub max_entries: u32,
@@ -80,11 +80,10 @@ impl SettingsUpdate {
                 value.max_entry_bytes,
                 64 * 1024..=512 * 1024 * 1024,
             )?,
-            capture_paused: value.capture_paused,
-            private_mode: value.private_mode,
             collapse_self_echoes: self
                 .collapse_self_echoes
                 .unwrap_or(value.collapse_self_echoes),
+            ..*value
         })
     }
 }
@@ -156,7 +155,7 @@ impl SettingsManager {
     /// Legacy booleans never assert privacy unless service state is verified.
     pub fn get(&self) -> Result<ClipboardSettings, String> {
         let state = self.validated_state()?;
-        let mut settings = state.value.clone();
+        let mut settings = state.value;
         if !state.capture_verified {
             settings.capture_paused = false;
             settings.private_mode = false;
@@ -165,7 +164,7 @@ impl SettingsManager {
     }
 
     fn preferences(&self) -> Result<ClipboardSettings, String> {
-        Ok(self.validated_state()?.value.clone())
+        Ok(self.validated_state()?.value)
     }
 
     fn lock_state(&self, error: &str) -> Result<MutexGuard<'_, SettingsState>, String> {
@@ -297,7 +296,7 @@ impl SettingsManager {
         }
         state.value = value;
         state.load_error = None;
-        Ok(state.value.clone())
+        Ok(value)
     }
 
     pub async fn set_paused(
@@ -594,7 +593,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{ClipboardSettings, SettingsManager, SettingsState, load_settings};
+    use super::{ClipboardSettings, SettingsManager, SettingsState, SettingsUpdate, load_settings};
 
     fn manager(path: Option<std::path::PathBuf>) -> (SettingsManager, Arc<MockServices>) {
         let services = Arc::new(MockServices::default());
@@ -704,6 +703,38 @@ mod tests {
         assert!(!state.verified);
         assert!(!state.private_mode);
         assert!(!state.desired_paused);
+    }
+
+    #[test]
+    fn settings_updates_preserve_capture_preferences_and_previous_snapshots() {
+        let previous = ClipboardSettings {
+            capture_paused: true,
+            private_mode: true,
+            ..ClipboardSettings::default()
+        };
+        let updated = SettingsUpdate {
+            max_entries: Some(42),
+            collapse_self_echoes: Some(false),
+            ..SettingsUpdate::default()
+        }
+        .apply(&previous)
+        .unwrap();
+        assert_eq!(
+            updated,
+            ClipboardSettings {
+                max_entries: 42,
+                collapse_self_echoes: false,
+                ..previous
+            }
+        );
+        assert_eq!(
+            previous,
+            ClipboardSettings {
+                capture_paused: true,
+                private_mode: true,
+                ..ClipboardSettings::default()
+            }
+        );
     }
 
     #[test]
