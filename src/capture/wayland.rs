@@ -2,7 +2,7 @@
 use std::{
     collections::HashMap,
     fs::File,
-    os::fd::AsFd,
+    os::fd::{AsFd, BorrowedFd},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -301,28 +301,66 @@ pub(super) fn run(session: Arc<Session>, skip_initial: bool) -> Result<(), Strin
         let Some(guard) = queue.prepare_read() else {
             continue;
         };
-        if wait_readable(&connection, &state.transfers)? {
+        if wait_readable(
+            &connection,
+            state
+                .transfers
+                .iter()
+                .map(|receiving| receiving.transfer.as_fd()),
+        )? {
             guard.read().map_err(|_| "Wayland capture disconnected")?;
         }
     }
     Ok(())
 }
 
-fn wait_readable(connection: &Connection, transfers: &[Receiving]) -> Result<bool, String> {
-    let mut fds = vec![PollFd::new(connection, PollFlags::IN)];
-    fds.extend(
-        transfers
-            .iter()
-            .map(|receiving| PollFd::new(&receiving.transfer, PollFlags::IN)),
-    );
+fn wait_readable<'fd>(
+    connection: &'fd impl AsFd,
+    transfers: impl IntoIterator<Item = BorrowedFd<'fd>>,
+) -> Result<bool, String> {
+    // One connection plus the bounded in-flight transfers; no per-tick heap allocation.
+    let mut fds: [_; MAX_TRANSFERS + 1] =
+        std::array::from_fn(|_| PollFd::new(connection, PollFlags::IN));
+    let mut count = 1;
+    for fd in transfers {
+        let slot = fds
+            .get_mut(count)
+            .ok_or("Too many capture transfers to poll")?;
+        *slot = PollFd::from_borrowed_fd(fd, PollFlags::IN);
+        count += 1;
+    }
     let timeout = Timespec {
         tv_sec: 0,
         tv_nsec: 25_000_000,
     };
-    match poll(&mut fds, Some(&timeout)) {
+    match poll(&mut fds[..count], Some(&timeout)) {
         Ok(_) => Ok(!fds[0].revents().is_empty()),
         Err(rustix::io::Errno::INTR) => Ok(false),
         Err(_) => Err("Wayland capture poll failed".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_TRANSFERS, wait_readable};
+    use rustix::pipe::{PipeFlags, pipe_with};
+    use std::{fs::File, io::Write, os::fd::AsFd};
+
+    #[test]
+    fn bounded_poll_distinguishes_transfer_readiness_without_allocating() {
+        let (source, writer) = pipe_with(PipeFlags::CLOEXEC).unwrap();
+        let mut writer = File::from(writer);
+        let (transfer, transfer_writer) = pipe_with(PipeFlags::CLOEXEC).unwrap();
+        File::from(transfer_writer).write_all(b"ready").unwrap();
+        let transfers = [transfer.as_fd(); MAX_TRANSFERS];
+        let allocations = allocation_counter::measure(|| {
+            assert!(!wait_readable(&source, transfers).unwrap());
+            writer.write_all(b"ready").unwrap();
+            assert!(wait_readable(&source, transfers).unwrap());
+            assert!(wait_readable(&source, []).unwrap());
+        });
+        assert_eq!(allocations.count_total, 0);
+        assert!(wait_readable(&source, [transfer.as_fd(); MAX_TRANSFERS + 1]).is_err());
     }
 }
 
