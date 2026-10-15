@@ -37,17 +37,17 @@ impl Matcher {
         matched + usize::from(byte == self.needle[matched])
     }
 
-    fn feed(&self, text: &str, matched: &mut usize, found: &mut bool) {
+    fn feed(&self, text: &str, matched: &mut usize) -> bool {
         for character in text.chars().flat_map(char::to_lowercase) {
             let mut encoded = [0; 4];
             for &byte in character.encode_utf8(&mut encoded).as_bytes() {
                 *matched = self.advance(*matched, byte);
                 if *matched == self.needle.len() {
-                    *found = true;
-                    *matched = self.fallback[*matched - 1];
+                    return true;
                 }
             }
         }
+        false
     }
 
     pub fn contains(&self, mut source: impl Read) -> io::Result<bool> {
@@ -70,8 +70,8 @@ impl Matcher {
             let Some(valid) = utf8_prefix(&buffer[..end]) else {
                 return Ok(false);
             };
-            // A match is not success until the entire input is valid UTF-8.
-            self.feed(valid, &mut matched, &mut found);
+            // Stop matching after a hit, but validate UTF-8 and I/O through EOF.
+            found = found || self.feed(valid, &mut matched);
             carry = end - valid.len();
             buffer.copy_within(end - carry..end, 0);
         }
@@ -154,6 +154,9 @@ mod tests {
                 fold(&long).contains(&fold(needle))
             );
         }
+        let mut invalid_tail = long.into_bytes();
+        invalid_tail.push(0xff);
+        assert!(!Matcher::new("école").contains(&invalid_tail[..]).unwrap());
         let failure = &b"match"[..];
         // An I/O failure after a match must still propagate.
         struct Failure;
