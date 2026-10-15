@@ -136,6 +136,14 @@ impl Error for BackendError {}
 
 pub type BackendResult<T> = Result<T, BackendError>;
 
+pub(crate) fn invalid_data(message: &'static str) -> BackendError {
+    BackendError::new(BackendErrorKind::InvalidData, message)
+}
+
+pub(crate) fn operation_error(error: impl fmt::Display) -> BackendError {
+    BackendError::new(BackendErrorKind::OperationFailed, error.to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendMutation {
     Restore { max_bytes: u64 },

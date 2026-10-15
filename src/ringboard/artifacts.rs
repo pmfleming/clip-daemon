@@ -12,7 +12,9 @@ use shelllist_daemon_core::{XdgRoot, resolve_xdg_root};
 use url::Url;
 use uuid::Uuid;
 
-use crate::backend::{BackendError, BackendErrorKind, BackendResult, MAX_WAYLAND_SELECTION_BYTES};
+use crate::backend::{
+    BackendResult, MAX_WAYLAND_SELECTION_BYTES, operation_error as artifact_error,
+};
 
 use super::content::{LocalImageSource, image_identity, read_path};
 
@@ -338,16 +340,13 @@ fn unix_time() -> u64 {
         .unwrap_or_default()
 }
 
-fn artifact_error(error: impl std::fmt::Display) -> BackendError {
-    BackendError::new(BackendErrorKind::OperationFailed, error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         ArtifactRegistry, LocalImageSource, MAX_WAYLAND_SELECTION_BYTES, image_identity,
         read_registered_image,
     };
+    use crate::classification::INSPECTION_LIMIT;
 
     #[test]
     fn registered_image_reads_reject_missing_oversized_and_symlink_sources() {
@@ -442,7 +441,7 @@ mod tests {
         let restored = ArtifactRegistry::load(None, Some(manifest));
         assert_eq!(echo(&restored, "captured-echo"), Some("replacement".into()));
 
-        let large = vec![7; super::super::INSPECTION_LIMIT + 10];
+        let large = vec![7; INSPECTION_LIMIT + 10];
         registry
             .register_inline_echo("large-replacement", "image/png", &large)
             .unwrap();
@@ -459,11 +458,7 @@ mod tests {
         );
         assert!(
             registry
-                .match_inline_echo(
-                    "image/png",
-                    &digest(&large[..super::super::INSPECTION_LIMIT]),
-                    "prefix"
-                )
+                .match_inline_echo("image/png", &digest(&large[..INSPECTION_LIMIT]), "prefix")
                 .is_none()
         );
     }

@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::{BufReader, Read, Seek, SeekFrom},
     os::unix::fs::MetadataExt,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
@@ -19,10 +18,9 @@ use url::Url;
 use crate::{
     backend::{
         BackendError, BackendErrorKind, BackendMutation, BackendResult, ClipboardBackend,
-        EntryTarget, FileSelection, HistoryQuery, MAX_FILES, MAX_QUERY_LIMIT,
-        MAX_WAYLAND_SELECTION_BYTES, ScreenshotRegion,
+        EntryTarget, FileSelection, HistoryQuery, MAX_FILES, MAX_QUERY_LIMIT, ScreenshotRegion,
+        invalid_data, operation_error as operation_failed,
     },
-    classification::{INSPECTION_LIMIT, bounded_preview},
     editor::ImageEditorCommand,
     model::{
         BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
@@ -44,10 +42,7 @@ mod search;
 use operation::Operations;
 
 use artifacts::ArtifactRegistry;
-use content::{
-    MAX_THUMBNAIL_BYTES, ResolvedContent, create_resolved_thumbnail, invalid_entry,
-    prune_thumbnails, read_bounded,
-};
+use content::{entry_details, prune_thumbnails};
 
 const MAX_DETAILS_BYTES: usize = 256 * 1024;
 
@@ -90,10 +85,11 @@ struct IdentityBinding {
 impl SummaryCache {
     fn select_token(&mut self, token: u64) {
         if self.token != Some(token) {
-            self.projection = None;
-            self.search = None;
+            *self = Self {
+                token: Some(token),
+                ..Self::default()
+            };
         }
-        self.token = Some(token);
     }
 }
 
@@ -136,11 +132,12 @@ impl QueryCandidate {
         let entry = database
             .get_raw(self.raw_id)
             .map_err(|_| BackendError::stale("History changed during search"))?;
-        let unreadable = |_| invalid_entry("Could not search clipboard entry");
-        let mut file = entry.to_file(reader).map_err(unreadable)?;
+        let mut file = entry
+            .to_file(reader)
+            .map_err(|_| invalid_data("Could not search clipboard entry"))?;
         matcher
             .contains(&mut *file)
-            .map_err(|_| invalid_entry("Could not search clipboard entry"))
+            .map_err(|_| invalid_data("Could not search clipboard entry"))
     }
 
     fn collapsed_source(&self, collapse_echoes: bool, ids: &HashSet<&str>) -> Option<&str> {
@@ -357,46 +354,6 @@ impl RingboardBackend {
         Err(BackendError::stale(message))
     }
 
-    fn summarize(&self, entry: Entry, reader: &mut EntryReader) -> BackendResult<ResolvedEntry> {
-        let (mut loaded, metadata) = load_entry(entry, reader)?;
-        let byte_size = metadata.len();
-        let stored_mime = stored_mime_type(&loaded)?;
-        let (bytes, content_digest) = inspect_entry(&mut *loaded, byte_size)?;
-        let content = ResolvedContent::resolve(&stored_mime, &bytes, MAX_WAYLAND_SELECTION_BYTES);
-        let fingerprint = entry_fingerprint(entry.id(), byte_size, content.mime(), &content_digest);
-        let id = opaque_id(&fingerprint);
-        let (generated_paths, echo_source_id, inline_echo_source) = {
-            let registry = self.artifact_registry()?;
-            loaded
-                .seek(SeekFrom::Start(0))
-                .map_err(|_| invalid_entry("Could not inspect artifact references"))?;
-            let generated_paths = registry.references_in(BufReader::new(&mut *loaded))?;
-            let echo_source_id = content
-                .local_image()
-                .and_then(|source| registry.match_local_image(source));
-            let inline_echo_source =
-                matches!(content.image(), Some(content::ResolvedImage::Inline { .. }))
-                    .then(|| registry.match_inline_echo(content.mime(), &content_digest, &id))
-                    .flatten();
-            (generated_paths, echo_source_id, inline_echo_source)
-        };
-        Ok(ResolvedEntry {
-            summary: EntrySummary {
-                revision: entry_revision(&fingerprint),
-                id,
-                kind: content.kind(),
-                mime: content.mime().to_owned(),
-                byte_size,
-                favorite: entry.ring() == RingKind::Favorites,
-                current: false,
-                preview: bounded_preview(&bytes, INSPECTION_LIMIT),
-            },
-            proof: ipc::content_proof(&content_digest, &stored_mime),
-            generated_paths,
-            echo_source_id: echo_source_id.or(inline_echo_source),
-        })
-    }
-
     fn read_summary(
         &self,
         entry: Entry,
@@ -482,24 +439,6 @@ impl RingboardBackend {
         entry_details(entry, reader, summary, max_text_bytes)
     }
 
-    fn thumbnail_sync(
-        &self,
-        opaque_id: &str,
-        expected_revision: Option<u64>,
-        edge: u32,
-    ) -> BackendResult<EntryThumbnail> {
-        let (entry, mut reader, summary) = self.selected(opaque_id, expected_revision)?;
-        let mut loaded = entry
-            .to_file(&mut reader)
-            .map_err(|_| invalid_entry("Could not open clipboard image"))?;
-        let bytes = read_bounded(&mut loaded, INSPECTION_LIMIT)?;
-        loaded
-            .seek(SeekFrom::Start(0))
-            .map_err(|_| invalid_entry("Could not rewind clipboard image"))?;
-        let content = ResolvedContent::resolve(&summary.mime, &bytes, MAX_THUMBNAIL_BYTES);
-        create_resolved_thumbnail(&loaded, &content, &summary, edge)
-    }
-
     fn mutate_sync(
         &self,
         opaque_id: &str,
@@ -572,10 +511,7 @@ impl RingboardBackend {
 
     fn clear_identity_state(&self) -> BackendResult<()> {
         self.ids.lock().map_err(|_| lock_error())?.clear();
-        let mut cache = self.summaries.lock().map_err(|_| lock_error())?;
-        cache.token = None;
-        cache.projection = None;
-        cache.search = None;
+        *self.summaries.lock().map_err(|_| lock_error())? = SummaryCache::default();
         Ok(())
     }
 
@@ -850,30 +786,6 @@ impl ClipboardBackend for RingboardBackend {
     }
 }
 
-fn entry_details(
-    entry: Entry,
-    mut reader: EntryReader,
-    summary: EntrySummary,
-    max_text_bytes: usize,
-) -> BackendResult<EntryDetails> {
-    let mut loaded = entry
-        .to_file(&mut reader)
-        .map_err(|_| invalid_entry("Could not open clipboard details"))?;
-    let limit = max_text_bytes.min(MAX_DETAILS_BYTES);
-    let mut bytes = read_bounded(&mut loaded, limit.saturating_add(1))?;
-    let truncated = bytes.len() > limit;
-    bytes.truncate(limit);
-    let text = std::str::from_utf8(&bytes).ok().map(str::to_owned);
-    let content = ResolvedContent::resolve(&summary.mime, &bytes, MAX_THUMBNAIL_BYTES);
-    Ok(EntryDetails {
-        entry: summary,
-        text,
-        files: content.files().to_vec(),
-        image: content.image_metadata(),
-        preview_truncated: truncated,
-    })
-}
-
 async fn run_blocking<T>(
     work: impl FnOnce() -> BackendResult<T> + Send + 'static,
 ) -> BackendResult<T>
@@ -898,17 +810,17 @@ fn stored_mime_type(loaded: &LoadedEntry<'_, File>) -> BackendResult<String> {
         return loaded
             .mime_type()
             .map(|mime| mime.as_str().to_owned())
-            .map_err(|_| invalid_entry("Could not read clipboard MIME metadata"));
+            .map_err(|_| invalid_data("Could not read clipboard MIME metadata"));
     };
     let mut bytes = [0_u8; 255];
     let length = match rustix::fs::fgetxattr(file, c"user.mime_type", &mut bytes[..]) {
         Ok(length) => length,
         Err(rustix::io::Errno::NODATA) => return Ok(String::new()),
-        Err(_) => return Err(invalid_entry("Could not read clipboard MIME metadata")),
+        Err(_) => return Err(invalid_data("Could not read clipboard MIME metadata")),
     };
     std::str::from_utf8(&bytes[..length])
         .map(str::to_owned)
-        .map_err(|_| invalid_entry("Clipboard MIME metadata is not valid UTF-8"))
+        .map_err(|_| invalid_data("Clipboard MIME metadata is not valid UTF-8"))
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -993,10 +905,10 @@ fn load_entry(
 ) -> BackendResult<(LoadedEntry<'_, File>, fs::Metadata)> {
     let loaded = entry
         .to_file(reader)
-        .map_err(|_| invalid_entry("Could not open clipboard entry"))?;
+        .map_err(|_| invalid_data("Could not open clipboard entry"))?;
     let metadata = loaded
         .metadata()
-        .map_err(|_| invalid_entry("Could not read clipboard entry metadata"))?;
+        .map_err(|_| invalid_data("Could not read clipboard entry metadata"))?;
     Ok((loaded, metadata))
 }
 
@@ -1017,10 +929,6 @@ fn file_label(count: usize) -> &'static str {
     if count == 1 { "file" } else { "files" }
 }
 
-fn invalid_data(message: &'static str) -> BackendError {
-    BackendError::new(BackendErrorKind::InvalidData, message)
-}
-
 fn matches_query(summary: &EntrySummary, needle: &str) -> bool {
     needle.is_empty()
         || summary.preview.to_lowercase().contains(needle)
@@ -1031,39 +939,10 @@ fn lock_error() -> BackendError {
     operation_failed("Clipboard backend state is unavailable")
 }
 
-fn operation_failed(message: &'static str) -> BackendError {
-    BackendError::new(BackendErrorKind::OperationFailed, message)
-}
-
 fn content_hasher() -> Sha256 {
     let mut hash = Sha256::new();
     hash.update(b"clip-daemon:entry-content:v1:");
     hash
-}
-
-fn inspect_entry(source: &mut impl Read, expected_size: u64) -> BackendResult<(Vec<u8>, [u8; 32])> {
-    let preview_capacity = usize::try_from(expected_size)
-        .unwrap_or(usize::MAX)
-        .min(INSPECTION_LIMIT);
-    let mut preview = Vec::with_capacity(preview_capacity);
-    let mut hasher = content_hasher();
-    let read_error = |_| invalid_entry("Could not read clipboard entry");
-    source
-        .by_ref()
-        .take(INSPECTION_LIMIT as u64)
-        .read_to_end(&mut preview)
-        .map_err(read_error)?;
-    hasher.update(&preview);
-    let remaining = std::io::copy(source, &mut hasher).map_err(read_error)?;
-    let actual_size = remaining
-        .checked_add(preview.len() as u64)
-        .ok_or_else(|| invalid_entry("Clipboard entry size is invalid"))?;
-    if actual_size != expected_size {
-        return Err(BackendError::stale(
-            "Clipboard entry changed while its identity was calculated",
-        ));
-    }
-    Ok((preview, hasher.finalize().into()))
 }
 
 fn entry_fingerprint(raw_id: u64, size: u64, mime: &str, content_digest: &[u8; 32]) -> [u8; 32] {
@@ -1090,10 +969,7 @@ fn entry_revision(fingerprint: &[u8; 32]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CachedProjection, MAX_SAFE_JSON_INTEGER, QueryCandidate, ResolvedEntry, entry_fingerprint,
-        entry_revision, inspect_entry, opaque_id,
-    };
+    use super::{CachedProjection, QueryCandidate, ResolvedEntry};
     use crate::{
         backend::HistoryQuery,
         model::{EntryKind, EntrySummary},
@@ -1194,48 +1070,5 @@ mod tests {
             orphan.project(&query("", 0, 10, true)).entries[0].id,
             "echo"
         );
-    }
-
-    fn fingerprint(raw_id: u64, mime: &str, bytes: &[u8]) -> [u8; 32] {
-        let split = bytes.len().min(crate::classification::INSPECTION_LIMIT);
-        let source = std::io::Read::chain(&bytes[..split], InterruptOnce(true, &bytes[split..]));
-        let (preview, digest) = inspect_entry(&mut InterruptOnce(true, source), bytes.len() as u64)
-            .expect("fingerprint fixture");
-        assert_eq!(preview, bytes[..split]);
-        entry_fingerprint(raw_id, bytes.len() as u64, mime, &digest)
-    }
-
-    struct InterruptOnce<R>(bool, R);
-
-    impl<R: std::io::Read> std::io::Read for InterruptOnce<R> {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            if std::mem::take(&mut self.0) {
-                return Err(std::io::ErrorKind::Interrupted.into());
-            }
-            self.1.read(buffer)
-        }
-    }
-
-    #[test]
-    fn entry_identity_covers_full_content_and_preserves_js_safe_revisions() {
-        assert_ne!(
-            fingerprint(42, "text/plain", b""),
-            fingerprint(42, "text/plain", b"a")
-        );
-        let mut first = vec![b'a'; crate::classification::INSPECTION_LIMIT + 1];
-        let mut second = first.clone();
-        first[crate::classification::INSPECTION_LIMIT] = b'x';
-        second[crate::classification::INSPECTION_LIMIT] = b'y';
-
-        let identity = fingerprint(42, "text/plain", &first);
-        let changed = fingerprint(42, "text/plain", &second);
-        assert_ne!(identity, changed);
-        assert_eq!(identity, fingerprint(42, "text/plain", &first));
-        assert_ne!(identity, fingerprint(43, "text/plain", &first));
-        assert_ne!(opaque_id(&identity), opaque_id(&changed));
-        assert_ne!(entry_revision(&identity), entry_revision(&changed));
-        assert!(entry_revision(&[u8::MAX; 32]) <= MAX_SAFE_JSON_INTEGER);
-        assert!(inspect_entry(&mut &b"abc"[..], 2).is_err());
-        assert!(inspect_entry(&mut &b"abc"[..], 4).is_err());
     }
 }

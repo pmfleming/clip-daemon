@@ -274,11 +274,11 @@ async fn poll_operations(
     forward_broadcast(events, move |update| async move {
         match update {
             BroadcastEvent::Item(operation) => {
-                let event = operation.status.clone();
+                let event = &operation.status;
                 emit_event(
                     emitter,
                     protocol::stream::OPERATION,
-                    &event,
+                    event,
                     subscription_id,
                     Some(EventBody::data(json!({ "operation": operation }))),
                 )
@@ -350,7 +350,11 @@ fn lag_event(stream: &str) -> Option<(&str, &'static str)> {
 }
 
 fn lag_data(skipped: u64) -> EventBody {
-    EventBody::data(serde_json::to_value(Gap::lagged(skipped)).expect("gap"))
+    serde_json::to_value(Gap::lagged(skipped))
+        .map(EventBody::data)
+        .unwrap_or_else(|error| {
+            EventBody::error(ApiError::new("serialization-failed", error.to_string()))
+        })
 }
 
 async fn emit_update(
@@ -394,7 +398,19 @@ async fn emit_requested(
 mod tests {
     use serde_json::json;
 
-    use super::{HistoryState, HistoryUpdate};
+    use super::{HistoryState, HistoryUpdate, lag_data};
+
+    #[test]
+    fn lag_counts_preserve_u64_precision_on_the_wire() {
+        let body = lag_data(u64::MAX);
+        assert_eq!(
+            body.data,
+            json!({
+                "reason": "subscriber-lag", "dropped_events": u64::MAX.to_string()
+            })
+        );
+        assert!(body.error.is_none());
+    }
 
     #[test]
     fn history_state_emits_initial_changes_outages_and_recovery_once() {

@@ -15,7 +15,7 @@ use crate::{
     backend::{
         BackendError, BackendErrorKind, BackendMutation, ClipboardBackend, EntryTarget,
         FileSelection, FileSelectionOperation, HistoryQuery, MAX_FILES, MAX_QUERY_LIMIT,
-        ScreenshotRegion,
+        ScreenshotRegion, invalid_data as invalid,
     },
     model::{EntryDetails, EntryKind, FilePreview, OperationResult},
     session::SessionManager,
@@ -341,11 +341,7 @@ impl ClipboardService {
             .session_id
             .as_deref()
             .ok_or_else(|| ApiError::validation("session_id is required for paste"))?;
-        let has_target = self
-            .sessions
-            .validate_paste(session_id)
-            .await
-            .map_err(stale_target)?;
+        let has_target = self.validate_paste(Some(session_id)).await?;
         let mutation = required_mutation(&params.action, max_entry_bytes)?;
         let mut operation = self
             .backend
@@ -357,6 +353,13 @@ impl ClipboardService {
         operation.message = feedback.1.into();
         operation.action = params.action;
         Ok(json!({ "operation": operation }))
+    }
+
+    async fn validate_paste(&self, session_id: Option<&str>) -> Result<bool, ApiError> {
+        match session_id {
+            Some(id) => self.sessions.validate_paste(id).await.map_err(stale_target),
+            None => Ok(false),
+        }
     }
 
     async fn begin_edit(&self, params: EntryParams) -> Result<Value, ApiError> {
@@ -385,36 +388,17 @@ impl ClipboardService {
         params: EditCommitParams,
         max_entry_bytes: u64,
     ) -> Result<Value, ApiError> {
-        let paste_target = match params.paste_session_id.as_deref() {
-            Some(id) => self
-                .sessions
-                .validate_paste(id)
-                .await
-                .map_err(stale_target)?,
-            None => false,
-        };
+        let paste_target = self
+            .validate_paste(params.paste_session_id.as_deref())
+            .await?;
         let lease = self
             .edits
             .lock()
             .await
             .remove(&params.edit_id)
             .ok_or_else(|| edit_error("Edit session is unknown or already used"))?;
-        if lease.expires <= Instant::now() {
-            return Err(edit_error("Edit session expired"));
-        }
-        if params.value.len() as u64 > (MAX_EDIT_BYTES as u64).min(max_entry_bytes) {
-            return Err(edit_error("Edited text exceeds the configured limit"));
-        }
-        let current_revision = self.backend.revision(&lease.entry_id).await?;
-        validate_revision(Some(lease.revision), current_revision)?;
-        let replacement = self
-            .backend
-            .replace(
-                &lease.entry_id,
-                lease.revision,
-                &lease.mime,
-                params.value.as_bytes(),
-            )
+        let replacement = lease
+            .replace(&self.backend, &params.value, max_entry_bytes)
             .await?;
         let mut result = json!({
             "entry": replacement.entry,
@@ -451,6 +435,26 @@ struct EditLease {
     revision: u64,
     mime: String,
     expires: Instant,
+}
+
+impl EditLease {
+    async fn replace(
+        self,
+        backend: &Backend,
+        value: &str,
+        max_entry_bytes: u64,
+    ) -> Result<crate::model::ReplacementResult, ApiError> {
+        if self.expires <= Instant::now() {
+            return Err(edit_error("Edit session expired"));
+        }
+        if value.len() as u64 > (MAX_EDIT_BYTES as u64).min(max_entry_bytes) {
+            return Err(edit_error("Edited text exceeds the configured limit"));
+        }
+        validate_revision(Some(self.revision), backend.revision(&self.entry_id).await?)?;
+        Ok(backend
+            .replace(&self.entry_id, self.revision, &self.mime, value.as_bytes())
+            .await?)
+    }
 }
 
 #[derive(Deserialize)]
@@ -700,10 +704,6 @@ fn stale_target(message: &'static str) -> ApiError {
     ApiError::new("stale-target", message)
 }
 
-fn invalid(message: &'static str) -> BackendError {
-    BackendError::new(BackendErrorKind::InvalidData, message)
-}
-
 const fn default_query_limit() -> usize {
     100
 }
@@ -716,7 +716,7 @@ mod tests {
         fake::FakeBackend,
         model::{EntryDetails, EntryKind, EntrySummary},
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::sync::Arc;
 
     fn text_details(truncated: bool) -> EntryDetails {
@@ -736,6 +736,18 @@ mod tests {
             image: None,
             preview_truncated: truncated,
         }
+    }
+
+    async fn begin_edit(service: &ClipboardService) -> Value {
+        service
+            .dispatch_entry(
+                "clipboard.entry.edit.begin",
+                json!({"entry_id":"entry", "revision":1}),
+                1024,
+            )
+            .await
+            .unwrap()["edit"]["id"]
+            .take()
     }
 
     #[tokio::test]
@@ -759,15 +771,8 @@ mod tests {
         let backend =
             FakeBackend::with_entries(vec![text_details(false)]).with_failed_publication();
         let service = ClipboardService::new(Arc::new(backend));
-        let begun = service
-            .dispatch_entry(
-                "clipboard.entry.edit.begin",
-                json!({"entry_id":"entry", "revision":1}),
-                1024,
-            )
-            .await
-            .unwrap();
-        let params = json!({"edit_id":begun["edit"]["id"], "value":"new value"});
+        let edit_id = begin_edit(&service).await;
+        let params = json!({"edit_id":edit_id, "value":"new value"});
         let committed = service
             .dispatch_entry("clipboard.entry.edit.commit", params.clone(), 1024)
             .await
@@ -801,15 +806,9 @@ mod tests {
             };
             let service = ClipboardService::new(Arc::new(backend));
             let session = service.sessions.test_target().await;
-            let begun = service
-                .dispatch_entry(
-                    "clipboard.entry.edit.begin",
-                    json!({"entry_id":"entry", "revision":1}),
-                    1024,
-                )
-                .await
-                .unwrap();
-            let params = json!({"edit_id":begun["edit"]["id"], "value":"replacement", "paste_session_id": session});
+            let edit_id = begin_edit(&service).await;
+            let params =
+                json!({"edit_id":edit_id, "value":"replacement", "paste_session_id": session});
             let result = service
                 .dispatch_entry("clipboard.entry.edit.commit", params.clone(), 1024)
                 .await
@@ -826,27 +825,25 @@ mod tests {
         }
     }
 
+    async fn text(backend: &FakeBackend) -> Option<String> {
+        backend.details("entry", 1024).await.unwrap().text
+    }
+
     #[tokio::test]
     async fn stale_paste_session_rejects_before_editing() {
         let backend = Arc::new(FakeBackend::with_entries(vec![text_details(false)]));
         let service = ClipboardService::new(backend.clone());
-        let begun = service
+        let edit_id = begin_edit(&service).await;
+        let result = service
             .dispatch_entry(
-                "clipboard.entry.edit.begin",
-                json!({"entry_id":"entry", "revision":1}),
+                "clipboard.entry.edit.commit",
+                json!({"edit_id":edit_id, "value":"replacement", "paste_session_id":"expired"}),
                 1024,
             )
-            .await
-            .unwrap();
-        let result = service.dispatch_entry("clipboard.entry.edit.commit", json!({"edit_id":begun["edit"]["id"], "value":"replacement", "paste_session_id":"expired"}), 1024).await;
+            .await;
         assert!(result.is_err());
         assert_eq!(
-            backend
-                .details("entry", 1024)
-                .await
-                .unwrap()
-                .text
-                .as_deref(),
+            text(&backend).await.as_deref(),
             Some("https://example.test")
         );
     }
@@ -855,14 +852,7 @@ mod tests {
     async fn concurrent_change_invalidates_an_edit_without_overwriting_it() {
         let backend = Arc::new(FakeBackend::with_entries(vec![text_details(false)]));
         let service = ClipboardService::new(backend.clone());
-        let begun = service
-            .dispatch_entry(
-                "clipboard.entry.edit.begin",
-                json!({"entry_id":"entry", "revision":1}),
-                1024,
-            )
-            .await
-            .unwrap();
+        let edit_id = begin_edit(&service).await;
         backend
             .replace("entry", 1, "text/plain", b"concurrent value")
             .await
@@ -870,20 +860,12 @@ mod tests {
         let error = service
             .dispatch_entry(
                 "clipboard.entry.edit.commit",
-                json!({"edit_id":begun["edit"]["id"], "value":"stale value"}),
+                json!({"edit_id":edit_id, "value":"stale value"}),
                 1024,
             )
             .await
             .unwrap_err();
         assert_eq!(error.code, "stale-entry");
-        assert_eq!(
-            backend
-                .details("entry", 1024)
-                .await
-                .unwrap()
-                .text
-                .as_deref(),
-            Some("concurrent value")
-        );
+        assert_eq!(text(&backend).await.as_deref(), Some("concurrent value"));
     }
 }

@@ -2,22 +2,144 @@ use std::{
     collections::HashSet,
     env,
     fs::{self, File, Permissions},
-    io::{BufReader, Read},
+    io::{BufReader, Read, Seek, SeekFrom},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
 use clipboard_history_client_sdk::{Entry, EntryReader};
+use clipboard_history_core::protocol::RingKind;
 use image::{DynamicImage, ImageReader, Limits};
 use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::{
-    backend::{BackendError, BackendErrorKind, BackendResult, MAX_FILES},
-    classification::{INSPECTION_LIMIT, classify},
-    model::{EntryKind, EntrySummary, EntryThumbnail, FilePreview, ImageMetadata},
-    selection::{read_selection, selection_io_error},
+    backend::{
+        BackendError, BackendResult, MAX_FILES, MAX_WAYLAND_SELECTION_BYTES,
+        invalid_data as invalid_entry, operation_error as selection_io_error,
+    },
+    classification::{INSPECTION_LIMIT, bounded_preview, classify},
+    model::{EntryDetails, EntryKind, EntrySummary, EntryThumbnail, FilePreview, ImageMetadata},
+    selection::read_selection,
 };
+
+use super::{
+    MAX_DETAILS_BYTES, ResolvedEntry, RingboardBackend, content_hasher, entry_fingerprint,
+    entry_revision, ipc, load_entry, opaque_id, stored_mime_type,
+};
+
+impl RingboardBackend {
+    pub(super) fn summarize(
+        &self,
+        entry: Entry,
+        reader: &mut EntryReader,
+    ) -> BackendResult<ResolvedEntry> {
+        let (mut loaded, metadata) = load_entry(entry, reader)?;
+        let byte_size = metadata.len();
+        let stored_mime = stored_mime_type(&loaded)?;
+        let (bytes, content_digest) = inspect_entry(&mut *loaded, byte_size)?;
+        let content = ResolvedContent::resolve(&stored_mime, &bytes, MAX_WAYLAND_SELECTION_BYTES);
+        let fingerprint = entry_fingerprint(entry.id(), byte_size, content.mime(), &content_digest);
+        let id = opaque_id(&fingerprint);
+        let (generated_paths, echo_source_id) = {
+            let registry = self.artifact_registry()?;
+            loaded
+                .seek(SeekFrom::Start(0))
+                .map_err(|_| invalid_entry("Could not inspect artifact references"))?;
+            let generated_paths = registry.references_in(BufReader::new(&mut *loaded))?;
+            let echo_source_id = match content.image() {
+                Some(ResolvedImage::LocalFile(source)) => registry.match_local_image(source),
+                Some(ResolvedImage::Inline { .. }) => {
+                    registry.match_inline_echo(content.mime(), &content_digest, &id)
+                }
+                None => None,
+            };
+            (generated_paths, echo_source_id)
+        };
+        Ok(ResolvedEntry {
+            summary: EntrySummary {
+                revision: entry_revision(&fingerprint),
+                id,
+                kind: content.kind(),
+                mime: content.mime().to_owned(),
+                byte_size,
+                favorite: entry.ring() == RingKind::Favorites,
+                current: false,
+                preview: bounded_preview(&bytes, INSPECTION_LIMIT),
+            },
+            proof: ipc::content_proof(&content_digest, &stored_mime),
+            generated_paths,
+            echo_source_id,
+        })
+    }
+
+    pub(super) fn thumbnail_sync(
+        &self,
+        opaque_id: &str,
+        expected_revision: Option<u64>,
+        edge: u32,
+    ) -> BackendResult<EntryThumbnail> {
+        let (entry, mut reader, summary) = self.selected(opaque_id, expected_revision)?;
+        let mut loaded = entry
+            .to_file(&mut reader)
+            .map_err(|_| invalid_entry("Could not open clipboard image"))?;
+        let bytes = read_bounded(&mut loaded, INSPECTION_LIMIT)?;
+        loaded
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| invalid_entry("Could not rewind clipboard image"))?;
+        let content = ResolvedContent::resolve(&summary.mime, &bytes, MAX_THUMBNAIL_BYTES);
+        create_resolved_thumbnail(&loaded, &content, &summary, edge)
+    }
+}
+
+pub(super) fn entry_details(
+    entry: Entry,
+    mut reader: EntryReader,
+    summary: EntrySummary,
+    max_text_bytes: usize,
+) -> BackendResult<EntryDetails> {
+    let mut loaded = entry
+        .to_file(&mut reader)
+        .map_err(|_| invalid_entry("Could not open clipboard details"))?;
+    let limit = max_text_bytes.min(MAX_DETAILS_BYTES);
+    let mut bytes = read_bounded(&mut loaded, limit.saturating_add(1))?;
+    let truncated = bytes.len() > limit;
+    bytes.truncate(limit);
+    let text = std::str::from_utf8(&bytes).ok().map(str::to_owned);
+    let content = ResolvedContent::resolve(&summary.mime, &bytes, MAX_THUMBNAIL_BYTES);
+    Ok(EntryDetails {
+        entry: summary,
+        text,
+        image: content.image_metadata(),
+        files: content.into_files(),
+        preview_truncated: truncated,
+    })
+}
+
+fn inspect_entry(source: &mut impl Read, expected_size: u64) -> BackendResult<(Vec<u8>, [u8; 32])> {
+    let preview_capacity = usize::try_from(expected_size)
+        .unwrap_or(usize::MAX)
+        .min(INSPECTION_LIMIT);
+    let mut preview = Vec::with_capacity(preview_capacity);
+    let mut hasher = content_hasher();
+    let read_error = |_| invalid_entry("Could not read clipboard entry");
+    source
+        .by_ref()
+        .take(INSPECTION_LIMIT as u64)
+        .read_to_end(&mut preview)
+        .map_err(read_error)?;
+    hasher.update(&preview);
+    let remaining = std::io::copy(source, &mut hasher).map_err(read_error)?;
+    let actual_size = remaining
+        .checked_add(preview.len() as u64)
+        .ok_or_else(|| invalid_entry("Clipboard entry size is invalid"))?;
+    if actual_size != expected_size {
+        return Err(BackendError::stale(
+            "Clipboard entry changed while its identity was calculated",
+        ));
+    }
+    Ok((preview, hasher.finalize().into()))
+}
 
 pub(super) const MAX_THUMBNAIL_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -44,11 +166,6 @@ pub(super) enum ResolvedImage {
         dimensions: Option<ImageMetadata>,
     },
     LocalFile(LocalImageSource),
-}
-
-pub(super) enum Publication<'a> {
-    Bytes { mime: &'a str },
-    File { mime: &'a str, path: &'a Path },
 }
 
 impl ResolvedContent {
@@ -100,11 +217,11 @@ impl ResolvedContent {
         }
     }
 
-    pub fn files(&self) -> &[FilePreview] {
-        &self.files
+    fn into_files(self) -> Vec<FilePreview> {
+        self.files
     }
 
-    pub fn image_metadata(&self) -> Option<ImageMetadata> {
+    fn image_metadata(&self) -> Option<ImageMetadata> {
         match &self.image {
             Some(ResolvedImage::Inline { dimensions, .. }) => *dimensions,
             Some(ResolvedImage::LocalFile(source)) => Some(source.dimensions),
@@ -120,16 +237,6 @@ impl ResolvedContent {
         match &self.image {
             Some(ResolvedImage::LocalFile(source)) => Some(source),
             _ => None,
-        }
-    }
-
-    pub fn default_publication(&self) -> Publication<'_> {
-        match &self.image {
-            Some(ResolvedImage::LocalFile(source)) => Publication::File {
-                mime: source.mime,
-                path: &source.path,
-            },
-            _ => Publication::Bytes { mime: self.mime() },
         }
     }
 }
@@ -150,7 +257,7 @@ pub(super) fn read_path(path: &Path, max_bytes: u64) -> BackendResult<Vec<u8>> {
     read_selection(source, size, max_bytes)
 }
 
-pub(super) fn read_bounded(file: &mut File, limit: usize) -> BackendResult<Vec<u8>> {
+fn read_bounded(file: &mut File, limit: usize) -> BackendResult<Vec<u8>> {
     let mut bytes = Vec::with_capacity(limit.min(INSPECTION_LIMIT));
     file.take(limit as u64)
         .read_to_end(&mut bytes)
@@ -164,7 +271,7 @@ pub(super) fn detected_image_mime(bytes: &[u8]) -> Option<&'static str> {
         .map(|format| format.to_mime_type())
 }
 
-pub(super) fn create_resolved_thumbnail(
+fn create_resolved_thumbnail(
     stored_file: &File,
     content: &ResolvedContent,
     summary: &EntrySummary,
@@ -173,17 +280,17 @@ pub(super) fn create_resolved_thumbnail(
     if summary.kind != EntryKind::Image {
         return Err(invalid_entry("Clipboard entry cannot be thumbnailed"));
     }
-    let image_file = match content.image() {
+    match content.image() {
         Some(ResolvedImage::Inline { .. }) if summary.byte_size <= MAX_THUMBNAIL_BYTES => {
-            stored_file
-                .try_clone()
-                .map_err(|_| invalid_entry("Could not open clipboard image"))?
+            create_thumbnail_from_image(stored_file, summary, edge)
         }
-        Some(ResolvedImage::LocalFile(source)) => File::open(&source.path)
-            .map_err(|_| invalid_entry("Clipboard image file could not be opened"))?,
-        _ => return Err(invalid_entry("Clipboard entry cannot be thumbnailed")),
-    };
-    create_thumbnail_from_image(&image_file, summary, edge)
+        Some(ResolvedImage::LocalFile(source)) => {
+            let file = File::open(&source.path)
+                .map_err(|_| invalid_entry("Clipboard image file could not be opened"))?;
+            create_thumbnail_from_image(&file, summary, edge)
+        }
+        _ => Err(invalid_entry("Clipboard entry cannot be thumbnailed")),
+    }
 }
 
 fn create_thumbnail_from_image(
@@ -234,7 +341,27 @@ fn decode_image(file: &File) -> BackendResult<DynamicImage> {
         .map_err(|_| invalid_entry("Clipboard image could not be decoded"))
 }
 
-pub(super) fn image_decode_limits() -> Limits {
+/// Edited output must be a regular, bounded PNG that fully decodes.
+pub(super) fn valid_edited_image(path: &Path, max_bytes: u64) -> bool {
+    if !path.symlink_metadata().is_ok_and(|metadata| {
+        metadata.is_file() && metadata.len() <= max_bytes.min(MAX_THUMBNAIL_BYTES)
+    }) {
+        return false;
+    }
+    let Some(mut reader) = ImageReader::open(path)
+        .and_then(ImageReader::with_guessed_format)
+        .ok()
+    else {
+        return false;
+    };
+    if reader.format() != Some(image::ImageFormat::Png) {
+        return false;
+    }
+    reader.limits(image_decode_limits());
+    reader.decode().is_ok()
+}
+
+fn image_decode_limits() -> Limits {
     let mut limits = Limits::default();
     limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
     limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
@@ -414,15 +541,93 @@ fn private_permissions(path: &Path, mode: u32) -> BackendResult<()> {
         .map_err(|_| BackendError::unavailable("Clipboard thumbnail cache is unavailable"))
 }
 
-pub(super) fn invalid_entry(message: &'static str) -> BackendError {
-    BackendError::new(BackendErrorKind::InvalidData, message)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::symlink;
+    use std::{fs, os::unix::fs::symlink};
 
-    use super::ResolvedContent;
+    use super::{
+        INSPECTION_LIMIT, MAX_THUMBNAIL_BYTES, ResolvedContent, entry_fingerprint, entry_revision,
+        inspect_entry, opaque_id, valid_edited_image,
+    };
+    use crate::ringboard::MAX_SAFE_JSON_INTEGER;
+
+    #[test]
+    fn edited_images_must_fully_decode() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let valid = directory.path().join("valid.png");
+        let malformed = directory.path().join("malformed.png");
+        image::RgbaImage::new(2, 2)
+            .save(&valid)
+            .expect("write valid image");
+        fs::write(&malformed, b"\x89PNG\r\n\x1a\n").expect("write malformed image");
+
+        assert!(valid_edited_image(&valid, MAX_THUMBNAIL_BYTES));
+        assert!(!valid_edited_image(&valid, 1));
+        assert!(!valid_edited_image(&malformed, MAX_THUMBNAIL_BYTES));
+        let oversized = directory.path().join("oversized.png");
+        image::RgbaImage::new(16_385, 1).save(&oversized).unwrap();
+        assert!(!valid_edited_image(&oversized, MAX_THUMBNAIL_BYTES));
+        for format in [
+            image::ImageFormat::Jpeg,
+            image::ImageFormat::Gif,
+            image::ImageFormat::Tiff,
+        ] {
+            let disguised = directory.path().join("not-really-png.png");
+            image::RgbImage::new(2, 2)
+                .save_with_format(&disguised, format)
+                .unwrap();
+            assert!(
+                !valid_edited_image(&disguised, MAX_THUMBNAIL_BYTES),
+                "{format:?}"
+            );
+        }
+        let link = directory.path().join("symlink.png");
+        symlink(&valid, &link).unwrap();
+        assert!(!valid_edited_image(&link, MAX_THUMBNAIL_BYTES));
+    }
+
+    fn fingerprint(raw_id: u64, mime: &str, bytes: &[u8]) -> [u8; 32] {
+        let split = bytes.len().min(INSPECTION_LIMIT);
+        let source = std::io::Read::chain(&bytes[..split], InterruptOnce(true, &bytes[split..]));
+        let (preview, digest) = inspect_entry(&mut InterruptOnce(true, source), bytes.len() as u64)
+            .expect("fingerprint fixture");
+        assert_eq!(preview, bytes[..split]);
+        entry_fingerprint(raw_id, bytes.len() as u64, mime, &digest)
+    }
+
+    struct InterruptOnce<R>(bool, R);
+
+    impl<R: std::io::Read> std::io::Read for InterruptOnce<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if std::mem::take(&mut self.0) {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            self.1.read(buffer)
+        }
+    }
+
+    #[test]
+    fn entry_identity_covers_full_content_and_preserves_js_safe_revisions() {
+        assert_ne!(
+            fingerprint(42, "text/plain", b""),
+            fingerprint(42, "text/plain", b"a")
+        );
+        let mut first = vec![b'a'; INSPECTION_LIMIT + 1];
+        let mut second = first.clone();
+        first[INSPECTION_LIMIT] = b'x';
+        second[INSPECTION_LIMIT] = b'y';
+
+        let identity = fingerprint(42, "text/plain", &first);
+        let changed = fingerprint(42, "text/plain", &second);
+        assert_ne!(identity, changed);
+        assert_eq!(identity, fingerprint(42, "text/plain", &first));
+        assert_ne!(identity, fingerprint(43, "text/plain", &first));
+        assert_ne!(opaque_id(&identity), opaque_id(&changed));
+        assert_ne!(entry_revision(&identity), entry_revision(&changed));
+        assert!(entry_revision(&[u8::MAX; 32]) <= MAX_SAFE_JSON_INTEGER);
+        assert!(inspect_entry(&mut &b"abc"[..], 2).is_err());
+        assert!(inspect_entry(&mut &b"abc"[..], 4).is_err());
+    }
 
     #[test]
     fn a_single_local_image_file_can_supply_preview_dimensions() {
@@ -448,10 +653,15 @@ mod tests {
             &format!("cut\n{uri}\n{uri}\n"),
         );
         assert!(multiple.local_image().is_none());
-        assert_eq!(multiple.files().len(), 2);
-        assert_eq!(multiple.files()[0].operation, "cut");
-        assert_eq!(multiple.files()[0].display_name, "screen shot.png");
-        assert!(inspect("text/uri-list", "not a uri").files().is_empty());
+        let files = multiple.into_files();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].operation, "cut");
+        assert_eq!(files[0].display_name, "screen shot.png");
+        assert!(
+            inspect("text/uri-list", "not a uri")
+                .into_files()
+                .is_empty()
+        );
 
         let symlink_path = directory.path().join("screenshot-link.png");
         symlink(&path, &symlink_path).expect("image symlink");

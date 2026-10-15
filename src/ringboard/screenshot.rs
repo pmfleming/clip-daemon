@@ -1,15 +1,86 @@
 //! Explicit user captures: no shell, clipboard subprocess, or history-entry race.
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{
+    fs,
+    path::Path,
+    process::{Command as StdCommand, Stdio},
+    time::{Duration, Instant},
+};
 
 use tokio::{io::AsyncReadExt, process::Command};
 
-use super::mutation::{private_file, runtime_directory, unique_path, valid_edited_image};
-use super::operation::{OperationCompletion, OperationControl, operation_error};
+use super::content::{MAX_THUMBNAIL_BYTES, valid_edited_image};
+use super::mutation::{private_file, runtime_directory, unique_path};
+use super::operation::{OperationCompletion, OperationControl};
 use super::{RingboardBackend, run_blocking};
 use crate::{
-    backend::{BackendResult, InteractiveScreenshot, ScreenshotMode, ScreenshotRegion},
+    backend::{
+        BackendResult, InteractiveScreenshot, ScreenshotMode, ScreenshotRegion, operation_error,
+    },
     model::OperationResult,
 };
+
+impl RingboardBackend {
+    pub(super) fn capture_region(
+        &self,
+        region: ScreenshotRegion,
+        max_bytes: u64,
+    ) -> BackendResult<OperationResult> {
+        let path = unique_path(&runtime_directory("clip-daemon/screenshots")?, "png");
+        drop(private_file(&path)?);
+        let mut command = StdCommand::new("grim");
+        command
+            .args([
+                "-g",
+                &format!(
+                    "{},{} {}x{}",
+                    region.x, region.y, region.width, region.height
+                ),
+            ])
+            .arg(&path);
+        let result =
+            command_status_with_timeout(&mut command, Duration::from_secs(15)).and_then(|status| {
+                if !status.success() {
+                    return Err(operation_error("Screenshot capture failed"));
+                }
+                publish_capture(self, &path, max_bytes)
+            });
+        let _ = fs::remove_file(path);
+        result?;
+        Ok(OperationResult::completed(
+            "screenshot",
+            "Screenshot published to the Wayland clipboard",
+        ))
+    }
+}
+
+fn publish_capture(backend: &RingboardBackend, path: &Path, max_bytes: u64) -> BackendResult<()> {
+    if !valid_edited_image(path, max_bytes) {
+        return Err(operation_error("Screenshot is not a valid bounded PNG"));
+    }
+    backend
+        .selection
+        .publish_file("image/png", path, max_bytes.min(MAX_THUMBNAIL_BYTES))?;
+    backend.selection_changed()
+}
+
+fn command_status_with_timeout(
+    command: &mut StdCommand,
+    timeout: Duration,
+) -> BackendResult<std::process::ExitStatus> {
+    let mut child = command
+        .spawn()
+        .map_err(|_| operation_error("Could not start screenshot capture"))?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().map_err(operation_error)? {
+            return Ok(status);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(operation_error("Screenshot capture timed out"))
+}
 
 pub(super) fn launch(
     backend: &RingboardBackend,
@@ -75,13 +146,7 @@ async fn capture(
             .transaction
             .lock()
             .map_err(|_| super::lock_error())?;
-        if !valid_edited_image(&chosen, max_bytes) {
-            return Err(operation_error("Screenshot is not a valid bounded PNG"));
-        }
-        backend
-            .selection
-            .publish_file("image/png", &chosen, max_bytes)?;
-        backend.selection_changed()?;
+        publish_capture(&backend, &chosen, max_bytes)?;
         Ok(OperationCompletion {
             status: "completed",
             message: "Screenshot copied",
@@ -185,8 +250,19 @@ fn parse_pair<T: std::str::FromStr>(value: &str, separator: char) -> BackendResu
 
 #[cfg(test)]
 mod tests {
-    use super::select_region;
+    use super::{command_status_with_timeout, select_region};
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn screenshot_commands_are_bounded() {
+        let mut slow = std::process::Command::new("sleep");
+        slow.arg("1");
+        let started = std::time::Instant::now();
+        assert!(
+            command_status_with_timeout(&mut slow, std::time::Duration::from_millis(40)).is_err()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    }
 
     #[tokio::test]
     async fn selector_accepts_only_bounded_regions_and_preserves_cancellation() {

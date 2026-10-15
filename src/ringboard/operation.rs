@@ -15,7 +15,7 @@ use tokio::{
 };
 
 use crate::{
-    backend::{BackendError, BackendErrorKind, BackendResult},
+    backend::{BackendResult, operation_error},
     model::OperationResult,
 };
 
@@ -195,10 +195,6 @@ impl Operations {
         }
         Ok(())
     }
-}
-
-pub(super) fn operation_error(error: impl std::fmt::Display) -> BackendError {
-    BackendError::new(BackendErrorKind::OperationFailed, error.to_string())
 }
 
 const EDITING: u8 = 0;

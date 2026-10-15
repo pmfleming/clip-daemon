@@ -2,7 +2,9 @@ use std::{fs::File, io::Read, path::Path, sync::Arc};
 
 use wl_clipboard_rs::copy::{ClipboardType, MimeSource, MimeType, Options, Seat, Source};
 
-use crate::backend::{BackendError, BackendErrorKind, BackendResult};
+use crate::backend::{
+    BackendError, BackendErrorKind, BackendResult, operation_error as selection_io_error,
+};
 
 pub use crate::backend::MAX_WAYLAND_SELECTION_BYTES;
 
@@ -213,10 +215,6 @@ fn valid_mime_token(value: &str) -> bool {
                     b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-'
                 )
         })
-}
-
-pub(crate) fn selection_io_error(error: impl std::fmt::Display) -> BackendError {
-    BackendError::new(BackendErrorKind::OperationFailed, error.to_string())
 }
 
 fn selection_error(message: String) -> BackendError {

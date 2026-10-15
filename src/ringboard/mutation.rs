@@ -4,29 +4,30 @@ use std::{
     io::Write,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::Command as StdCommand,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use image::ImageReader;
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    backend::{BackendResult, EntryTarget, MAX_WAYLAND_SELECTION_BYTES, ScreenshotRegion},
+    backend::{
+        BackendResult, EntryTarget, MAX_WAYLAND_SELECTION_BYTES, invalid_data as invalid_entry,
+        operation_error,
+    },
     model::{EntryKind, OperationResult},
 };
 
 use super::{
-    MAX_THUMBNAIL_BYTES, RingboardBackend,
-    content::{Publication, ResolvedContent, ResolvedImage, read_entry, read_path},
-    invalid_entry,
-    operation::{OperationCompletion, OperationControl, operation_error},
+    RingboardBackend,
+    content::{
+        MAX_THUMBNAIL_BYTES, ResolvedContent, ResolvedImage, read_entry, read_path,
+        valid_edited_image,
+    },
+    operation::{OperationCompletion, OperationControl},
     run_blocking,
 };
-
-const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(super) struct AnnotationStage {
     input: PathBuf,
@@ -62,22 +63,6 @@ impl RingboardBackend {
             let _ = fs::remove_file(path);
         }
         Ok(())
-    }
-
-    pub(super) fn capture_region(
-        &self,
-        region: ScreenshotRegion,
-        max_bytes: u64,
-    ) -> BackendResult<OperationResult> {
-        let directory = runtime_directory("clip-daemon/screenshots")?;
-        let path = unique_path(&directory, "png");
-        drop(private_file(&path)?);
-        let result = capture_and_publish(self, region, &path, max_bytes);
-        let _ = fs::remove_file(path);
-        if result.is_ok() {
-            self.selection_changed()?;
-        }
-        result
     }
 
     pub(super) fn restore_entry(
@@ -280,36 +265,6 @@ fn cleanup_backend(backend: &RingboardBackend) -> BackendResult<usize> {
     backend.artifact_registry()?.reconcile(&references)
 }
 
-fn capture_and_publish(
-    backend: &RingboardBackend,
-    region: ScreenshotRegion,
-    path: &Path,
-    max_bytes: u64,
-) -> BackendResult<OperationResult> {
-    let geometry = format!(
-        "{},{} {}x{}",
-        region.x, region.y, region.width, region.height
-    );
-    let mut command = StdCommand::new("grim");
-    command.args(["-g", &geometry]).arg(path);
-    let status = command_status_with_timeout(&mut command, SCREENSHOT_TIMEOUT)?;
-    if !status.success() {
-        return Err(operation_error("Screenshot capture failed"));
-    }
-    if !valid_edited_image(path, max_bytes.min(MAX_THUMBNAIL_BYTES)) {
-        return Err(operation_error(
-            "Screenshot capture returned an invalid image",
-        ));
-    }
-    backend
-        .selection
-        .publish_file("image/png", path, max_bytes.min(MAX_THUMBNAIL_BYTES))?;
-    Ok(OperationResult::completed(
-        "screenshot",
-        "Screenshot published to the Wayland clipboard",
-    ))
-}
-
 async fn run_annotation(
     backend: RingboardBackend,
     staged: AnnotationStage,
@@ -343,25 +298,6 @@ async fn run_annotation(
         apply_annotation(&backend, &opaque_id, revision, &output, max_bytes)
     })
     .await
-}
-
-fn command_status_with_timeout(
-    command: &mut StdCommand,
-    timeout: Duration,
-) -> BackendResult<std::process::ExitStatus> {
-    let mut child = command
-        .spawn()
-        .map_err(|_| operation_error("Could not start screenshot capture"))?;
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().map_err(operation_error)? {
-            return Ok(status);
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    Err(operation_error("Screenshot capture timed out"))
 }
 
 fn apply_annotation(
@@ -445,9 +381,11 @@ fn publish_entry(
             "Clipboard image file is missing, unsafe, invalid, or exceeds the size limit",
         ));
     }
-    match content.default_publication() {
-        Publication::Bytes { mime } => backend.selection.publish(mime, bytes, max_bytes),
-        Publication::File { mime, path } => backend.selection.publish_file(mime, path, max_bytes),
+    match content.local_image() {
+        Some(source) => backend
+            .selection
+            .publish_file(source.mime, &source.path, max_bytes),
+        None => backend.selection.publish(content.mime(), bytes, max_bytes),
     }
 }
 
@@ -469,25 +407,6 @@ fn publish_image_uri(backend: &RingboardBackend, path: &Path, max_bytes: u64) ->
     backend
         .selection
         .publish_file_link(format!("{uri}\r\n").into_bytes(), max_bytes)
-}
-
-pub(super) fn valid_edited_image(path: &Path, max_bytes: u64) -> bool {
-    if !path.symlink_metadata().is_ok_and(|metadata| {
-        metadata.is_file() && metadata.len() <= max_bytes.min(MAX_THUMBNAIL_BYTES)
-    }) {
-        return false;
-    }
-    let Some(mut reader) = ImageReader::open(path)
-        .and_then(ImageReader::with_guessed_format)
-        .ok()
-    else {
-        return false;
-    };
-    if reader.format() != Some(image::ImageFormat::Png) {
-        return false;
-    }
-    reader.limits(super::content::image_decode_limits());
-    reader.decode().is_ok()
 }
 
 fn image_directory() -> BackendResult<PathBuf> {
@@ -539,58 +458,5 @@ fn image_extension(mime: &str) -> &'static str {
         "image/tiff" => "tiff",
         "image/svg+xml" => "svg",
         _ => "png",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use super::{command_status_with_timeout, valid_edited_image};
-
-    #[test]
-    fn screenshot_commands_are_bounded() {
-        let mut slow = std::process::Command::new("sleep");
-        slow.arg("1");
-        let started = std::time::Instant::now();
-        assert!(
-            command_status_with_timeout(&mut slow, std::time::Duration::from_millis(40)).is_err()
-        );
-        assert!(started.elapsed() < std::time::Duration::from_millis(500));
-    }
-
-    #[test]
-    fn edited_images_must_fully_decode() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let valid = directory.path().join("valid.png");
-        let malformed = directory.path().join("malformed.png");
-        image::RgbaImage::new(2, 2)
-            .save(&valid)
-            .expect("write valid image");
-        fs::write(&malformed, b"\x89PNG\r\n\x1a\n").expect("write malformed image");
-
-        assert!(valid_edited_image(&valid, super::MAX_THUMBNAIL_BYTES));
-        assert!(!valid_edited_image(&valid, 1));
-        assert!(!valid_edited_image(&malformed, super::MAX_THUMBNAIL_BYTES));
-        let oversized = directory.path().join("oversized.png");
-        image::RgbaImage::new(16_385, 1).save(&oversized).unwrap();
-        assert!(!valid_edited_image(&oversized, super::MAX_THUMBNAIL_BYTES));
-        for format in [
-            image::ImageFormat::Jpeg,
-            image::ImageFormat::Gif,
-            image::ImageFormat::Tiff,
-        ] {
-            let disguised = directory.path().join("not-really-png.png");
-            image::RgbImage::new(2, 2)
-                .save_with_format(&disguised, format)
-                .unwrap();
-            assert!(
-                !valid_edited_image(&disguised, super::MAX_THUMBNAIL_BYTES),
-                "{format:?}"
-            );
-        }
-        let link = directory.path().join("symlink.png");
-        std::os::unix::fs::symlink(&valid, &link).unwrap();
-        assert!(!valid_edited_image(&link, super::MAX_THUMBNAIL_BYTES));
     }
 }
