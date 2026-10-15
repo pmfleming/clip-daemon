@@ -221,7 +221,7 @@ impl CachedProjection {
             complete: self.complete,
             ..QueryProjection::default()
         };
-        let needle = query.query.trim().to_lowercase();
+        let needle = search::fold(query.query.trim());
         let matches = self
             .candidates
             .iter()
@@ -931,8 +931,8 @@ fn file_label(count: usize) -> &'static str {
 
 fn matches_query(summary: &EntrySummary, needle: &str) -> bool {
     needle.is_empty()
-        || summary.preview.to_lowercase().contains(needle)
-        || summary.mime.to_lowercase().contains(needle)
+        || search::fold(&summary.preview).contains(needle)
+        || search::fold(&summary.mime).contains(needle)
 }
 
 fn lock_error() -> BackendError {
@@ -1002,7 +1002,7 @@ mod tests {
                     byte_size: 10,
                     favorite: false,
                     current: false,
-                    preview: "image".into(),
+                    preview: "image ΟΣ".into(),
                 },
                 proof: [0; 32],
                 generated_paths: generated
@@ -1026,6 +1026,8 @@ mod tests {
             (query("", 0, 10, true), vec!["source"], 1, "source"),
             (query(" IMAGE/PNG ", 1, 1, false), vec!["source"], 2, "echo"),
             (query("missing", 0, 10, true), vec![], 0, "source"),
+            (query("οσ", 0, 10, false), vec!["echo", "source"], 2, "echo"),
+            (query("ος", 0, 10, false), vec![], 0, "echo"),
             (query("", usize::MAX, 10, true), vec![], 1, "source"),
             (query("", 0, 0, true), vec!["source"], 1, "source"),
         ] {

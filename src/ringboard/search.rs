@@ -2,7 +2,12 @@
 use std::io::{self, Read};
 
 pub(super) fn fold(value: &str) -> String {
-    value.chars().flat_map(char::to_lowercase).collect()
+    if value.is_ascii() {
+        return value.to_ascii_lowercase();
+    }
+    let mut folded = String::with_capacity(value.len());
+    folded.extend(value.chars().flat_map(char::to_lowercase));
+    folded
 }
 
 pub(super) struct Matcher {
@@ -106,8 +111,17 @@ mod tests {
 
     #[test]
     fn short_reads_match_whole_string_search_and_reject_invalid_tails() {
-        for text in ["", "ababababac", "ÉCOLE İSTANBUL 😀", "€éa"] {
-            for needle in ["", "ababac", "école i̇stanbul", "😀", "€é", "absent"] {
+        for text in ["", "ababababac", "ÉCOLE İSTANBUL 😀", "€éa", "ΟΣ"] {
+            for needle in [
+                "",
+                "ababac",
+                "école i̇stanbul",
+                "😀",
+                "€é",
+                "absent",
+                "οσ",
+                "ος",
+            ] {
                 for size in 1..=7 {
                     let input = Chunks {
                         bytes: text.as_bytes(),
