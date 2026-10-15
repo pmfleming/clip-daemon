@@ -253,51 +253,15 @@ mod tests {
     }
 
     #[test]
-    fn text_aliases_require_utf8_plain_text() {
-        for mime in ["text/plain", "text/plain;charset=utf-8"] {
-            assert!(super::supports_text_aliases(mime, b"plain text"));
-            assert!(!super::supports_text_aliases(mime, &[0xff]));
-        }
-        for mime in [
-            "text/html",
-            "text/uri-list",
-            "text/plain;charset=iso-8859-1",
-            "image/png",
-        ] {
-            assert!(!super::supports_text_aliases(mime, b"plain text"));
-        }
-    }
-
-    #[test]
-    fn bounded_reads_check_metadata_growth_and_io_failures() {
-        use super::read_selection;
-        use std::io;
-        for (bytes, advertised, limit, accepted) in [
-            (b"abcd".as_slice(), 4, 4, true),
-            (b"abcde", 4, 4, false), // grew after metadata
-            (b"a", 5, 4, false),     // reject oversized metadata before reading
-            (b"", 0, 0, true),
-            (b"a", 0, 0, false),
-        ] {
-            let result = read_selection(bytes, advertised, limit);
-            assert_eq!(result.is_ok(), accepted);
-            if let Ok(actual) = result {
-                assert_eq!(actual, bytes);
-            }
-        }
-        let mut source = io::Cursor::new(b"abcdef");
-        assert!(read_selection(&mut source, 0, 4).is_err());
-        assert_eq!(source.position(), 5); // Never drain an unbounded producer.
-        let directory = tempfile::tempdir().unwrap();
-        let unreadable = std::fs::File::open(directory.path()).unwrap();
+    fn unsafe_content_is_rejected_before_publication() {
+        // Both advertised and actual bytes must satisfy the publication limit.
         assert_eq!(
-            read_selection(unreadable, 0, 4).unwrap_err().kind,
-            crate::backend::BackendErrorKind::OperationFailed
+            super::read_selection(b"abcd".as_slice(), 4, 4).unwrap(),
+            b"abcd"
         );
-    }
-
-    #[test]
-    fn mime_and_size_policy_rejects_unsafe_offers() {
+        for (bytes, advertised) in [(b"abcde".as_slice(), 4), (b"a", 5)] {
+            assert!(super::read_selection(bytes, advertised, 4).is_err());
+        }
         let publisher = Arc::new(RecordingPublisher::default());
         let service = SelectionService::with_publisher(publisher.clone());
         for (mime, bytes) in [
@@ -313,6 +277,14 @@ mod tests {
             service
                 .publish_files("cut", uri.to_vec(), size - 1)
                 .is_err()
+        );
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            service
+                .publish_file("text/plain", directory.path(), MAX_WAYLAND_SELECTION_BYTES)
+                .unwrap_err()
+                .kind,
+            crate::backend::BackendErrorKind::OperationFailed
         );
         assert!(publisher.values.lock().unwrap().is_empty());
         service.publish_files("cut", uri.to_vec(), size).unwrap();

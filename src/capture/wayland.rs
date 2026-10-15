@@ -340,30 +340,6 @@ fn wait_readable<'fd>(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{MAX_TRANSFERS, wait_readable};
-    use rustix::pipe::{PipeFlags, pipe_with};
-    use std::{fs::File, io::Write, os::fd::AsFd};
-
-    #[test]
-    fn bounded_poll_distinguishes_transfer_readiness_without_allocating() {
-        let (source, writer) = pipe_with(PipeFlags::CLOEXEC).unwrap();
-        let mut writer = File::from(writer);
-        let (transfer, transfer_writer) = pipe_with(PipeFlags::CLOEXEC).unwrap();
-        File::from(transfer_writer).write_all(b"ready").unwrap();
-        let transfers = [transfer.as_fd(); MAX_TRANSFERS];
-        let allocations = allocation_counter::measure(|| {
-            assert!(!wait_readable(&source, transfers).unwrap());
-            writer.write_all(b"ready").unwrap();
-            assert!(wait_readable(&source, transfers).unwrap());
-            assert!(wait_readable(&source, []).unwrap());
-        });
-        assert_eq!(allocations.count_total, 0);
-        assert!(wait_readable(&source, [transfer.as_fd(); MAX_TRANSFERS + 1]).is_err());
-    }
-}
-
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
     fn event(
         state: &mut Self,

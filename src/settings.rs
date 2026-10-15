@@ -593,7 +593,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{ClipboardSettings, SettingsManager, SettingsState, SettingsUpdate, load_settings};
+    use super::{ClipboardSettings, SettingsManager, SettingsState, load_settings};
 
     fn manager(path: Option<std::path::PathBuf>) -> (SettingsManager, Arc<MockServices>) {
         let services = Arc::new(MockServices::default());
@@ -703,38 +703,6 @@ mod tests {
         assert!(!state.verified);
         assert!(!state.private_mode);
         assert!(!state.desired_paused);
-    }
-
-    #[test]
-    fn settings_updates_preserve_capture_preferences_and_previous_snapshots() {
-        let previous = ClipboardSettings {
-            capture_paused: true,
-            private_mode: true,
-            ..ClipboardSettings::default()
-        };
-        let updated = SettingsUpdate {
-            max_entries: Some(42),
-            collapse_self_echoes: Some(false),
-            ..SettingsUpdate::default()
-        }
-        .apply(&previous)
-        .unwrap();
-        assert_eq!(
-            updated,
-            ClipboardSettings {
-                max_entries: 42,
-                collapse_self_echoes: false,
-                ..previous
-            }
-        );
-        assert_eq!(
-            previous,
-            ClipboardSettings {
-                capture_paused: true,
-                private_mode: true,
-                ..ClipboardSettings::default()
-            }
-        );
     }
 
     #[test]

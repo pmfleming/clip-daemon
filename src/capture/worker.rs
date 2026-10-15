@@ -321,26 +321,33 @@ mod tests {
 
     #[tokio::test]
     async fn uncertain_shutdown_is_latched_across_repeated_privacy_requests() {
-        let gate = Admission::default();
-        gate.resume().unwrap();
-        let generation = gate.admit().unwrap();
-        assert!(
-            gate.submit::<()>(generation, || Err("injected lost reply".into()))
+        for panics in [false, true] {
+            let gate = Admission::default();
+            gate.resume().unwrap();
+            assert!(
+                gate.submit::<()>(gate.admit().unwrap(), || {
+                    assert!(!panics, "injected sink panic");
+                    Err("injected lost reply".into())
+                })
                 .is_err()
-        );
-        let controller = Controller::new(Arc::new(Unavailable));
-        controller.runtime.lock().await.worker = Some(Worker {
-            thread: std::thread::spawn(|| {}),
-            control: Arc::new(Control {
-                gate,
-                stop: AtomicBool::new(false),
-                status: Mutex::new(Ok(false)),
-            }),
-            limit: 65536,
-        });
-        for paused in [true, true, false] {
-            assert!(controller.set_paused(paused, 65536).await.is_err());
-            assert!(controller.is_paused().await.is_err());
+            );
+            assert!(gate.admit().is_none());
+            assert!(gate.fence().is_err());
+            assert!(gate.resume().is_err());
+            let controller = Controller::new(Arc::new(Unavailable));
+            controller.runtime.lock().await.worker = Some(Worker {
+                thread: std::thread::spawn(|| {}),
+                control: Arc::new(Control {
+                    gate,
+                    stop: AtomicBool::new(false),
+                    status: Mutex::new(Ok(false)),
+                }),
+                limit: 65536,
+            });
+            for paused in [true, true, false] {
+                assert!(controller.set_paused(paused, 65536).await.is_err());
+                assert!(controller.is_paused().await.is_err());
+            }
         }
     }
 }

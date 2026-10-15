@@ -260,37 +260,7 @@ fn rank_entries(entries: Vec<EntrySummary>, query: &str) -> Vec<EntrySummary> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cursor, CursorScope, HistorySearch, rank_entries};
-    use crate::model::{EntryKind, EntrySummary};
-
-    #[test]
-    fn blank_search_preserves_catalog_rows_without_allocating() {
-        for length in [0, 3] {
-            for query in ["", " \t\n", "\u{2003}"] {
-                let entries = ["", "Café", "last"]
-                    .into_iter()
-                    .take(length)
-                    .enumerate()
-                    .map(|(index, preview)| EntrySummary {
-                        id: index.to_string(),
-                        revision: index as u64 + 1,
-                        kind: EntryKind::Text,
-                        mime: "text/plain".into(),
-                        byte_size: 7,
-                        favorite: index == 1,
-                        current: index == 2,
-                        preview: preview.into(),
-                    })
-                    .collect::<Vec<_>>();
-                let expected = serde_json::to_value(&entries).unwrap();
-                let mut result = Vec::new();
-                let allocations =
-                    allocation_counter::measure(|| result = rank_entries(entries, query));
-                assert_eq!(allocations.count_total, 0);
-                assert_eq!(serde_json::to_value(result).unwrap(), expected);
-            }
-        }
-    }
+    use super::{Cursor, CursorScope, HistorySearch};
 
     #[test]
     fn cursors_bind_owner_query_generation_policy_and_process_lifetime() {

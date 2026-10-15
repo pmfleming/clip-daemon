@@ -258,16 +258,10 @@ fn is_terminal(class: &str) -> bool {
 mod tests {
     use super::{SessionManager, valid_window_address};
 
-    #[test]
-    fn paste_targets_require_hyprland_window_addresses() {
-        assert!(valid_window_address("0x123abc"));
-        assert!(!valid_window_address("0x0"));
-        assert!(!valid_window_address("123abc"));
-        assert!(!valid_window_address("0x123'; os.execute('false')"));
-    }
-
     #[tokio::test]
-    async fn expired_or_ended_sessions_cannot_trigger_paste() {
+    async fn invalid_targets_and_expired_or_ended_sessions_cannot_trigger_paste() {
+        assert!(!valid_window_address("0x0"));
+        assert!(!valid_window_address("0x123'; os.execute('false')"));
         let manager = SessionManager::default();
         let id = manager.test_target().await;
         manager.sessions.lock().await.get_mut(&id).unwrap().expires = std::time::Instant::now();

@@ -131,29 +131,9 @@ mod tests {
     use super::Admission;
 
     #[test]
-    fn admission_is_closed_initially_and_old_transfers_never_revive() {
-        let gate = Admission::default();
-        assert!(gate.admit().is_none());
-        gate.resume().unwrap();
-        let old = gate.admit().unwrap();
-        gate.close();
-        gate.fence().unwrap();
-        gate.resume().unwrap();
-        assert!(!gate.accepts(old));
-        assert_eq!(
-            gate.submit(old, || panic!("stale transfer reached sink"))
-                .unwrap(),
-            None::<()>
-        );
-        assert_eq!(
-            gate.submit(gate.admit().unwrap(), || Ok(7)).unwrap(),
-            Some(7)
-        );
-    }
-
-    #[test]
     fn pause_fences_in_flight_submission_and_rejects_queued_transfers() {
         let gate = Arc::new(Admission::default());
+        assert!(gate.admit().is_none());
         gate.resume().unwrap();
         let generation = gate.admit().unwrap();
         let (entered, started) = mpsc::channel();
@@ -180,30 +160,15 @@ mod tests {
         sink.join().unwrap().unwrap();
         pause.join().unwrap();
         done.recv().unwrap();
+        gate.resume().unwrap();
         assert_eq!(
             gate.submit(generation, || panic!("queued transfer reached sink"))
                 .unwrap(),
             None::<()>
         );
-    }
-
-    #[test]
-    fn uncertain_submission_never_becomes_verified_pause_or_retry() {
-        for panics in [false, true] {
-            let gate = Admission::default();
-            gate.resume().unwrap();
-            assert!(
-                gate.submit::<()>(gate.admit().unwrap(), || {
-                    if panics {
-                        panic!("injected sink panic");
-                    }
-                    Err("lost reply".into())
-                })
-                .is_err()
-            );
-            assert!(gate.admit().is_none());
-            assert!(gate.fence().is_err());
-            assert!(gate.resume().is_err());
-        }
+        assert_eq!(
+            gate.submit(gate.admit().unwrap(), || Ok(7)).unwrap(),
+            Some(7)
+        );
     }
 }

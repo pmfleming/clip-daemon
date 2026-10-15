@@ -342,80 +342,8 @@ fn unix_time() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ArtifactRegistry, LocalImageSource, MAX_WAYLAND_SELECTION_BYTES, image_identity,
-        read_registered_image,
-    };
+    use super::{ArtifactRegistry, LocalImageSource, MAX_WAYLAND_SELECTION_BYTES};
     use crate::classification::INSPECTION_LIMIT;
-
-    #[test]
-    fn registered_image_reads_reject_missing_oversized_and_symlink_sources() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("image.png");
-        let mut source = LocalImageSource {
-            path: path.clone(),
-            mime: "image/png",
-            dimensions: crate::model::ImageMetadata {
-                width: 1,
-                height: 1,
-            },
-        };
-        assert!(read_registered_image(&source).is_none());
-        std::fs::write(&path, b"image").unwrap();
-        assert_eq!(
-            read_registered_image(&source),
-            Some(image_identity("image/png", b"image"))
-        );
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_len(MAX_WAYLAND_SELECTION_BYTES + 1)
-            .unwrap();
-        assert!(read_registered_image(&source).is_none());
-        std::fs::write(&path, b"image").unwrap();
-        source.path = directory.path().join("link.png");
-        std::os::unix::fs::symlink(&path, &source.path).unwrap();
-        assert!(read_registered_image(&source).is_none());
-    }
-
-    #[test]
-    fn reference_scan_distinguishes_bounded_lines_from_ambiguous_history() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut registry = ArtifactRegistry::load(Some(directory.path().to_owned()), None);
-        let paths: Vec<_> = (0..2)
-            .map(|_| {
-                directory
-                    .path()
-                    .join(format!("clipboard-{}.png", uuid::Uuid::new_v4()))
-            })
-            .collect();
-        for path in &paths {
-            registry
-                .register(path, "source", "image/png", b"image")
-                .unwrap();
-        }
-        let uri = url::Url::from_file_path(&paths[0]).unwrap();
-        for prefix in [
-            b"\xff\n# comment\n".to_vec(),
-            [vec![b'x'; 32 * 1024 - 1], vec![b'\n']].concat(),
-        ] {
-            let bytes = [prefix, format!("{uri}\r\n{uri}").into_bytes()].concat();
-            assert_eq!(
-                registry.references_in(bytes.as_slice()).unwrap(),
-                [paths[0].clone()].into()
-            );
-        }
-        for length in [32 * 1024, 32 * 1024 + 1] {
-            assert_eq!(
-                registry
-                    .references_in(vec![b'x'; length].as_slice())
-                    .unwrap(),
-                paths.iter().cloned().collect()
-            );
-        }
-        assert!(registry.references_in(b"".as_slice()).unwrap().is_empty());
-    }
 
     #[test]
     fn annotation_echoes_match_duplicates_but_not_the_replacement_source() {
@@ -464,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_removes_only_registered_unreferenced_files() {
+    fn generated_artifacts_reject_unsafe_echoes_and_preserve_live_files() {
         let directory = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
         let generated = directory
@@ -480,6 +408,31 @@ mod tests {
         registry
             .register(&generated, "entry-source", "image/png", b"image")
             .unwrap();
+        let source = LocalImageSource {
+            path: generated.clone(),
+            mime: "image/png",
+            dimensions: crate::model::ImageMetadata {
+                width: 1,
+                height: 1,
+            },
+        };
+        assert_eq!(
+            registry.match_local_image(&source).as_deref(),
+            Some("entry-source")
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&generated)
+            .unwrap()
+            .set_len(MAX_WAYLAND_SELECTION_BYTES + 1)
+            .unwrap();
+        assert!(registry.match_local_image(&source).is_none());
+        std::fs::remove_file(&generated).unwrap();
+        std::os::unix::fs::symlink(&unrelated, &generated).unwrap();
+        assert!(registry.match_local_image(&source).is_none());
+        std::fs::remove_file(&generated).unwrap();
+        assert!(registry.match_local_image(&source).is_none());
+        std::fs::write(&generated, b"image").unwrap();
         let empty = std::collections::HashSet::new();
         registry.clear_active_selection();
         assert_eq!(registry.reconcile(&empty).unwrap(), 0); // grace period

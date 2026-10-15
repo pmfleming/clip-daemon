@@ -93,25 +93,7 @@ fn looks_like_color(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_preview, classify};
-    use crate::model::EntryKind;
-
-    #[test]
-    fn classification_respects_authoritative_mimes_before_refining_text() {
-        let cases: [(&str, &[u8], EntryKind); 8] = [
-            ("image/png", b"https://example.test", EntryKind::Image),
-            ("text/uri-list", b"file:///tmp/a", EntryKind::Files),
-            ("application/octet-stream", b"hello", EntryKind::Binary),
-            ("text/plain", b"https://example.test/a", EntryKind::Link),
-            ("text/plain", br#"{"ok":true}"#, EntryKind::Json),
-            ("text/plain", b"#1a2b3c", EntryKind::Color),
-            ("", b"ordinary text", EntryKind::Text),
-            ("", &[0xff, 0xfe], EntryKind::Binary),
-        ];
-        for (mime, bytes, expected) in cases {
-            assert_eq!(classify(mime, bytes), expected, "{mime}: {bytes:?}");
-        }
-    }
+    use super::bounded_preview;
 
     #[test]
     fn previews_are_bounded_single_line_and_strip_spoofing_characters() {

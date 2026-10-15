@@ -549,7 +549,7 @@ mod tests {
         INSPECTION_LIMIT, MAX_THUMBNAIL_BYTES, ResolvedContent, entry_fingerprint, entry_revision,
         inspect_entry, opaque_id, valid_edited_image,
     };
-    use crate::ringboard::MAX_SAFE_JSON_INTEGER;
+    use crate::{model::EntryKind, ringboard::MAX_SAFE_JSON_INTEGER};
 
     #[test]
     fn edited_images_must_fully_decode() {
@@ -630,7 +630,28 @@ mod tests {
     }
 
     #[test]
-    fn a_single_local_image_file_can_supply_preview_dimensions() {
+    fn content_resolution_preserves_mime_authority_and_local_file_semantics() {
+        let cases: [(&str, &[u8], EntryKind); 8] = [
+            ("image/png", b"https://example.test", EntryKind::Image),
+            (
+                "text/uri-list",
+                b"https://example.test/file",
+                EntryKind::Files,
+            ),
+            ("application/octet-stream", b"hello", EntryKind::Binary),
+            ("text/plain", b"https://example.test/a", EntryKind::Link),
+            ("text/plain", br#"{"ok":true}"#, EntryKind::Json),
+            ("text/plain", b"#1a2b3c", EntryKind::Color),
+            ("", b"ordinary text", EntryKind::Text),
+            ("", &[0xff, 0xfe], EntryKind::Binary),
+        ];
+        for (mime, bytes, expected) in cases {
+            assert_eq!(
+                ResolvedContent::resolve(mime, bytes, 1024).kind(),
+                expected,
+                "{mime}: {bytes:?}"
+            );
+        }
         let directory = tempfile::tempdir().expect("image directory");
         let path = directory.path().join("screen shot.png");
         image::RgbaImage::new(7, 5)

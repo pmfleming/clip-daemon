@@ -767,35 +767,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edits_report_partial_publication_and_consume_the_lease_once() {
-        let backend =
-            FakeBackend::with_entries(vec![text_details(false)]).with_failed_publication();
-        let service = ClipboardService::new(Arc::new(backend));
-        let edit_id = begin_edit(&service).await;
-        let params = json!({"edit_id":edit_id, "value":"new value"});
-        let committed = service
-            .dispatch_entry("clipboard.entry.edit.commit", params.clone(), 1024)
-            .await
-            .unwrap();
-        assert_eq!(committed["entry"]["text"], "new value");
-        assert_eq!(committed["publication"]["published"], false);
-        assert!(
-            !committed["publication"]["message"]
-                .as_str()
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            service
-                .dispatch_entry("clipboard.entry.edit.commit", params, 1024)
-                .await
-                .unwrap_err()
-                .code,
-            "edit-error"
-        );
-    }
-
-    #[tokio::test]
     async fn commit_and_prepare_paste_is_single_use_and_requires_publication() {
         for published in [true, false] {
             let backend = FakeBackend::with_entries(vec![text_details(false)]);
@@ -814,58 +785,53 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(result["entry"]["text"], "replacement");
+            assert_eq!(result["publication"]["published"], published);
+            assert!(
+                !result["publication"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(result["paste"]["prepared"], published);
             assert_eq!(service.sessions.test_is_armed(&session).await, published);
-            assert!(
+            assert_eq!(
                 service
                     .dispatch_entry("clipboard.entry.edit.commit", params, 1024)
                     .await
-                    .is_err()
+                    .unwrap_err()
+                    .code,
+                "edit-error"
             );
         }
     }
 
-    async fn text(backend: &FakeBackend) -> Option<String> {
-        backend.details("entry", 1024).await.unwrap().text
-    }
-
     #[tokio::test]
-    async fn stale_paste_session_rejects_before_editing() {
-        let backend = Arc::new(FakeBackend::with_entries(vec![text_details(false)]));
-        let service = ClipboardService::new(backend.clone());
-        let edit_id = begin_edit(&service).await;
-        let result = service
-            .dispatch_entry(
-                "clipboard.entry.edit.commit",
-                json!({"edit_id":edit_id, "value":"replacement", "paste_session_id":"expired"}),
-                1024,
-            )
-            .await;
-        assert!(result.is_err());
-        assert_eq!(
-            text(&backend).await.as_deref(),
-            Some("https://example.test")
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_change_invalidates_an_edit_without_overwriting_it() {
-        let backend = Arc::new(FakeBackend::with_entries(vec![text_details(false)]));
-        let service = ClipboardService::new(backend.clone());
-        let edit_id = begin_edit(&service).await;
-        backend
-            .replace("entry", 1, "text/plain", b"concurrent value")
-            .await
-            .unwrap();
-        let error = service
-            .dispatch_entry(
-                "clipboard.entry.edit.commit",
-                json!({"edit_id":edit_id, "value":"stale value"}),
-                1024,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "stale-entry");
-        assert_eq!(text(&backend).await.as_deref(), Some("concurrent value"));
+    async fn stale_edits_never_overwrite_content() {
+        for (stale_session, code, expected) in [
+            (true, "stale-target", "https://example.test"),
+            (false, "stale-entry", "concurrent value"),
+        ] {
+            let backend = Arc::new(FakeBackend::with_entries(vec![text_details(false)]));
+            let service = ClipboardService::new(backend.clone());
+            let edit_id = begin_edit(&service).await;
+            if !stale_session {
+                backend
+                    .replace("entry", 1, "text/plain", expected.as_bytes())
+                    .await
+                    .unwrap();
+            }
+            let error = service
+                .dispatch_entry(
+                    "clipboard.entry.edit.commit",
+                    json!({"edit_id":edit_id, "value":"stale value",
+                    "paste_session_id":stale_session.then_some("expired")}),
+                    1024,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, code);
+            let text = backend.details("entry", 1024).await.unwrap().text;
+            assert_eq!(text.as_deref(), Some(expected));
+        }
     }
 }

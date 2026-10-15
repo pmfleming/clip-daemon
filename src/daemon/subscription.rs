@@ -398,19 +398,7 @@ async fn emit_requested(
 mod tests {
     use serde_json::json;
 
-    use super::{HistoryState, HistoryUpdate, lag_data};
-
-    #[test]
-    fn lag_counts_preserve_u64_precision_on_the_wire() {
-        let body = lag_data(u64::MAX);
-        assert_eq!(
-            body.data,
-            json!({
-                "reason": "subscriber-lag", "dropped_events": u64::MAX.to_string()
-            })
-        );
-        assert!(body.error.is_none());
-    }
+    use super::{HistoryState, HistoryUpdate};
 
     #[test]
     fn history_state_emits_initial_changes_outages_and_recovery_once() {

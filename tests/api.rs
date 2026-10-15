@@ -77,6 +77,24 @@ async fn native_search_uses_revision_bound_owner_scoped_cursors() {
         entry("three", EntryKind::Text, Some("Café three")),
     ]));
     let api = ApiService::new(backend.clone());
+    let plain = api
+        .dispatch("clipboard.history.query", json!({"limit":3}))
+        .await;
+    for query in ["", " \t\n", "\u{2003}"] {
+        let blank = api
+            .dispatch(
+                "clipboard.history.query",
+                json!({
+                    "query":query, "fuzzy":true, "limit":3
+                }),
+            )
+            .await;
+        assert_eq!(blank["ok"], true);
+        assert_eq!(
+            blank["data"]["history"]["entries"],
+            plain["data"]["history"]["entries"]
+        );
+    }
     let request = json!({"query":"cafee", "generation":9, "fuzzy":true, "limit":2});
     let first = api
         .dispatch_owned(
@@ -191,34 +209,24 @@ async fn bulk_delete_validates_the_selection_before_removing_entries() {
 }
 
 #[tokio::test]
-async fn text_publication_uses_the_daemon_operation_boundary() {
-    let api = ApiService::new(Arc::new(FakeBackend::default()));
-    let response = api
-        .dispatch(
-            "clipboard.selection.publishText",
-            json!({ "text": "WIFI:T:WPA;S:Example;P:secret;;" }),
-        )
-        .await;
-    assert_eq!(response["ok"], true);
-    assert_eq!(response["data"]["operation"]["action"], "publish");
-
-    let empty = api
-        .dispatch("clipboard.selection.publishText", json!({ "text": "" }))
-        .await;
-    assert_eq!(empty["error"]["code"], "validation-error");
-    let unknown_field = api
-        .dispatch(
-            "clipboard.selection.publishText",
-            json!({"text":"ok", "extra":true}),
-        )
-        .await;
-    assert_eq!(unknown_field["error"]["code"], "validation-error");
-}
-
-#[tokio::test]
 async fn validation_unknown_methods_and_wipe_challenges_are_stable() {
     let api = ApiService::new(Arc::new(FakeBackend::default()));
+    let empty = api
+        .dispatch("clipboard.history.query", json!({"fuzzy":true}))
+        .await;
+    assert_eq!(empty["data"]["history"]["entries"], json!([]));
+    assert_eq!(empty["data"]["history"]["total"], 0);
     for (method, params, code) in [
+        (
+            "clipboard.selection.publishText",
+            json!({"text":""}),
+            "validation-error",
+        ),
+        (
+            "clipboard.selection.publishText",
+            json!({"text":"ok", "extra":true}),
+            "validation-error",
+        ),
         (
             "clipboard.history.query",
             json!({"limit": 0}),
@@ -280,8 +288,17 @@ async fn validation_unknown_methods_and_wipe_challenges_are_stable() {
         .await;
     assert_eq!(published["data"]["operation"]["action"], "publish-files");
 
-    let published = api.publish_selection("image/png", vec![1, 2, 3, 4]).await;
-    assert_eq!(published["data"]["operation"]["action"], "publish");
+    for published in [
+        api.publish_selection("image/png", vec![1, 2, 3, 4]).await,
+        api.dispatch(
+            "clipboard.selection.publishText",
+            json!({"text":"clipboard text"}),
+        )
+        .await,
+    ] {
+        assert_eq!(published["ok"], true);
+        assert_eq!(published["data"]["operation"]["action"], "publish");
+    }
     let empty = api.publish_selection("image/png", vec![]).await;
     assert_eq!(empty["error"]["code"], "validation-error");
 

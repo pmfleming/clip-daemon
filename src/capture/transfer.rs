@@ -125,64 +125,16 @@ impl Transfer {
 #[cfg(test)]
 mod tests {
     use super::{Budget, IDLE, Received, TOTAL, TOTAL_BYTES, Transfer};
-    use rustix::fs::{MemfdFlags, memfd_create};
+    use rustix::pipe::{PipeFlags, pipe_with};
     use std::{
         fs::File,
-        io::{Read, Seek, Write},
+        io::{Read, Write},
         sync::Arc,
-        time::{Duration, Instant},
+        time::Duration,
     };
 
-    fn source(bytes: &[u8]) -> File {
-        let mut file = File::from(memfd_create(c"capture-test", MemfdFlags::CLOEXEC).unwrap());
-        file.write_all(bytes).unwrap();
-        file.rewind().unwrap();
-        file
-    }
-
     #[test]
-    fn nonblocking_reads_preserve_progress_and_total_deadline() {
-        use rustix::pipe::{PipeFlags, pipe_with};
-        let budget = Arc::new(Budget::default());
-        let (read, write) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).unwrap();
-        let mut writer = File::from(write);
-        let mut transfer = Transfer::new(File::from(read), 4, budget.reserve(5).unwrap()).unwrap();
-        let progress = transfer.progress;
-        assert!(!transfer.receive(progress).unwrap()); // WouldBlock is not EOF or progress.
-        assert_eq!(transfer.progress, progress);
-        writer.write_all(b"data").unwrap();
-        assert!(
-            !transfer
-                .receive(progress + Duration::from_millis(1))
-                .unwrap()
-        );
-        drop(writer);
-        assert!(
-            transfer
-                .receive(progress + Duration::from_millis(2))
-                .unwrap()
-        );
-        let Received::Complete(mut file, reservation) = transfer.finish().unwrap() else {
-            panic!("nonblank transfer")
-        };
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).unwrap();
-        assert_eq!(bytes, b"data");
-        drop(reservation);
-
-        let mut transfer = Transfer::new(source(b"data"), 4, budget.reserve(5).unwrap()).unwrap();
-        transfer.progress = transfer.started + TOTAL - Duration::from_millis(1);
-        assert_eq!(
-            transfer
-                .receive(transfer.started + TOTAL)
-                .unwrap_err()
-                .kind(),
-            std::io::ErrorKind::TimedOut
-        );
-    }
-
-    #[test]
-    fn transfers_enforce_size_idle_deadline_blank_filtering_and_budget_release() {
+    fn bounded_nonblocking_transfers_validate_content_deadlines_and_release_budget() {
         let budget = Arc::new(Budget::default());
         for (bytes, delay, nonblank) in [
             (b"abcd".as_slice(), Duration::ZERO, Some(true)),
@@ -190,17 +142,42 @@ mod tests {
             (b"\0\xff", Duration::ZERO, Some(true)),
             (b" \n\t", Duration::ZERO, Some(false)),
             (b"abcd", IDLE, None),
+            (b"abcd", TOTAL, None),
         ] {
-            let mut transfer = Transfer::new(source(bytes), 4, budget.reserve(5).unwrap()).unwrap();
-            let result = transfer.receive(Instant::now() + delay);
+            let (read, write) = pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).unwrap();
+            let mut writer = File::from(write);
+            let mut transfer =
+                Transfer::new(File::from(read), 4, budget.reserve(5).unwrap()).unwrap();
+            let initial = transfer.progress;
+            assert!(
+                !transfer
+                    .receive(initial + Duration::from_millis(1))
+                    .unwrap()
+            );
+            writer.write_all(bytes).unwrap();
+            if delay == TOTAL {
+                // Recent progress must not defeat the absolute deadline.
+                transfer.progress = initial + TOTAL - Duration::from_millis(1);
+            }
+            let now = initial + delay.max(Duration::from_millis(2));
+            let result = transfer.receive(now);
             assert_eq!(result.is_ok(), nonblank.is_some());
             if let Some(nonblank) = nonblank {
                 assert!(!result.unwrap());
-                assert!(transfer.receive(Instant::now()).unwrap());
-                assert_eq!(
-                    matches!(transfer.finish().unwrap(), Received::Complete(..)),
-                    nonblank
-                );
+                assert!(!transfer.receive(now).unwrap()); // WouldBlock is not EOF.
+                drop(writer);
+                assert!(transfer.receive(now).unwrap());
+                match transfer.finish().unwrap() {
+                    Received::Blank => assert!(!nonblank),
+                    Received::Complete(mut file, _reservation) => {
+                        assert!(nonblank);
+                        let mut actual = Vec::new();
+                        file.read_to_end(&mut actual).unwrap();
+                        assert_eq!(actual, bytes);
+                    }
+                }
+            } else if delay != Duration::ZERO {
+                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
             }
         }
         let reserved = budget.reserve(TOTAL_BYTES).unwrap();
