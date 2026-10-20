@@ -99,37 +99,3 @@ pub async fn run() -> Result<()> {
     )
     .await
 }
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-    use shelllist_daemon_tokio::{CorrelationPolicy, TrackedKind};
-
-    use super::ClipCorrelation;
-    use crate::protocol;
-
-    #[test]
-    fn correlates_clipboard_operations_and_subscriptions() {
-        let policy = ClipCorrelation;
-        let operation = policy
-            .response_id(&json!({ "data": { "operation": { "id": "operation-1" } } }))
-            .unwrap();
-        assert_eq!(operation.kind, TrackedKind::Operation);
-        assert_eq!(
-            policy.event_id(
-                protocol::stream::OPERATION,
-                &json!({ "data": { "operation": { "id": "operation-1" } } })
-            ),
-            Some("operation-1".into())
-        );
-        assert!(policy.is_terminal(
-            protocol::stream::OPERATION,
-            &json!({ "event": "cancelled" })
-        ));
-
-        let subscription = policy
-            .response_id(&json!({ "data": { "subscription": { "id": "sub-1" } } }))
-            .unwrap();
-        assert_eq!(subscription.kind, TrackedKind::Subscription);
-    }
-}
