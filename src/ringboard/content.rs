@@ -108,11 +108,11 @@ pub(super) fn entry_details(
     let text = std::str::from_utf8(&bytes).ok().map(str::to_owned);
     let content = ResolvedContent::resolve(&summary.mime, &bytes, MAX_THUMBNAIL_BYTES);
     Ok(EntryDetails {
-        entry: summary,
         text,
         image: content.image_metadata(),
         files: content.into_files(),
         preview_truncated: truncated,
+        entry: summary,
     })
 }
 
@@ -153,8 +153,8 @@ pub(super) struct LocalImageSource {
 }
 
 /// Daemon-owned semantic interpretation of bytes and MIME stored by Ringboard.
-pub(super) struct ResolvedContent {
-    stored_mime: String,
+pub(super) struct ResolvedContent<'a> {
+    stored_mime: &'a str,
     kind: EntryKind,
     files: Vec<FilePreview>,
     image: Option<ResolvedImage>,
@@ -168,9 +168,9 @@ pub(super) enum ResolvedImage {
     LocalFile(LocalImageSource),
 }
 
-impl ResolvedContent {
-    pub fn resolve(stored_mime: &str, bytes: &[u8], max_file_bytes: u64) -> Self {
-        let stored_mime = mime_or_default(stored_mime).to_owned();
+impl<'a> ResolvedContent<'a> {
+    pub fn resolve(stored_mime: &'a str, bytes: &[u8], max_file_bytes: u64) -> Self {
+        let stored_mime = mime_or_default(stored_mime);
         if let Some(mime) = detected_image_mime(bytes) {
             return Self {
                 stored_mime,
@@ -183,7 +183,7 @@ impl ResolvedContent {
             };
         }
 
-        let semantic_mime = canonical_mime(&stored_mime);
+        let semantic_mime = canonical_mime(stored_mime);
         let files = match semantic_mime {
             "text/uri-list" | "x-special/gnome-copied-files" | "text/plain" => {
                 parse_files(semantic_mime, bytes)
@@ -213,7 +213,7 @@ impl ResolvedContent {
     pub fn mime(&self) -> &str {
         match &self.image {
             Some(ResolvedImage::Inline { mime, .. }) => mime,
-            _ => &self.stored_mime,
+            _ => self.stored_mime,
         }
     }
 
@@ -251,12 +251,6 @@ pub(super) fn read_entry(
     read_selection(&mut *source, size, max_bytes)
 }
 
-pub(super) fn read_path(path: &Path, max_bytes: u64) -> BackendResult<Vec<u8>> {
-    let source = File::open(path).map_err(selection_io_error)?;
-    let size = source.metadata().map_err(selection_io_error)?.len();
-    read_selection(source, size, max_bytes)
-}
-
 fn read_bounded(file: &mut File, limit: usize) -> BackendResult<Vec<u8>> {
     let mut bytes = Vec::with_capacity(limit.min(INSPECTION_LIMIT));
     file.take(limit as u64)
@@ -273,7 +267,7 @@ pub(super) fn detected_image_mime(bytes: &[u8]) -> Option<&'static str> {
 
 fn create_resolved_thumbnail(
     stored_file: &File,
-    content: &ResolvedContent,
+    content: &ResolvedContent<'_>,
     summary: &EntrySummary,
     edge: u32,
 ) -> BackendResult<EntryThumbnail> {

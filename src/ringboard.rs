@@ -21,7 +21,6 @@ use crate::{
         EntryTarget, FileSelection, HistoryQuery, MAX_FILES, MAX_QUERY_LIMIT, ScreenshotRegion,
         invalid_data, operation_error as operation_failed,
     },
-    editor::ImageEditorCommand,
     model::{
         BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
         ReplacementResult, paginate,
@@ -65,7 +64,7 @@ struct RevisionState {
 #[derive(Default)]
 struct SummaryCache {
     token: Option<u64>,
-    projection: Option<CachedProjection>,
+    projection: CachedProjection,
     search: Option<(String, HashSet<u64>)>,
 }
 
@@ -82,22 +81,12 @@ struct IdentityBinding {
     revision: u64,
 }
 
-impl SummaryCache {
-    fn select_token(&mut self, token: u64) {
-        if self.token != Some(token) {
-            *self = Self {
-                token: Some(token),
-                ..Self::default()
-            };
-        }
-    }
-}
-
 struct QueryCandidate {
     raw_id: u64,
     resolved: ResolvedEntry,
 }
 
+#[derive(Default)]
 struct CachedProjection {
     current_id: Option<u64>,
     candidates: Vec<QueryCandidate>,
@@ -253,7 +242,7 @@ impl CachedProjection {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct RingboardBackend {
     transaction: Arc<Mutex<()>>,
     operation_gate: Arc<tokio::sync::Mutex<()>>,
@@ -262,24 +251,7 @@ pub struct RingboardBackend {
     summaries: Arc<Mutex<SummaryCache>>,
     operations: Arc<Operations>,
     artifacts: Arc<Mutex<ArtifactRegistry>>,
-    editor: ImageEditorCommand,
     selection: SelectionService,
-}
-
-impl Default for RingboardBackend {
-    fn default() -> Self {
-        Self {
-            transaction: Arc::default(),
-            operation_gate: Arc::default(),
-            ids: Arc::default(),
-            revision: Arc::default(),
-            summaries: Arc::default(),
-            operations: Arc::default(),
-            artifacts: Arc::default(),
-            editor: ImageEditorCommand::configured(),
-            selection: SelectionService::default(),
-        }
-    }
 }
 
 impl RingboardBackend {
@@ -575,8 +547,12 @@ fn collect_query_projection(
     token: u64,
 ) -> BackendResult<QueryProjection> {
     let mut cache = backend.summaries.lock().map_err(|_| lock_error())?;
-    cache.select_token(token);
-    let result = project_query(backend, &mut cache, database, reader, query, token);
+    if cache.token != Some(token) {
+        *cache = SummaryCache::default();
+        cache.projection = CachedProjection::load(backend, database, reader)?;
+        cache.token = Some(token);
+    }
+    let result = project_query(&mut cache, database, reader, query, token);
     if !result.as_ref().is_ok_and(|projection| projection.complete) {
         *cache = SummaryCache::default();
     }
@@ -584,17 +560,13 @@ fn collect_query_projection(
 }
 
 fn project_query(
-    backend: &RingboardBackend,
     cache: &mut SummaryCache,
     database: &DatabaseReader,
     reader: &mut EntryReader,
     query: &HistoryQuery,
     token: u64,
 ) -> BackendResult<QueryProjection> {
-    if cache.projection.is_none() {
-        cache.projection = Some(CachedProjection::load(backend, database, reader)?);
-    }
-    let projection = cache.projection.as_ref().ok_or_else(lock_error)?;
+    let projection = &cache.projection;
     let needle = search::fold(query.query.trim());
     let filtering = !needle.is_empty();
     if filtering

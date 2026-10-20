@@ -16,7 +16,8 @@ use crate::backend::{
     BackendResult, MAX_WAYLAND_SELECTION_BYTES, operation_error as artifact_error,
 };
 
-use super::content::{LocalImageSource, image_identity, read_path};
+use super::content::{LocalImageSource, image_identity};
+use crate::selection::read_path;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ArtifactRecord {

@@ -1,15 +1,13 @@
 use std::{
     env,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
 use url::Url;
-use uuid::Uuid;
 
 use crate::{
     backend::{
@@ -17,15 +15,18 @@ use crate::{
         operation_error,
     },
     model::{EntryKind, OperationResult},
+    selection::read_path,
 };
 
 use super::{
     RingboardBackend,
     content::{
-        MAX_THUMBNAIL_BYTES, ResolvedContent, ResolvedImage, read_entry, read_path,
-        valid_edited_image,
+        MAX_THUMBNAIL_BYTES, ResolvedContent, ResolvedImage, read_entry, valid_edited_image,
     },
-    operation::{OperationCompletion, OperationControl},
+    operation::{
+        OperationCompletion, OperationControl, private_directory, private_file, runtime_directory,
+        unique_path,
+    },
     run_blocking,
 };
 
@@ -180,9 +181,7 @@ impl RingboardBackend {
     ) -> BackendResult<u64> {
         let directory = runtime_directory("clip-daemon/transfers")?;
         let path = unique_path(&directory, "edit");
-        private_file(&path)?
-            .write_all(bytes)
-            .map_err(operation_error)?;
+        write_private(&path, bytes)?;
         let result = self.replace_file_entry(opaque_id, expected_revision, &path, mime);
         let _ = fs::remove_file(path);
         result
@@ -279,11 +278,7 @@ async fn run_annotation(
     } = staged;
     // Give the picker time to hide so the editor becomes focused when it maps.
     tokio::time::sleep(Duration::from_millis(150)).await;
-    backend
-        .editor
-        .run(&input, &output)
-        .await
-        .map_err(operation_error)?;
+    backend.operations.edit(&input, &output).await?;
     if !output.is_file() {
         return Err(operation_error("Image edit was cancelled"));
     }
@@ -335,9 +330,7 @@ fn publish_annotation(
         .artifact_registry()?
         .register_inline_echo(&source.entry.id, "image/png", &bytes)?;
     backend.clear_identity_state()?;
-    backend
-        .selection
-        .publish_file("image/png", output, max_bytes)?;
+    backend.selection.publish("image/png", bytes, max_bytes)?;
     backend.artifact_registry()?.clear_active_selection();
     Ok(())
 }
@@ -365,7 +358,7 @@ fn selected_image(
         .ok_or_else(|| invalid_entry("Only image entries support this action"))
 }
 
-fn resolved_content(mime: &str, bytes: &[u8], max_bytes: u64) -> ResolvedContent {
+fn resolved_content<'a>(mime: &'a str, bytes: &[u8], max_bytes: u64) -> ResolvedContent<'a> {
     ResolvedContent::resolve(mime, bytes, max_bytes.min(MAX_WAYLAND_SELECTION_BYTES))
 }
 
@@ -389,7 +382,10 @@ fn publish_entry(
     }
 }
 
-fn prepare_image_file(content: &ResolvedContent, bytes: &[u8]) -> BackendResult<(PathBuf, bool)> {
+fn prepare_image_file(
+    content: &ResolvedContent<'_>,
+    bytes: &[u8],
+) -> BackendResult<(PathBuf, bool)> {
     match content.image() {
         Some(ResolvedImage::LocalFile(source)) => Ok((source.path.clone(), false)),
         Some(ResolvedImage::Inline { mime, .. }) => {
@@ -414,39 +410,13 @@ fn image_directory() -> BackendResult<PathBuf> {
     private_directory(PathBuf::from(home).join("Pictures/Screenshots/clipboard-history"))
 }
 
-pub(super) fn runtime_directory(child: &str) -> BackendResult<PathBuf> {
-    let root = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir);
-    private_directory(root.join(child))
-}
-
-fn private_directory(path: PathBuf) -> BackendResult<PathBuf> {
-    fs::create_dir_all(&path).map_err(operation_error)?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(operation_error)?;
-    Ok(path)
-}
-
-pub(super) fn private_file(path: &Path) -> BackendResult<File> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(operation_error)
-}
-
 fn write_private(path: &Path, bytes: &[u8]) -> BackendResult<()> {
-    let result =
-        private_file(path).and_then(|mut file| file.write_all(bytes).map_err(operation_error));
-    if result.is_err() {
-        let _ = fs::remove_file(path);
-    }
-    result
-}
-
-pub(super) fn unique_path(directory: &Path, extension: &str) -> PathBuf {
-    directory.join(format!("clipboard-{}.{}", Uuid::new_v4(), extension))
+    let mut file = private_file(path)?;
+    file.write_all(bytes)
+        .map_err(operation_error)
+        .inspect_err(|_| {
+            let _ = fs::remove_file(path);
+        })
 }
 
 fn image_extension(mime: &str) -> &'static str {
@@ -458,5 +428,17 @@ fn image_extension(mime: &str) -> &'static str {
         "image/tiff" => "tiff",
         "image/svg+xml" => "svg",
         _ => "png",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn staging_never_overwrites_or_removes_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("edit");
+        super::write_private(&path, b"original").unwrap();
+        assert!(super::write_private(&path, b"replacement").is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"original");
     }
 }

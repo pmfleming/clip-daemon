@@ -139,11 +139,15 @@ impl SelectionService {
         configured_limit: u64,
     ) -> BackendResult<()> {
         validate_mime(mime)?;
-        let file = File::open(path).map_err(selection_io_error)?;
-        let size = file.metadata().map_err(selection_io_error)?.len();
         self.publisher
-            .publish(mime, read_selection(file, size, configured_limit)?)
+            .publish(mime, read_path(path, configured_limit)?)
     }
+}
+
+pub(crate) fn read_path(path: &Path, max_bytes: u64) -> BackendResult<Vec<u8>> {
+    let source = File::open(path).map_err(selection_io_error)?;
+    let size = source.metadata().map_err(selection_io_error)?.len();
+    read_selection(source, size, max_bytes)
 }
 
 /// Enforce both the advertised size and the bytes actually read (files may grow).

@@ -9,8 +9,9 @@ use std::{
 use tokio::{io::AsyncReadExt, process::Command};
 
 use super::content::{MAX_THUMBNAIL_BYTES, valid_edited_image};
-use super::mutation::{private_file, runtime_directory, unique_path};
-use super::operation::{OperationCompletion, OperationControl};
+use super::operation::{
+    OperationCompletion, OperationControl, private_file, runtime_directory, unique_path,
+};
 use super::{RingboardBackend, run_blocking};
 use crate::{
     backend::{
@@ -185,10 +186,12 @@ async fn edit_capture(
     if !run_blocking(move || Ok(valid_edited_image(&path, max_bytes))).await? {
         return Err(operation_error("Screenshot is not a valid bounded PNG"));
     }
-    tokio::time::timeout(Duration::from_secs(1800), backend.editor.run(input, output))
-        .await
-        .map_err(operation_error)?
-        .map_err(operation_error)?;
+    tokio::time::timeout(
+        Duration::from_secs(1800),
+        backend.operations.edit(input, output),
+    )
+    .await
+    .map_err(operation_error)??;
     Ok(output.exists())
 }
 

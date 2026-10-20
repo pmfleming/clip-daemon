@@ -6,7 +6,7 @@ use std::{
         mpsc::{self, Receiver, SyncSender},
     },
     thread::JoinHandle,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -108,10 +108,8 @@ impl Session {
                 self.report(result);
             }
             skip_initial = true;
-            let deadline = Instant::now() + backoff;
-            while !self.control.stop.load(Ordering::SeqCst) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(25));
-            }
+            // close() unparks this thread, including a stop racing with this wait.
+            std::thread::park_timeout(backoff);
             backoff = (backoff * 2).min(Duration::from_secs(10));
         }
     }
@@ -174,6 +172,7 @@ impl Worker {
     fn close(&self) {
         self.control.stop.store(true, Ordering::SeqCst);
         self.control.gate.close();
+        self.thread.thread().unpark();
     }
 
     fn finish(self) -> Result<(), String> {

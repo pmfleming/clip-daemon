@@ -1,9 +1,11 @@
 //! Shared image-operation lifecycle: registration, cancellation and commit draining.
 use std::{
     collections::HashMap,
-    fs,
+    env,
+    fs::{self, File, OpenOptions},
     future::Future,
-    path::PathBuf,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU8, Ordering},
@@ -16,10 +18,12 @@ use tokio::{
 
 use crate::{
     backend::{BackendResult, operation_error},
+    editor::ImageEditorCommand,
     model::OperationResult,
 };
 
 pub(super) struct Operations {
+    editor: ImageEditorCommand,
     active: Mutex<HashMap<String, OperationTask>>,
     events: broadcast::Sender<OperationResult>,
 }
@@ -27,6 +31,7 @@ pub(super) struct Operations {
 impl Default for Operations {
     fn default() -> Self {
         Self {
+            editor: ImageEditorCommand::configured(),
             active: Mutex::default(),
             events: broadcast::channel(64).0,
         }
@@ -59,6 +64,13 @@ pub(super) struct OperationCompletion {
 }
 
 impl Operations {
+    pub async fn edit(&self, input: &Path, output: &Path) -> BackendResult<()> {
+        self.editor
+            .run(input, output)
+            .await
+            .map_err(operation_error)
+    }
+
     fn active(&self) -> BackendResult<MutexGuard<'_, HashMap<String, OperationTask>>> {
         self.active
             .lock()
@@ -195,6 +207,32 @@ impl Operations {
         }
         Ok(())
     }
+}
+
+pub(super) fn runtime_directory(child: &str) -> BackendResult<PathBuf> {
+    let root = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir);
+    private_directory(root.join(child))
+}
+
+pub(super) fn private_directory(path: PathBuf) -> BackendResult<PathBuf> {
+    fs::create_dir_all(&path).map_err(operation_error)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).map_err(operation_error)?;
+    Ok(path)
+}
+
+pub(super) fn private_file(path: &Path) -> BackendResult<File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(operation_error)
+}
+
+pub(super) fn unique_path(directory: &Path, extension: &str) -> PathBuf {
+    directory.join(format!("clipboard-{}.{}", uuid::Uuid::new_v4(), extension))
 }
 
 const EDITING: u8 = 0;

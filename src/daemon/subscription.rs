@@ -38,12 +38,6 @@ struct SubscriptionTask {
     requested: RequestedStreams,
 }
 
-struct LifecycleSubscription {
-    destination: SignalEmitter<'static>,
-    id: String,
-    streams: Vec<String>,
-}
-
 #[derive(Default)]
 struct HistoryState {
     previous: Option<u64>,
@@ -53,7 +47,7 @@ struct HistoryState {
 #[derive(Clone)]
 pub(super) enum HistoryUpdate {
     Changed(Value),
-    Unavailable(Value),
+    Unavailable(ApiError),
 }
 
 impl RequestedStreams {
@@ -87,28 +81,24 @@ impl SubscriptionTask {
         // subscriber also gets its own fresh baseline, even if polling is active.
         let history = self.requested.watches_clipboard().then(|| {
             receive_history(
-                self.destination.clone(),
+                &self.destination,
                 self.history_events.subscribe(),
-                Arc::clone(&self.api_service),
-                self.id.clone(),
+                &self.api_service,
+                &self.id,
                 self.requested,
             )
         });
         let operations = self.requested.operation.then(|| {
             poll_operations(
-                self.destination.clone(),
+                &self.destination,
                 self.api_service.operation_events(),
-                self.id.clone(),
+                &self.id,
             )
         });
-        let lifecycle = self.requested.lifecycle.then(|| {
-            LifecycleSubscription {
-                destination: self.destination.clone(),
-                id: self.id.clone(),
-                streams: self.streams.clone(),
-            }
-            .run(self.api_service.lifecycle_events())
-        });
+        let lifecycle = self
+            .requested
+            .lifecycle
+            .then(|| self.receive_lifecycle(self.api_service.lifecycle_events()));
         for stream in &self.streams {
             emit_event(&self.destination, stream, "subscribed", &self.id, None).await;
         }
@@ -132,7 +122,7 @@ where
 }
 
 impl HistoryState {
-    fn update(&mut self, result: Result<u64, Value>) -> Option<HistoryUpdate> {
+    fn update(&mut self, result: Result<u64, ApiError>) -> Option<HistoryUpdate> {
         match result {
             Ok(token) => self
                 .changed(token)
@@ -169,12 +159,13 @@ pub(super) async fn start(
     let id = daemon.subscriptions.next_id("subscription");
     let destination = emitter.set_destination(owner.clone().into()).to_owned();
     let connection = destination.connection().clone();
+    let response = api::success(json!({ "subscription": { "id": id, "streams": streams } }));
     let task = SubscriptionTask {
         destination,
         api_service: Arc::clone(&daemon.api),
         history_events: daemon.history_events.clone(),
         id: id.clone(),
-        streams: streams.clone(),
+        streams,
         requested,
     };
     if let Err(error) = daemon.subscriptions.spawn_for_owner(
@@ -186,7 +177,7 @@ pub(super) async fn start(
         return api::error("subscription-unavailable", error.to_string()).to_string();
     }
     tracing::debug!(subscription_id = %id, "clipboard subscription started");
-    api::success(json!({ "subscription": { "id": id, "streams": streams } })).to_string()
+    response.to_string()
 }
 
 pub(super) async fn observe_history(
@@ -231,10 +222,10 @@ async fn observe_history_tick(
 }
 
 async fn receive_history(
-    emitter: SignalEmitter<'static>,
+    emitter: &SignalEmitter<'_>,
     mut events: tokio::sync::broadcast::Receiver<HistoryUpdate>,
-    api_service: Arc<ApiService>,
-    subscription_id: String,
+    api_service: &ApiService,
+    subscription_id: &str,
     requested: RequestedStreams,
 ) {
     let initial = match api_service.change_token().await {
@@ -243,15 +234,15 @@ async fn receive_history(
         })),
         Err(error) => HistoryUpdate::Unavailable(error),
     };
-    emit_update(&emitter, &subscription_id, requested, initial).await;
+    emit_update(emitter, subscription_id, requested, initial).await;
     loop {
         match events.recv().await {
-            Ok(update) => emit_update(&emitter, &subscription_id, requested, update).await,
+            Ok(update) => emit_update(emitter, subscription_id, requested, update).await,
             Err(RecvError::Lagged(skipped)) => {
                 tracing::warn!(%subscription_id, skipped, "clipboard history events lagged");
                 emit_update(
-                    &emitter,
-                    &subscription_id,
+                    emitter,
+                    subscription_id,
                     requested,
                     HistoryUpdate::Changed(json!({
                         "change": "reset", "reason": "lagged", "skipped": skipped.to_string()
@@ -265,12 +256,10 @@ async fn receive_history(
 }
 
 async fn poll_operations(
-    emitter: SignalEmitter<'static>,
+    emitter: &SignalEmitter<'_>,
     events: tokio::sync::broadcast::Receiver<crate::model::OperationResult>,
-    subscription_id: String,
+    subscription_id: &str,
 ) {
-    let emitter = &emitter;
-    let subscription_id = subscription_id.as_str();
     forward_broadcast(events, move |update| async move {
         match update {
             BroadcastEvent::Item(operation) => {
@@ -300,13 +289,15 @@ async fn poll_operations(
     .await;
 }
 
-impl LifecycleSubscription {
-    async fn run(self, events: tokio::sync::broadcast::Receiver<api::LifecycleEvent>) {
-        let sink = &self;
+impl SubscriptionTask {
+    async fn receive_lifecycle(
+        &self,
+        events: tokio::sync::broadcast::Receiver<api::LifecycleEvent>,
+    ) {
         forward_broadcast(events, move |update| async move {
             match update {
-                BroadcastEvent::Item(update) => sink.emit(update).await,
-                BroadcastEvent::Lagged(skipped) => sink.emit_lag(skipped).await,
+                BroadcastEvent::Item(update) => self.emit(update).await,
+                BroadcastEvent::Lagged(skipped) => self.emit_lag(skipped).await,
             }
         })
         .await;
@@ -365,14 +356,9 @@ async fn emit_update(
 ) {
     let (events, data) = match update {
         HistoryUpdate::Changed(data) => (("reset", "changed"), EventBody::data(data)),
-        HistoryUpdate::Unavailable(error) => (
-            ("unavailable", "unavailable"),
-            EventBody::error(
-                serde_json::from_value(error["error"].clone()).unwrap_or_else(|_| {
-                    ApiError::new("clipboard-unavailable", "Clipboard history unavailable")
-                }),
-            ),
-        ),
+        HistoryUpdate::Unavailable(error) => {
+            (("unavailable", "unavailable"), EventBody::error(error))
+        }
     };
     emit_requested(emitter, subscription_id, requested, events, data).await;
 }
@@ -396,9 +382,8 @@ async fn emit_requested(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::{HistoryState, HistoryUpdate};
+    use shelllist_daemon_core::ApiError;
 
     #[test]
     fn history_state_emits_initial_changes_outages_and_recovery_once() {
@@ -413,10 +398,14 @@ mod tests {
             Some(HistoryUpdate::Changed(_))
         ));
         assert!(matches!(
-            state.update(Err(json!({ "error": "offline" }))),
+            state.update(Err(ApiError::new("offline", "History unavailable"))),
             Some(HistoryUpdate::Unavailable(_))
         ));
-        assert!(state.update(Err(json!({ "error": "offline" }))).is_none());
+        assert!(
+            state
+                .update(Err(ApiError::new("offline", "History unavailable")))
+                .is_none()
+        );
         assert!(matches!(
             state.update(Ok(2)),
             Some(HistoryUpdate::Changed(_))

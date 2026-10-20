@@ -67,11 +67,11 @@ impl ApiService {
         }
     }
 
-    pub(crate) async fn change_token(&self) -> Result<u64, Value> {
+    pub(crate) async fn change_token(&self) -> Result<u64, EnvelopeError> {
         self.actions
             .change_token()
             .await
-            .map_err(|error| json!({ "error": { "code": error.code, "message": error.message } }))
+            .map_err(|error| EnvelopeError::new(error.code, error.message))
     }
 
     pub(crate) fn operation_events(&self) -> actions::OperationEvents {
