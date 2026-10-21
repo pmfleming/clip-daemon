@@ -53,8 +53,36 @@ pub struct SearchResponse {
 #[derive(Debug)]
 struct RankedItem<'a> {
     item: &'a SearchItem,
-    normalized_title: String,
     match_score: i64,
+}
+
+/// Search-only projection prepared once when a catalog is replaced. Raw and
+/// normalized field copies are not both retained by the worker.
+#[derive(Debug)]
+pub struct PreparedCatalog {
+    items: Vec<SearchItem>,
+}
+
+impl PreparedCatalog {
+    pub fn new(items: &[SearchItem]) -> Self {
+        Self {
+            items: items
+                .iter()
+                .map(|item| SearchItem {
+                    key: item.key.clone(),
+                    title: normalize(&item.title),
+                    subtitle: normalize(&item.subtitle),
+                    keywords: item.keywords.iter().map(|value| normalize(value)).collect(),
+                    score: item.score,
+                    provider_priority: item.provider_priority,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn rank(&self, owner: String, generation: u64, query: &str) -> SearchResponse {
+        rank_prepared(owner, generation, query, &self.items)
+    }
 }
 
 fn normalize(value: &str) -> String {
@@ -94,6 +122,8 @@ fn token_score(field: &str, token: &str) -> Option<i64> {
         return Some(10_000 - index.min(500) as i64);
     }
 
+    // Keep a fresh matcher: 0.3.7's cross-input matrix cache changes some
+    // Unicode scores, and use_cache(false) panics on its RefCell borrow.
     let mut best = SkimMatcherV2::default()
         .fuzzy_match(field, token)
         .map(|score| 7_000 + score);
@@ -146,37 +176,35 @@ fn title_bonus(title: &str, query: &str) -> i64 {
     }
 }
 
-fn item_match(item: &SearchItem, query: &str) -> Option<(i64, String)> {
-    let title = normalize(&item.title);
-    let tokens = words(query).collect::<Vec<_>>();
+fn item_match(item: &SearchItem, query: &str, tokens: &[&str]) -> Option<i64> {
     if tokens.is_empty() {
-        return Some((0, title));
+        return Some(0);
     }
-
-    let subtitle = normalize(&item.subtitle);
-    let keywords = item
-        .keywords
-        .iter()
-        .map(|value| normalize(value))
-        .collect::<Vec<_>>();
-    let score = tokens.into_iter().try_fold(0, |total, token| {
-        best_token_score(&title, &subtitle, &keywords, token).map(|score| total + score)
+    let score = tokens.iter().try_fold(0, |total, token| {
+        best_token_score(&item.title, &item.subtitle, &item.keywords, token)
+            .map(|score| total + score)
     })?;
-    Some((score + title_bonus(&title, query), title))
+    Some(score + title_bonus(&item.title, query))
 }
 
 pub fn rank(owner: String, generation: u64, query: &str, items: &[SearchItem]) -> SearchResponse {
+    PreparedCatalog::new(items).rank(owner, generation, query)
+}
+
+fn rank_prepared(
+    owner: String,
+    generation: u64,
+    query: &str,
+    items: &[SearchItem],
+) -> SearchResponse {
     let query = normalize(query);
     let query = query.trim();
+    let tokens = words(query).collect::<Vec<_>>();
     let mut ranked = items
         .iter()
         .filter_map(|item| {
-            let (match_score, normalized_title) = item_match(item, query)?;
-            Some(RankedItem {
-                item,
-                normalized_title,
-                match_score,
-            })
+            let match_score = item_match(item, query, &tokens)?;
+            Some(RankedItem { item, match_score })
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|left, right| {
@@ -190,7 +218,7 @@ pub fn rank(owner: String, generation: u64, query: &str, items: &[SearchItem]) -
                     .provider_priority
                     .cmp(&left.item.provider_priority)
             })
-            .then_with(|| left.normalized_title.cmp(&right.normalized_title))
+            .then_with(|| left.item.title.cmp(&right.item.title))
             .then_with(|| left.item.key.cmp(&right.item.key))
     });
     SearchResponse {
@@ -211,13 +239,13 @@ fn write_line(output: &mut impl Write, value: &impl Serialize) -> io::Result<()>
 
 fn apply_command(
     command: Result<SearchCommand, String>,
-    catalogs: &mut HashMap<String, Vec<SearchItem>>,
+    catalogs: &mut HashMap<String, PreparedCatalog>,
     pending: &mut HashMap<String, (u64, String)>,
     output: &mut impl Write,
 ) -> io::Result<()> {
     match command {
         Ok(SearchCommand::Catalog { owner, items }) => {
-            catalogs.insert(owner, items);
+            catalogs.insert(owner, PreparedCatalog::new(&items));
         }
         Ok(SearchCommand::Query {
             owner,
@@ -237,13 +265,14 @@ fn apply_command(
 }
 
 fn send_pending(
-    catalogs: &HashMap<String, Vec<SearchItem>>,
+    catalogs: &HashMap<String, PreparedCatalog>,
     pending: &mut HashMap<String, (u64, String)>,
     output: &mut impl Write,
 ) -> io::Result<()> {
     for (owner, (generation, query)) in std::mem::take(pending) {
-        let items: &[SearchItem] = catalogs.get(&owner).map_or(&[], Vec::as_slice);
-        write_line(output, &rank(owner, generation, &query, items))?;
+        let empty = PreparedCatalog { items: Vec::new() };
+        let catalog = catalogs.get(&owner).unwrap_or(&empty);
+        write_line(output, &catalog.rank(owner, generation, &query))?;
     }
     Ok(())
 }
@@ -252,7 +281,7 @@ fn serve_commands(
     commands: mpsc::Receiver<Result<SearchCommand, String>>,
     mut output: impl Write,
 ) -> io::Result<()> {
-    let mut catalogs = HashMap::<String, Vec<SearchItem>>::new();
+    let mut catalogs = HashMap::<String, PreparedCatalog>::new();
     let mut pending = HashMap::<String, (u64, String)>::new();
 
     while let Ok(first) = commands.recv() {

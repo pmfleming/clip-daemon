@@ -57,6 +57,44 @@ fn optimized_token_scores_match_reference() {
     }
 }
 
+#[test]
+fn prepared_catalog_reuses_fields_without_changing_keys_or_ties() {
+    let items = catalog();
+    let prepared = PreparedCatalog::new(&items);
+    for query in ["", "—", "Café", "résumé edit", "devlop", "xy", "applcation"] {
+        assert_eq!(
+            prepared.rank("owner".into(), 7, query).keys,
+            rank("owner".into(), 7, query, &items).keys
+        );
+    }
+    let first = PreparedCatalog::new(&[SearchItem {
+        key: "first".into(),
+        title: "Café".into(),
+        subtitle: String::new(),
+        keywords: vec![],
+        score: 1,
+        provider_priority: 0,
+    }]);
+    assert_eq!(first.rank("owner".into(), 1, "cafe").keys, ["first"]);
+    let replacement = PreparedCatalog::new(&[]);
+    assert!(replacement.rank("owner".into(), 2, "cafe").keys.is_empty());
+}
+
+#[test]
+#[ignore = "manual prepared-catalog query probe; setup excluded"]
+fn profile_prepared_search_work() {
+    let items = PreparedCatalog::new(&catalog());
+    let start = Instant::now();
+    for iteration in 0..25 {
+        let query = ["applcation", "term", "xy", "résumé edit", "devlop"][iteration % 5];
+        black_box(items.rank("bench".into(), iteration as u64, query));
+    }
+    println!(
+        "25 rankings / 1000 normalized catalog rows: {:.3} ms",
+        start.elapsed().as_secs_f64() * 1000.0
+    );
+}
+
 pub(super) fn catalog() -> Vec<SearchItem> {
     (0..1000)
         .map(|index| SearchItem {
