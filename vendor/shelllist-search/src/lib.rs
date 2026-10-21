@@ -5,6 +5,9 @@ use std::{
     thread,
 };
 
+#[cfg(test)]
+mod performance_tests;
+
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
@@ -96,12 +99,20 @@ fn token_score(field: &str, token: &str) -> Option<i64> {
         .map(|score| 7_000 + score);
     let token_length = token.chars().count();
     let typo_limit = allowed_typos(token_length);
+    // Exact/prefix/substring cases already returned above. A zero-edit match
+    // cannot improve the remaining fuzzy result, and edit distance is bounded
+    // below by the difference in Unicode scalar counts.
+    if typo_limit == 0 {
+        return best;
+    }
     for word in words(field) {
+        let length_difference = word.chars().count().abs_diff(token_length);
+        if length_difference > typo_limit {
+            continue;
+        }
         let distance = strsim::osa_distance(word, token);
         if distance <= typo_limit {
-            let score = 9_000
-                - distance as i64 * 900
-                - word.chars().count().abs_diff(token_length) as i64 * 25;
+            let score = 9_000 - distance as i64 * 900 - length_difference as i64 * 25;
             best = Some(best.map_or(score, |current| current.max(score)));
         }
     }
