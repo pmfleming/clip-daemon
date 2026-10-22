@@ -33,6 +33,36 @@ fn entry(id: &str, kind: EntryKind, text: Option<&str>) -> EntryDetails {
 }
 
 #[tokio::test]
+async fn sensitive_publication_never_falls_back_to_history_capable_publication() {
+    // This backend supports ordinary publication but deliberately has no
+    // sensitive-source capability. A valid request must fail closed.
+    let backend = Arc::new(FakeBackend::with_entries(vec![entry(
+        "keep",
+        EntryKind::Text,
+        Some("keep"),
+    )]));
+    let api = ApiService::new(backend);
+    let before = api.dispatch("clipboard.history.query", json!({})).await;
+    for params in [
+        json!({"text":"001234", "expiry_seconds":0}),
+        json!({"text":"001234", "expiry_seconds":5}),
+        json!({"text":"001234", "expiry_seconds":301}),
+        json!({"text":"1".repeat(257), "expiry_seconds":30}),
+        json!({"text":"001234", "expiry_seconds":30, "persist":true}),
+    ] {
+        assert_eq!(
+            api.dispatch("clipboard.selection.publishSensitive", params)
+                .await["ok"],
+            false
+        );
+    }
+    assert_eq!(
+        api.dispatch("clipboard.history.query", json!({})).await,
+        before
+    );
+}
+
+#[tokio::test]
 async fn wipe_requires_a_verified_capture_fence_before_deleting_anything() {
     struct FailedFence;
     #[async_trait::async_trait]
