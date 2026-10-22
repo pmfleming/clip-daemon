@@ -19,6 +19,10 @@ impl OfferedMimes {
         }
         self.count += 1;
         self.bytes += value.len();
+        if value == "application/x-shelllist-sensitive" || value == "x-kde-passwordManagerHint" {
+            self.rejected = true;
+            return;
+        }
         if value.is_empty()
             || self.count > 64
             || self.bytes > 8192
@@ -59,7 +63,12 @@ mod tests {
             mimes.add("x-kde-passwordManagerHint".into());
             assert!(mimes.next().is_none());
         }
-        for bad in ["a".repeat(97), "text/plain\n".into(), "text/é".into()] {
+        for bad in [
+            "a".repeat(97),
+            "text/plain\n".into(),
+            "text/é".into(),
+            "application/x-shelllist-sensitive".into(),
+        ] {
             let mut mimes = OfferedMimes::default();
             mimes.add("text/plain".into());
             mimes.add(bad);

@@ -235,6 +235,25 @@ impl ClipboardService {
         Ok(json!({ "operation": operation }))
     }
 
+    pub(crate) async fn publish_sensitive(
+        &self,
+        params: SensitiveTextParams,
+    ) -> Result<Value, ApiError> {
+        if params.text.is_empty()
+            || params.text.len() > 256
+            || (params.expiry_seconds != 0 && !(10..=300).contains(&params.expiry_seconds))
+        {
+            return Err(ApiError::validation(
+                "Sensitive text must be 1–256 bytes; expiry must be 0 or 10–300 seconds",
+            ));
+        }
+        let operation = self
+            .backend
+            .publish_sensitive(params.text, params.expiry_seconds)
+            .await?;
+        Ok(json!({"operation": operation}))
+    }
+
     pub(crate) async fn publish_text(
         &self,
         params: PublishTextParams,
@@ -502,6 +521,13 @@ pub(crate) struct QueryParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PublishTextParams {
     text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SensitiveTextParams {
+    text: String,
+    expiry_seconds: u16,
 }
 
 #[derive(Deserialize)]

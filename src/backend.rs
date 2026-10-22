@@ -214,6 +214,15 @@ pub trait ClipboardBackend: Send + Sync {
         bytes: Vec<u8>,
         max_bytes: u64,
     ) -> BackendResult<OperationResult>;
+    async fn publish_sensitive(
+        &self,
+        _text: String,
+        _seconds: u16,
+    ) -> BackendResult<OperationResult> {
+        Err(BackendError::unavailable(
+            "Sensitive clipboard publication unavailable",
+        ))
+    }
     async fn publish_files(
         &self,
         selection: FileSelection,

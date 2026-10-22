@@ -41,5 +41,7 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 benchmarks = []
 
 [dev-dependencies]
+wayland-server = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["server"] }
 allocation-counter = "0.8.1"
 tempfile = "3"

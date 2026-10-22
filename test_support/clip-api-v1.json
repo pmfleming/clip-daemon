@@ -157,6 +157,15 @@
         "stream": "clipboard.operation"
       },
       {
+        "name": "clipboard.selection.publishSensitive",
+        "params_example": {
+          "text": "123456",
+          "expiry_seconds": 30
+        },
+        "response_key": "operation",
+        "stream": "clipboard.operation"
+      },
+      {
         "name": "clipboard.selection.publishFiles",
         "params_example": {
           "operation": "copy",

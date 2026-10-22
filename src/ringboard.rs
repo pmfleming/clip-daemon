@@ -505,6 +505,16 @@ impl RingboardBackend {
         ))
     }
 
+    fn publish_sensitive_sync(&self, text: String, seconds: u16) -> BackendResult<OperationResult> {
+        // No Ringboard insert, temporary file or ordinary publisher fallback.
+        self.selection
+            .publish_sensitive(text.into_bytes(), seconds)?;
+        Ok(OperationResult::completed(
+            "publish-sensitive",
+            "Sensitive content copied without history",
+        ))
+    }
+
     fn publish_files_sync(
         &self,
         file_selection: FileSelection,
@@ -698,6 +708,14 @@ impl ClipboardBackend for RingboardBackend {
     ) -> BackendResult<OperationResult> {
         let mime = mime.to_owned();
         run_backend!(self, publish_sync(&mime, bytes, max_bytes))
+    }
+
+    async fn publish_sensitive(
+        &self,
+        text: String,
+        seconds: u16,
+    ) -> BackendResult<OperationResult> {
+        run_backend!(self, publish_sensitive_sync(text, seconds))
     }
 
     async fn publish_files(

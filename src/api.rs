@@ -195,6 +195,9 @@ impl ApiService {
             | "clipboard.capture.interactive" => self.dispatch_capture(method, params).await,
             "clipboard.settings.get" => self.get_settings().await,
             "clipboard.settings.update" => self.update_settings(decode(params)?).await,
+            "clipboard.selection.publishSensitive" => {
+                self.actions.publish_sensitive(decode(params)?).await
+            }
             "clipboard.selection.publishText" => {
                 self.actions
                     .publish_text(decode(params)?, self.max_entry_bytes()?)

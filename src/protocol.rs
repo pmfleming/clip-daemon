@@ -28,6 +28,7 @@ pub const METHODS: &[&str] = &[
     "clipboard.capture.screenshot",
     "clipboard.capture.interactive",
     "clipboard.selection.publishText",
+    "clipboard.selection.publishSensitive",
     "clipboard.selection.publishFiles",
     "clipboard.settings.get",
     "clipboard.settings.update",

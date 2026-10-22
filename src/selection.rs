@@ -7,9 +7,15 @@ use crate::backend::{
 };
 
 pub use crate::backend::MAX_WAYLAND_SELECTION_BYTES;
+mod secret;
 
 pub trait SelectionPublisher: Send + Sync {
     fn publish(&self, mime: &str, bytes: Vec<u8>) -> BackendResult<()>;
+    fn publish_sensitive(&self, _bytes: Vec<u8>, _seconds: u16) -> BackendResult<()> {
+        Err(selection_error(
+            "Sensitive clipboard publication unavailable".into(),
+        ))
+    }
 
     fn publish_file_link(&self, uri: Vec<u8>) -> BackendResult<()> {
         self.publish("text/uri-list", uri)
@@ -25,6 +31,10 @@ pub trait SelectionPublisher: Send + Sync {
 pub struct WaylandSelectionPublisher;
 
 impl SelectionPublisher for WaylandSelectionPublisher {
+    fn publish_sensitive(&self, bytes: Vec<u8>, seconds: u16) -> BackendResult<()> {
+        secret::publish(bytes, seconds).map_err(selection_error)
+    }
+
     fn publish(&self, mime: &str, bytes: Vec<u8>) -> BackendResult<()> {
         clipboard_options(!supports_text_aliases(mime, &bytes))
             .copy(
@@ -104,6 +114,10 @@ impl SelectionService {
         validate_mime(mime)?;
         validate_size(bytes.len() as u64, configured_limit)?;
         self.publisher.publish(mime, bytes)
+    }
+
+    pub fn publish_sensitive(&self, bytes: Vec<u8>, seconds: u16) -> BackendResult<()> {
+        self.publisher.publish_sensitive(bytes, seconds)
     }
 
     pub fn publish_file_link(&self, uri: Vec<u8>, configured_limit: u64) -> BackendResult<()> {
