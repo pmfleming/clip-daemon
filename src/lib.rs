@@ -1,4 +1,6 @@
 mod actions;
+#[cfg(test)]
+mod frontend_contract;
 mod history_search;
 mod wayland_io;
 

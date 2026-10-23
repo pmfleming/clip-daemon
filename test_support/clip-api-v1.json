@@ -1,5 +1,13 @@
 {
   "protocol": "clip-api",
+  "history_example": {
+    "revision": 1,
+    "generation": 0,
+    "current": null,
+    "entries": [{"id":"entry-example", "revision":1, "kind":"text", "mime":"text/plain", "byte_size":4, "favorite":false, "current":false, "preview":"test"}],
+    "has_more": false,
+    "next_offset": null
+  },
   "registry": {
     "methods": [
       {
