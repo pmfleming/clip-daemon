@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     env,
     fs::{self, File},
     io::Write,
@@ -94,7 +95,8 @@ impl RingboardBackend {
     ) -> BackendResult<OperationResult> {
         let (summary, bytes) = selected_image(self, opaque_id, expected_revision, max_bytes)?;
         let content = resolved_content(&summary.mime, &bytes, max_bytes);
-        let (path, created) = prepare_image_file(&content, &bytes)?;
+        let path = prepare_image_file(&content, &bytes)?;
+        let created = matches!(path, Cow::Owned(_));
         self.track_image_file(&path, created, &summary.id, content.mime(), &bytes)?;
         if let Err(error) = publish_image_uri(self, &path, max_bytes) {
             self.rollback_image_file(&path, created)?;
@@ -382,16 +384,16 @@ fn publish_entry(
     }
 }
 
-fn prepare_image_file(
-    content: &ResolvedContent<'_>,
+fn prepare_image_file<'a>(
+    content: &'a ResolvedContent<'_>,
     bytes: &[u8],
-) -> BackendResult<(PathBuf, bool)> {
+) -> BackendResult<Cow<'a, Path>> {
     match content.image() {
-        Some(ResolvedImage::LocalFile(source)) => Ok((source.path.clone(), false)),
+        Some(ResolvedImage::LocalFile(source)) => Ok(Cow::Borrowed(&source.path)),
         Some(ResolvedImage::Inline { mime, .. }) => {
             let path = unique_path(&image_directory()?, image_extension(mime));
             write_private(&path, bytes)?;
-            Ok((path, true))
+            Ok(Cow::Owned(path))
         }
         None => Err(invalid_entry("Only image entries support this action")),
     }

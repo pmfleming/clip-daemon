@@ -190,9 +190,17 @@ impl ApiService {
 
     async fn dispatch_policy(&self, method: &str, params: Value) -> Result<Value, ApiError> {
         match method {
-            "clipboard.capture.setPaused"
-            | "clipboard.capture.screenshot"
-            | "clipboard.capture.interactive" => self.dispatch_capture(method, params).await,
+            "clipboard.capture.setPaused" => self.set_paused(decode(params)?).await,
+            "clipboard.capture.interactive" => {
+                self.actions
+                    .interactive_screenshot(decode(params)?, self.max_entry_bytes()?)
+                    .await
+            }
+            "clipboard.capture.screenshot" => {
+                self.actions
+                    .capture_screenshot(decode(params)?, self.max_entry_bytes()?)
+                    .await
+            }
             "clipboard.settings.get" => self.get_settings().await,
             "clipboard.settings.update" => self.update_settings(decode(params)?).await,
             "clipboard.selection.publishSensitive" => {
@@ -206,23 +214,6 @@ impl ApiService {
             "clipboard.selection.publishFiles" => {
                 self.actions
                     .publish_files(decode(params)?, self.max_entry_bytes()?)
-                    .await
-            }
-            _ => Err(unknown_method(method)),
-        }
-    }
-
-    async fn dispatch_capture(&self, method: &str, params: Value) -> Result<Value, ApiError> {
-        match method {
-            "clipboard.capture.setPaused" => self.set_paused(decode(params)?).await,
-            "clipboard.capture.interactive" => {
-                self.actions
-                    .interactive_screenshot(decode(params)?, self.max_entry_bytes()?)
-                    .await
-            }
-            "clipboard.capture.screenshot" => {
-                self.actions
-                    .capture_screenshot(decode(params)?, self.max_entry_bytes()?)
                     .await
             }
             _ => Err(unknown_method(method)),

@@ -148,7 +148,7 @@ impl ArtifactRegistry {
         mime: &str,
         bytes: &[u8],
     ) -> BackendResult<()> {
-        let mut content = super::content_hasher();
+        let mut content = super::content::content_hasher();
         content.update(bytes);
         let identity = inline_image_identity(mime, &content.finalize().into());
         self.inline_echoes.insert(
@@ -357,7 +357,7 @@ mod tests {
 
         use sha2::Digest;
         let digest = |bytes: &[u8]| {
-            let mut hash = super::super::content_hasher();
+            let mut hash = super::super::content::content_hasher();
             hash.update(bytes);
             <[u8; 32]>::from(hash.finalize())
         };
@@ -370,7 +370,7 @@ mod tests {
         let restored = ArtifactRegistry::load(None, Some(manifest));
         assert_eq!(echo(&restored, "captured-echo"), Some("replacement".into()));
 
-        let large = vec![7; INSPECTION_LIMIT + 10];
+        let mut large = vec![7; INSPECTION_LIMIT + 10];
         registry
             .register_inline_echo("large-replacement", "image/png", &large)
             .unwrap();
@@ -378,11 +378,10 @@ mod tests {
             registry.match_inline_echo("image/png", &digest(&large), "large-echo"),
             Some("large-replacement".into())
         );
-        let mut different = large.clone();
-        *different.last_mut().unwrap() = 8;
+        *large.last_mut().unwrap() = 8;
         assert!(
             registry
-                .match_inline_echo("image/png", &digest(&different), "distinct")
+                .match_inline_echo("image/png", &digest(&large), "distinct")
                 .is_none()
         );
         assert!(

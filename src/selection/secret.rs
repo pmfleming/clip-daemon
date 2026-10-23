@@ -1,9 +1,6 @@
 //! Memory-only data-control source. Expiry drops *this connection*, never clears
 //! the seat selection, so a newer owner cannot be erased by an old timer.
-use rustix::{
-    event::{PollFd, PollFlags, Timespec, poll},
-    fs::{OFlags, fcntl_setfl},
-};
+use rustix::fs::{OFlags, fcntl_setfl};
 use std::{
     fs::File,
     io::Write,
@@ -43,13 +40,7 @@ impl Drop for Admission {
 }
 
 pub(super) fn publish(text: Vec<u8>, seconds: u16) -> Result<(), String> {
-    if text.is_empty()
-        || text.len() > 256
-        || std::str::from_utf8(&text).is_err()
-        || (seconds != 0 && !(10..=300).contains(&seconds))
-    {
-        return Err("Invalid sensitive clipboard payload or expiry".into());
-    }
+    super::validate_sensitive(&text, seconds)?;
     OWNERS
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
             (n < 16).then_some(n + 1)
@@ -201,37 +192,16 @@ fn run_on(
         if let Some(error) = state.error {
             return Err(error.into());
         }
-        if state.owned {
-            if state.owners == 0 {
-                return Ok(());
-            }
-            if !acknowledged {
-                deadline = expiry.map(|duration| Instant::now() + duration);
-                ack.send(Ok(()))
-                    .map_err(|_| "Sensitive clipboard caller disappeared")?;
-                acknowledged = true;
-            }
+        if state.owned && state.owners == 0 {
+            return Ok(());
         }
-        queue
-            .flush()
-            .map_err(|_| "Sensitive clipboard flush failed")?;
-        let Some(guard) = queue.prepare_read() else {
-            continue;
-        };
-        let mut fds = [PollFd::new(&connection, PollFlags::IN)];
-        let timeout = Timespec {
-            tv_sec: 0,
-            tv_nsec: 25_000_000,
-        };
-        match poll(&mut fds, Some(&timeout)) {
-            Ok(_) if !fds[0].revents().is_empty() => {
-                guard
-                    .read()
-                    .map_err(|_| "Sensitive clipboard disconnected")?;
-            }
-            Ok(_) | Err(rustix::io::Errno::INTR) => {}
-            Err(_) => return Err("Sensitive clipboard poll failed".into()),
+        if state.owned && !acknowledged {
+            deadline = expiry.map(|duration| Instant::now() + duration);
+            ack.send(Ok(()))
+                .map_err(|_| "Sensitive clipboard caller disappeared")?;
+            acknowledged = true;
         }
+        crate::wayland_io::read_events::<_, 1>(&connection, &mut queue, [])?;
     }
 }
 impl Dispatch<wl_registry::WlRegistry, ()> for State {

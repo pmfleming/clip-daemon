@@ -239,14 +239,8 @@ impl ClipboardService {
         &self,
         params: SensitiveTextParams,
     ) -> Result<Value, ApiError> {
-        if params.text.is_empty()
-            || params.text.len() > 256
-            || (params.expiry_seconds != 0 && !(10..=300).contains(&params.expiry_seconds))
-        {
-            return Err(ApiError::validation(
-                "Sensitive text must be 1–256 bytes; expiry must be 0 or 10–300 seconds",
-            ));
-        }
+        crate::selection::validate_sensitive(params.text.as_bytes(), params.expiry_seconds)
+            .map_err(ApiError::validation)?;
         let operation = self
             .backend
             .publish_sensitive(params.text, params.expiry_seconds)

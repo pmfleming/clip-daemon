@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, File},
+    fs,
     os::unix::fs::MetadataExt,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
@@ -10,7 +10,7 @@ use std::{
 use tokio::{sync::broadcast, task::spawn_blocking};
 
 use async_trait::async_trait;
-use clipboard_history_client_sdk::{DatabaseReader, Entry, EntryReader, LoadedEntry};
+use clipboard_history_client_sdk::{DatabaseReader, Entry, EntryReader};
 use clipboard_history_core::{dirs::data_dir, protocol::RingKind};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -331,8 +331,8 @@ impl RingboardBackend {
         entry: Entry,
         reader: &mut EntryReader,
     ) -> BackendResult<Option<ResolvedEntry>> {
-        let summary = match catch_unwind(AssertUnwindSafe(|| self.summarize(entry, reader))) {
-            Ok(Ok(summary)) => Some(summary),
+        match catch_unwind(AssertUnwindSafe(|| self.summarize(entry, reader))) {
+            Ok(Ok(summary)) => Ok(Some(summary)),
             Ok(Err(error))
                 if matches!(
                     error.kind,
@@ -340,15 +340,14 @@ impl RingboardBackend {
                 ) =>
             {
                 tracing::warn!(code = %error.kind.code(), "Skipping unreadable clipboard entry");
-                None
+                Ok(None)
             }
-            Ok(Err(error)) => return Err(error),
+            Ok(Err(error)) => Err(error),
             Err(_) => {
                 tracing::warn!("Skipping clipboard entry that panicked while being read");
-                None
+                Ok(None)
             }
-        };
-        Ok(summary)
+        }
     }
 
     pub(super) fn generated_artifact_references(&self) -> BackendResult<HashSet<PathBuf>> {
@@ -795,24 +794,6 @@ fn storage_mime(mime: &str) -> &str {
     }
 }
 
-fn stored_mime_type(loaded: &LoadedEntry<'_, File>) -> BackendResult<String> {
-    let Some(file) = loaded.backing_file() else {
-        return loaded
-            .mime_type()
-            .map(|mime| mime.as_str().to_owned())
-            .map_err(|_| invalid_data("Could not read clipboard MIME metadata"));
-    };
-    let mut bytes = [0_u8; 255];
-    let length = match rustix::fs::fgetxattr(file, c"user.mime_type", &mut bytes[..]) {
-        Ok(length) => length,
-        Err(rustix::io::Errno::NODATA) => return Ok(String::new()),
-        Err(_) => return Err(invalid_data("Could not read clipboard MIME metadata")),
-    };
-    std::str::from_utf8(&bytes[..length])
-        .map(str::to_owned)
-        .map_err(|_| invalid_data("Clipboard MIME metadata is not valid UTF-8"))
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RingFileState {
     device: u64,
@@ -889,19 +870,6 @@ fn history_token_from_parts(
     u64::from_le_bytes(token)
 }
 
-fn load_entry(
-    entry: Entry,
-    reader: &mut EntryReader,
-) -> BackendResult<(LoadedEntry<'_, File>, fs::Metadata)> {
-    let loaded = entry
-        .to_file(reader)
-        .map_err(|_| invalid_data("Could not open clipboard entry"))?;
-    let metadata = loaded
-        .metadata()
-        .map_err(|_| invalid_data("Could not read clipboard entry metadata"))?;
-    Ok((loaded, metadata))
-}
-
 fn encode_file_uris(paths: &[PathBuf]) -> BackendResult<Vec<u8>> {
     paths.iter().try_fold(Vec::new(), |mut bytes, path| {
         if !path.is_absolute() {
@@ -927,32 +895,4 @@ fn matches_query(summary: &EntrySummary, needle: &str) -> bool {
 
 fn lock_error() -> BackendError {
     operation_failed("Clipboard backend state is unavailable")
-}
-
-fn content_hasher() -> Sha256 {
-    let mut hash = Sha256::new();
-    hash.update(b"clip-daemon:entry-content:v1:");
-    hash
-}
-
-fn entry_fingerprint(raw_id: u64, size: u64, mime: &str, content_digest: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"clip-daemon:entry-fingerprint:v4:");
-    hasher.update(raw_id.to_le_bytes());
-    hasher.update(size.to_le_bytes());
-    hasher.update(mime.as_bytes());
-    hasher.update(content_digest);
-    hasher.finalize().into()
-}
-
-fn opaque_id(fingerprint: &[u8; 32]) -> String {
-    format!("entry-{}", hex::encode(&fingerprint[..16]))
-}
-
-const MAX_SAFE_JSON_INTEGER: u64 = (1 << 53) - 1;
-
-fn entry_revision(fingerprint: &[u8; 32]) -> u64 {
-    let mut revision = [0; 8];
-    revision.copy_from_slice(&fingerprint[16..24]);
-    (u64::from_le_bytes(revision) & MAX_SAFE_JSON_INTEGER).max(1)
 }

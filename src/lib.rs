@@ -1,5 +1,6 @@
 mod actions;
 mod history_search;
+mod wayland_io;
 
 pub mod api;
 pub mod backend;

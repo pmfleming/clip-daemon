@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use clipboard_history_client_sdk::{Entry, EntryReader};
+use clipboard_history_client_sdk::{Entry, EntryReader, LoadedEntry};
 use clipboard_history_core::protocol::RingKind;
 use image::{DynamicImage, ImageReader, Limits};
 use sha2::{Digest, Sha256};
@@ -23,10 +23,66 @@ use crate::{
     selection::read_selection,
 };
 
-use super::{
-    MAX_DETAILS_BYTES, ResolvedEntry, RingboardBackend, content_hasher, entry_fingerprint,
-    entry_revision, ipc, load_entry, opaque_id, stored_mime_type,
-};
+use super::{MAX_DETAILS_BYTES, ResolvedEntry, RingboardBackend, ipc};
+
+pub(super) fn stored_mime_type(loaded: &LoadedEntry<'_, File>) -> BackendResult<String> {
+    let Some(file) = loaded.backing_file() else {
+        return loaded
+            .mime_type()
+            .map(|mime| mime.as_str().to_owned())
+            .map_err(|_| invalid_entry("Could not read clipboard MIME metadata"));
+    };
+    let mut bytes = [0_u8; 255];
+    let length = match rustix::fs::fgetxattr(file, c"user.mime_type", &mut bytes[..]) {
+        Ok(length) => length,
+        Err(rustix::io::Errno::NODATA) => return Ok(String::new()),
+        Err(_) => return Err(invalid_entry("Could not read clipboard MIME metadata")),
+    };
+    std::str::from_utf8(&bytes[..length])
+        .map(str::to_owned)
+        .map_err(|_| invalid_entry("Clipboard MIME metadata is not valid UTF-8"))
+}
+
+pub(super) fn load_entry(
+    entry: Entry,
+    reader: &mut EntryReader,
+) -> BackendResult<(LoadedEntry<'_, File>, fs::Metadata)> {
+    let loaded = entry
+        .to_file(reader)
+        .map_err(|_| invalid_entry("Could not open clipboard entry"))?;
+    let metadata = loaded
+        .metadata()
+        .map_err(|_| invalid_entry("Could not read clipboard entry metadata"))?;
+    Ok((loaded, metadata))
+}
+
+pub(super) fn content_hasher() -> Sha256 {
+    let mut hash = Sha256::new();
+    hash.update(b"clip-daemon:entry-content:v1:");
+    hash
+}
+
+fn entry_fingerprint(raw_id: u64, size: u64, mime: &str, content_digest: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"clip-daemon:entry-fingerprint:v4:");
+    hasher.update(raw_id.to_le_bytes());
+    hasher.update(size.to_le_bytes());
+    hasher.update(mime.as_bytes());
+    hasher.update(content_digest);
+    hasher.finalize().into()
+}
+
+fn opaque_id(fingerprint: &[u8; 32]) -> String {
+    format!("entry-{}", hex::encode(&fingerprint[..16]))
+}
+
+const MAX_SAFE_JSON_INTEGER: u64 = (1 << 53) - 1;
+
+fn entry_revision(fingerprint: &[u8; 32]) -> u64 {
+    let mut revision = [0; 8];
+    revision.copy_from_slice(&fingerprint[16..24]);
+    (u64::from_le_bytes(revision) & MAX_SAFE_JSON_INTEGER).max(1)
+}
 
 impl RingboardBackend {
     pub(super) fn summarize(
@@ -540,10 +596,10 @@ mod tests {
     use std::{fs, os::unix::fs::symlink};
 
     use super::{
-        INSPECTION_LIMIT, MAX_THUMBNAIL_BYTES, ResolvedContent, entry_fingerprint, entry_revision,
-        inspect_entry, opaque_id, valid_edited_image,
+        INSPECTION_LIMIT, MAX_SAFE_JSON_INTEGER, MAX_THUMBNAIL_BYTES, ResolvedContent,
+        entry_fingerprint, entry_revision, inspect_entry, opaque_id, valid_edited_image,
     };
-    use crate::{model::EntryKind, ringboard::MAX_SAFE_JSON_INTEGER};
+    use crate::model::EntryKind;
 
     #[test]
     fn edited_images_must_fully_decode() {
@@ -606,16 +662,14 @@ mod tests {
             fingerprint(42, "text/plain", b""),
             fingerprint(42, "text/plain", b"a")
         );
-        let mut first = vec![b'a'; INSPECTION_LIMIT + 1];
-        let mut second = first.clone();
-        first[INSPECTION_LIMIT] = b'x';
-        second[INSPECTION_LIMIT] = b'y';
-
-        let identity = fingerprint(42, "text/plain", &first);
-        let changed = fingerprint(42, "text/plain", &second);
+        let mut bytes = vec![b'a'; INSPECTION_LIMIT + 1];
+        bytes[INSPECTION_LIMIT] = b'x';
+        let identity = fingerprint(42, "text/plain", &bytes);
+        assert_eq!(identity, fingerprint(42, "text/plain", &bytes));
+        assert_ne!(identity, fingerprint(43, "text/plain", &bytes));
+        bytes[INSPECTION_LIMIT] = b'y';
+        let changed = fingerprint(42, "text/plain", &bytes);
         assert_ne!(identity, changed);
-        assert_eq!(identity, fingerprint(42, "text/plain", &first));
-        assert_ne!(identity, fingerprint(43, "text/plain", &first));
         assert_ne!(opaque_id(&identity), opaque_id(&changed));
         assert_ne!(entry_revision(&identity), entry_revision(&changed));
         assert!(entry_revision(&[u8::MAX; 32]) <= MAX_SAFE_JSON_INTEGER);

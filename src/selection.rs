@@ -117,6 +117,7 @@ impl SelectionService {
     }
 
     pub fn publish_sensitive(&self, bytes: Vec<u8>, seconds: u16) -> BackendResult<()> {
+        validate_sensitive(&bytes, seconds).map_err(crate::backend::invalid_data)?;
         self.publisher.publish_sensitive(bytes, seconds)
     }
 
@@ -156,6 +157,16 @@ impl SelectionService {
         self.publisher
             .publish(mime, read_path(path, configured_limit)?)
     }
+}
+
+pub(crate) fn validate_sensitive(bytes: &[u8], seconds: u16) -> Result<(), &'static str> {
+    if !(1..=256).contains(&bytes.len())
+        || std::str::from_utf8(bytes).is_err()
+        || (seconds != 0 && !(10..=300).contains(&seconds))
+    {
+        return Err("Sensitive text must be 1–256 UTF-8 bytes; expiry must be 0 or 10–300 seconds");
+    }
+    Ok(())
 }
 
 pub(crate) fn read_path(path: &Path, max_bytes: u64) -> BackendResult<Vec<u8>> {

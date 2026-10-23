@@ -8,7 +8,11 @@ use std::{
 
 use sha2::Digest;
 
-use super::{RingboardBackend, ipc, load_entry, stored_mime_type};
+use super::{
+    RingboardBackend,
+    content::{content_hasher, load_entry, stored_mime_type},
+    ipc,
+};
 use crate::{backend::BackendResult, capture::CaptureSink};
 
 impl CaptureSink for RingboardBackend {
@@ -41,7 +45,7 @@ fn ingest_admitted(backend: &RingboardBackend, mime: &str, mut file: &File) -> R
     }
     file.rewind()
         .map_err(|_| "Could not rewind captured bytes")?;
-    let mut digest = super::content_hasher();
+    let mut digest = content_hasher();
     std::io::copy(&mut file.take(size + 1), &mut digest)
         .map_err(|_| "Could not hash captured bytes")?;
     let stored_mime = super::storage_mime(mime);

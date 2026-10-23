@@ -2,13 +2,12 @@
 use std::{
     collections::HashMap,
     fs::File,
-    os::fd::{AsFd, BorrowedFd},
+    os::fd::AsFd,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use rustix::{
-    event::{PollFd, PollFlags, Timespec, poll},
     fs::{OFlags, fcntl_setfl},
     pipe::{PipeFlags, pipe_with},
 };
@@ -297,47 +296,16 @@ pub(super) fn run(session: Arc<Session>, skip_initial: bool) -> Result<(), Strin
             return Err("Wayland capture initialization timed out".into());
         }
         state.receive();
-        queue.flush().map_err(|_| "Wayland capture flush failed")?;
-        let Some(guard) = queue.prepare_read() else {
-            continue;
-        };
-        if wait_readable(
+        crate::wayland_io::read_events::<_, { MAX_TRANSFERS + 1 }>(
             &connection,
+            &mut queue,
             state
                 .transfers
                 .iter()
                 .map(|receiving| receiving.transfer.as_fd()),
-        )? {
-            guard.read().map_err(|_| "Wayland capture disconnected")?;
-        }
+        )?;
     }
     Ok(())
-}
-
-fn wait_readable<'fd>(
-    connection: &'fd impl AsFd,
-    transfers: impl IntoIterator<Item = BorrowedFd<'fd>>,
-) -> Result<bool, String> {
-    // One connection plus the bounded in-flight transfers; no per-tick heap allocation.
-    let mut fds: [_; MAX_TRANSFERS + 1] =
-        std::array::from_fn(|_| PollFd::new(connection, PollFlags::IN));
-    let mut count = 1;
-    for fd in transfers {
-        let slot = fds
-            .get_mut(count)
-            .ok_or("Too many capture transfers to poll")?;
-        *slot = PollFd::from_borrowed_fd(fd, PollFlags::IN);
-        count += 1;
-    }
-    let timeout = Timespec {
-        tv_sec: 0,
-        tv_nsec: 25_000_000,
-    };
-    match poll(&mut fds[..count], Some(&timeout)) {
-        Ok(_) => Ok(!fds[0].revents().is_empty()),
-        Err(rustix::io::Errno::INTR) => Ok(false),
-        Err(_) => Err("Wayland capture poll failed".into()),
-    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for State {
