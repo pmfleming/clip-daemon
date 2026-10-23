@@ -72,8 +72,8 @@ fn prepared_catalog_reuses_fields_without_changing_keys_or_ties() {
         title: "Café".into(),
         subtitle: String::new(),
         keywords: vec![],
-        score: 1,
-        provider_priority: 0,
+        score: 1.0,
+        provider_priority: 0.0,
     }]);
     assert_eq!(first.rank("owner".into(), 1, "cafe").keys, ["first"]);
     let replacement = PreparedCatalog::new(&[]);
@@ -106,8 +106,8 @@ pub(super) fn catalog() -> Vec<SearchItem> {
                 "Development".into(),
                 format!("application-{index:04}"),
             ],
-            score: index % 10,
-            provider_priority: 0,
+            score: f64::from(index % 10),
+            provider_priority: 0.0,
         })
         .collect()
 }

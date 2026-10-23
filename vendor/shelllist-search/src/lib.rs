@@ -15,6 +15,9 @@ use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum SearchCommand {
+    Release {
+        owner: String,
+    },
     Catalog {
         owner: String,
         #[serde(default)]
@@ -38,9 +41,9 @@ pub struct SearchItem {
     #[serde(default)]
     pub keywords: Vec<String>,
     #[serde(default)]
-    pub score: i64,
+    pub score: f64,
     #[serde(default, rename = "providerPriority")]
-    pub provider_priority: i64,
+    pub provider_priority: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,12 +214,12 @@ fn rank_prepared(
         right
             .match_score
             .cmp(&left.match_score)
-            .then_with(|| right.item.score.cmp(&left.item.score))
+            .then_with(|| right.item.score.total_cmp(&left.item.score))
             .then_with(|| {
                 right
                     .item
                     .provider_priority
-                    .cmp(&left.item.provider_priority)
+                    .total_cmp(&left.item.provider_priority)
             })
             .then_with(|| left.item.title.cmp(&right.item.title))
             .then_with(|| left.item.key.cmp(&right.item.key))
@@ -244,6 +247,10 @@ fn apply_command(
     output: &mut impl Write,
 ) -> io::Result<()> {
     match command {
+        Ok(SearchCommand::Release { owner }) => {
+            catalogs.remove(&owner);
+            pending.remove(&owner);
+        }
         Ok(SearchCommand::Catalog { owner, items }) => {
             catalogs.insert(owner, PreparedCatalog::new(&items));
         }
@@ -328,13 +335,74 @@ mod tests {
             title: title.into(),
             subtitle: String::new(),
             keywords: Vec::new(),
-            score: 0,
-            provider_priority: 0,
+            score: 0.0,
+            provider_priority: 0.0,
         }
     }
 
     fn keys(query: &str, items: Vec<SearchItem>) -> Vec<String> {
         rank("test".into(), 1, query, &items).keys
+    }
+
+    #[test]
+    fn empty_queries_use_score_priority_then_normalized_title_and_key() {
+        let mut priority = item("priority", "Zulu");
+        priority.provider_priority = 0.5;
+        let mut scored = item("scored", "Zulu");
+        scored.score = 0.25;
+        assert_eq!(
+            keys(
+                "  ",
+                vec![item("b", "Café"), item("a", "Cafe"), priority, scored]
+            ),
+            ["scored", "priority", "a", "b"]
+        );
+    }
+
+    #[test]
+    fn wire_accepts_fractional_scores_and_empty_queries() {
+        let (sender, receiver) = mpsc::channel();
+        for line in [
+            r#"{"type":"catalog","owner":"wire","items":[{"key":"a","title":"Alpha","score":0.25},{"key":"b","title":"Beta","score":0.5}]}"#,
+            r#"{"type":"query","owner":"wire","generation":9,"query":""}"#,
+        ] {
+            sender
+                .send(Ok(serde_json::from_str::<SearchCommand>(line).unwrap()))
+                .unwrap();
+        }
+        drop(sender);
+        let mut output = Vec::new();
+        serve_commands(receiver, &mut output).unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            response,
+            serde_json::json!({"owner":"wire", "generation":9, "keys":["b","a"]})
+        );
+    }
+
+    #[test]
+    fn release_retires_catalog_and_pending_query() {
+        let mut catalogs = std::collections::HashMap::new();
+        let mut pending = std::collections::HashMap::new();
+        let mut output = Vec::new();
+        for command in [
+            SearchCommand::Catalog {
+                owner: "test".into(),
+                items: vec![item("a", "A")],
+            },
+            SearchCommand::Query {
+                owner: "test".into(),
+                generation: 1,
+                query: String::new(),
+            },
+            SearchCommand::Release {
+                owner: "test".into(),
+            },
+        ] {
+            super::apply_command(Ok(command), &mut catalogs, &mut pending, &mut output).unwrap();
+        }
+        assert!(catalogs.is_empty());
+        assert!(pending.is_empty());
     }
 
     #[test]

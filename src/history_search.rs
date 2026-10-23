@@ -242,8 +242,8 @@ fn rank_entries(entries: Vec<EntrySummary>, query: &str) -> Vec<EntrySummary> {
                 subtitle: format!("{label} · {} · {} bytes", entry.mime, entry.byte_size),
                 // The matcher always gives title matches a higher weight than keywords.
                 keywords: vec![entry.mime.clone(), label.to_ascii_lowercase()],
-                score: (count - index) as i64,
-                provider_priority: 100,
+                score: (count - index) as f64,
+                provider_priority: 100.0,
             }
         })
         .collect::<Vec<_>>();
