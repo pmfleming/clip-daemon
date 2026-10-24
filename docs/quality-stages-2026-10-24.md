@@ -63,3 +63,20 @@ allocation measurements from the opt-in benchmark in debug mode, not a release
 latency claim. Cold construction and storage I/O are outside this measurement.
 All-target/all-feature tests, strict Clippy, formatting, and diff checks pass
 (`stage3.log`, `stage3-before-benchmark.log`).
+
+## 4. Bounded capture proofs and real-file comparison
+
+Capture now reuses content inspection with a zero-byte preview, so proof hashing
+needs no preview allocation. Both capture and history inspection read at most
+advertised size plus one byte and reject growth/truncation before accepting a
+digest. Previously capture ignored the copied byte count, while history could
+follow an indefinitely growing file. Hash domains and successful digests remain
+unchanged; changed capture files now fail closed before candidate lookup/IPC.
+
+Extended the existing identity test with preview/no-preview digest equivalence
+and a counting cursor proving the one-extra-byte bound. One capture test uses a
+real temporary file and interrupted seven-byte reads to check multi-chunk
+matching, byte differences beyond the first chunk, exact/exhausted budgets,
+truncation, empty content, and preservation of the admitted FD's seek position.
+All-target/all-feature tests, strict Clippy, formatting, and diff checks pass
+(`stage4.log`). Live policy-engine IPC remains a separate qualification gap.

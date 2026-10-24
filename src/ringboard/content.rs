@@ -93,7 +93,7 @@ impl RingboardBackend {
         let (mut loaded, metadata) = load_entry(entry, reader)?;
         let byte_size = metadata.len();
         let stored_mime = stored_mime_type(&loaded)?;
-        let (bytes, content_digest) = inspect_entry(&mut *loaded, byte_size)?;
+        let (bytes, content_digest) = inspect_entry(&mut *loaded, byte_size, INSPECTION_LIMIT)?;
         let content = ResolvedContent::resolve(&stored_mime, &bytes, MAX_WAYLAND_SELECTION_BYTES);
         let fingerprint = entry_fingerprint(entry.id(), byte_size, content.mime(), &content_digest);
         let id = opaque_id(&fingerprint);
@@ -172,20 +172,31 @@ pub(super) fn entry_details(
     })
 }
 
-fn inspect_entry(source: &mut impl Read, expected_size: u64) -> BackendResult<(Vec<u8>, [u8; 32])> {
+/// Hash exactly the advertised content, retaining at most a bounded preview.
+/// One extra byte detects growth without following an indefinitely growing file.
+/// Capture requests no preview, so proof calculation needs no heap buffer.
+pub(super) fn inspect_entry(
+    source: &mut impl Read,
+    expected_size: u64,
+    preview_limit: usize,
+) -> BackendResult<(Vec<u8>, [u8; 32])> {
     let preview_capacity = usize::try_from(expected_size)
         .unwrap_or(usize::MAX)
-        .min(INSPECTION_LIMIT);
+        .min(preview_limit.min(INSPECTION_LIMIT));
     let mut preview = Vec::with_capacity(preview_capacity);
     let mut hasher = content_hasher();
     let read_error = |_| invalid_entry("Could not read clipboard entry");
     source
         .by_ref()
-        .take(INSPECTION_LIMIT as u64)
+        .take(preview_capacity as u64)
         .read_to_end(&mut preview)
         .map_err(read_error)?;
     hasher.update(&preview);
-    let remaining = std::io::copy(source, &mut hasher).map_err(read_error)?;
+    let remaining_limit = expected_size
+        .saturating_sub(preview.len() as u64)
+        .saturating_add(1);
+    let remaining =
+        std::io::copy(&mut source.take(remaining_limit), &mut hasher).map_err(read_error)?;
     let actual_size = remaining
         .checked_add(preview.len() as u64)
         .ok_or_else(|| invalid_entry("Clipboard entry size is invalid"))?;
@@ -645,8 +656,12 @@ mod tests {
     fn fingerprint(raw_id: u64, mime: &str, bytes: &[u8]) -> [u8; 32] {
         let split = bytes.len().min(INSPECTION_LIMIT);
         let source = std::io::Read::chain(&bytes[..split], InterruptOnce(true, &bytes[split..]));
-        let (preview, digest) = inspect_entry(&mut InterruptOnce(true, source), bytes.len() as u64)
-            .expect("fingerprint fixture");
+        let (preview, digest) = inspect_entry(
+            &mut InterruptOnce(true, source),
+            bytes.len() as u64,
+            INSPECTION_LIMIT,
+        )
+        .expect("fingerprint fixture");
         assert_eq!(preview, bytes[..split]);
         entry_fingerprint(raw_id, bytes.len() as u64, mime, &digest)
     }
@@ -679,8 +694,25 @@ mod tests {
         assert_ne!(opaque_id(&identity), opaque_id(&changed));
         assert_ne!(entry_revision(&identity), entry_revision(&changed));
         assert!(entry_revision(&[u8::MAX; 32]) <= MAX_SAFE_JSON_INTEGER);
-        assert!(inspect_entry(&mut &b"abc"[..], 2).is_err());
-        assert!(inspect_entry(&mut &b"abc"[..], 4).is_err());
+        assert!(inspect_entry(&mut &b"abc"[..], 2, INSPECTION_LIMIT).is_err());
+        assert!(inspect_entry(&mut &b"abc"[..], 4, INSPECTION_LIMIT).is_err());
+        for preview_limit in [0, INSPECTION_LIMIT] {
+            let mut growing = std::io::Cursor::new([b'a'; 100]);
+            assert!(inspect_entry(&mut growing, 3, preview_limit).is_err());
+            assert_eq!(
+                growing.position(),
+                4,
+                "growth must not cause an unbounded read"
+            );
+            let (preview, digest) = inspect_entry(&mut &b"abc"[..], 3, preview_limit).unwrap();
+            assert_eq!(preview.len(), preview_limit.min(3));
+            assert_eq!(
+                digest,
+                inspect_entry(&mut &b"abc"[..], 3, INSPECTION_LIMIT)
+                    .unwrap()
+                    .1
+            );
+        }
     }
 
     #[test]
