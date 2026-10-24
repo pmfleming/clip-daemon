@@ -87,15 +87,41 @@ impl ApiService {
     }
 
     pub async fn cancel_operation_owned(&self, operation_id: &str, owner: Option<&str>) -> bool {
-        let mut owners = self.operation_owners.lock().await;
-        if owners.get(operation_id).and_then(Option::as_deref) != owner {
+        if self.reconcile_operations(None).await.is_err()
+            || self
+                .operation_owners
+                .lock()
+                .await
+                .get(operation_id)
+                .map(Option::as_deref)
+                != Some(owner)
+        {
             return false;
         }
+        // Never hold the ownership lock while waiting for backend cancellation.
         let cancelled = self.actions.cancel(operation_id).await;
         if cancelled {
-            owners.remove(operation_id);
+            self.operation_owners.lock().await.remove(operation_id);
         }
         cancelled
+    }
+
+    /// Prune at API boundaries using authoritative liveness, not lossy events.
+    /// Dormant records are bounded by the last live snapshot; history cannot
+    /// accumulate across calls. Early completion is never re-registered.
+    async fn reconcile_operations(
+        &self,
+        registration: Option<(&str, Option<String>)>,
+    ) -> Result<(), ApiError> {
+        let mut owners = self.operation_owners.lock().await;
+        let active = self.actions.active_operations()?;
+        owners.retain(|id, _| active.contains(id));
+        if let Some((id, owner)) = registration
+            && active.contains(id)
+        {
+            owners.insert(id.into(), owner);
+        }
+        Ok(())
     }
 
     pub async fn publish_selection(&self, mime: &str, bytes: Vec<u8>) -> Value {
@@ -129,9 +155,14 @@ impl ApiService {
         };
         if let Ok(data) = &result {
             self.publish_lifecycle(method, data);
-            if let Some(id) = started_operation_id(data) {
-                self.operation_owners.lock().await.insert(id.into(), owner);
-            }
+        }
+        let registration = result
+            .as_ref()
+            .ok()
+            .and_then(started_operation_id)
+            .map(|id| (id, owner));
+        if let Err(error) = self.reconcile_operations(registration).await {
+            tracing::warn!(message = %error.message, "Could not reconcile operation ownership");
         }
         finish_request(method, result)
     }
@@ -390,4 +421,63 @@ fn error_response(error: ApiError) -> Value {
 
 pub fn error(code: &str, message: String) -> Value {
     error_response(ApiError::new(code, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiService;
+    use crate::{backend::ClipboardBackend, ringboard::RingboardBackend};
+    use std::{sync::Arc, time::Duration};
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn ownership_tracks_live_jobs_without_relying_on_event_delivery() {
+        let backend = Arc::new(RingboardBackend::default());
+        let api = ApiService::new(backend.clone());
+        for early in [false, true] {
+            for success in [false, true] {
+                let mut events = backend.operation_events();
+                let (finish, finished) = oneshot::channel();
+                let operation = backend.test_operation(finished);
+                assert_eq!(events.recv().await.unwrap().status, "started");
+                if !early {
+                    api.reconcile_operations(Some((&operation.id, Some(":1.1".into()))))
+                        .await
+                        .unwrap();
+                    assert_eq!(api.operation_owners.lock().await.len(), 1);
+                }
+                finish.send(success).unwrap();
+                let terminal = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    terminal.status,
+                    if success { "completed" } else { "failed" }
+                );
+                // No API event observer: the snapshot also covers lost/lagged events.
+                api.reconcile_operations(Some((&operation.id, Some(":1.1".into()))))
+                    .await
+                    .unwrap();
+                assert!(api.operation_owners.lock().await.is_empty());
+            }
+        }
+        for owner in [None, Some(":1.1")] {
+            let (_finish, finished) = oneshot::channel();
+            let operation = backend.test_operation(finished);
+            // Missing records are never equivalent to explicitly unowned jobs.
+            assert!(!api.cancel_operation(&operation.id).await);
+            assert!(backend.active_operations().unwrap().contains(&operation.id));
+            api.reconcile_operations(Some((&operation.id, owner.map(str::to_owned))))
+                .await
+                .unwrap();
+            assert!(
+                !api.cancel_operation_owned(&operation.id, Some(":1.2"))
+                    .await
+            );
+            assert!(api.cancel_operation_owned(&operation.id, owner).await);
+            assert!(!api.cancel_operation_owned(&operation.id, owner).await);
+            assert!(api.operation_owners.lock().await.is_empty());
+        }
+    }
 }

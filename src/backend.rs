@@ -196,6 +196,11 @@ impl BackendMutation {
 #[async_trait]
 pub trait ClipboardBackend: Send + Sync {
     fn operation_events(&self) -> broadcast::Receiver<OperationResult>;
+    /// Authoritative snapshot, independent of broadcast delivery. Backends that
+    /// launch asynchronous operations must include both editing and committing jobs.
+    fn active_operations(&self) -> BackendResult<std::collections::HashSet<String>> {
+        Ok(Default::default())
+    }
     async fn status(&self) -> BackendStatus;
     async fn change_token(&self) -> BackendResult<u64>;
     async fn query(&self, query: HistoryQuery) -> BackendResult<HistoryPage>;

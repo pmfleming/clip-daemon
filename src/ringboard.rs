@@ -634,6 +634,10 @@ fn finalize_query(
 
 #[async_trait]
 impl ClipboardBackend for RingboardBackend {
+    fn active_operations(&self) -> BackendResult<HashSet<String>> {
+        self.operations.active_ids()
+    }
+
     fn operation_events(&self) -> broadcast::Receiver<OperationResult> {
         self.operations.subscribe()
     }

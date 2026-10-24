@@ -77,6 +77,10 @@ impl Operations {
             .map_err(|_| operation_error("Clipboard operation state is unavailable"))
     }
 
+    pub fn active_ids(&self) -> BackendResult<std::collections::HashSet<String>> {
+        Ok(self.active()?.keys().cloned().collect())
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<OperationResult> {
         self.events.subscribe()
     }
@@ -278,6 +282,30 @@ impl OperationControl {
 }
 
 #[cfg(test)]
+impl super::RingboardBackend {
+    pub(crate) fn test_operation(&self, finish: oneshot::Receiver<bool>) -> OperationResult {
+        self.operations
+            .launch(
+                "annotate",
+                "Started",
+                vec![],
+                move |_| async move {
+                    if !finish.await.unwrap() {
+                        return Err(operation_error("Injected failure"));
+                    }
+                    Ok(OperationCompletion {
+                        status: "completed",
+                        message: "Done",
+                        warning: None,
+                    })
+                },
+                |_| async {},
+            )
+            .unwrap()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{OperationCompletion, Operations};
     use std::{fs, sync::Arc, time::Duration};
@@ -352,6 +380,7 @@ mod tests {
         assert_eq!(events.try_recv().unwrap().status, "started");
         running.await.unwrap();
         assert!(!operations.cancel(&operation.id).await.unwrap());
+        assert!(operations.active_ids().unwrap().contains(&operation.id));
         assert!(staged.exists());
         assert!(events.try_recv().is_err());
         let other = operations.clone();
@@ -363,6 +392,7 @@ mod tests {
         let event = events.try_recv().unwrap();
         assert_eq!(event.status, "completed");
         assert_eq!(event.warning.as_deref(), Some("Publication failed"));
+        assert!(operations.active_ids().unwrap().is_empty());
         assert!(events.try_recv().is_err());
         assert!(!staged.exists());
     }

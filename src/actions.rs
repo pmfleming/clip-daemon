@@ -270,6 +270,10 @@ impl ClipboardService {
         Ok(json!({ "operation": operation }))
     }
 
+    pub(crate) fn active_operations(&self) -> Result<HashSet<String>, ApiError> {
+        Ok(self.backend.active_operations()?)
+    }
+
     pub(crate) fn operation_events(&self) -> OperationEvents {
         self.backend.operation_events()
     }
