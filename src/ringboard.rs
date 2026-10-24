@@ -4,7 +4,7 @@ use std::{
     os::unix::fs::MetadataExt,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
 use tokio::{sync::broadcast, task::spawn_blocking};
@@ -86,11 +86,21 @@ struct QueryCandidate {
     resolved: ResolvedEntry,
 }
 
+type IdentityBindings = HashMap<String, IdentityBinding>;
+
 #[derive(Default)]
 struct CachedProjection {
     current_id: Option<u64>,
     candidates: Vec<QueryCandidate>,
     complete: bool,
+    views: [OnceLock<ProjectionMetadata>; 2],
+}
+
+struct ProjectionMetadata {
+    current: Option<EntrySummary>,
+    visible: Vec<usize>,
+    bindings: Arc<IdentityBindings>,
+    artifact_references: Arc<HashSet<PathBuf>>,
 }
 
 #[derive(Default)]
@@ -98,8 +108,8 @@ struct QueryProjection {
     current: Option<EntrySummary>,
     entries: Vec<EntrySummary>,
     matched: usize,
-    bindings: HashMap<String, IdentityBinding>,
-    artifact_references: HashSet<PathBuf>,
+    bindings: Arc<IdentityBindings>,
+    artifact_references: Arc<HashSet<PathBuf>>,
     complete: bool,
 }
 
@@ -137,18 +147,61 @@ impl QueryCandidate {
     }
 }
 
-impl QueryProjection {
-    fn push(&mut self, candidate: &QueryCandidate, current_id: Option<&str>) {
-        let summary = &candidate.resolved.summary;
-        let binding = IdentityBinding {
-            raw_id: candidate.raw_id,
-            revision: summary.revision,
-        };
-        self.bindings.insert(summary.id.clone(), binding);
-        if current_id == Some(summary.id.as_str()) {
-            let mut current = summary.clone();
-            current.current = true;
-            self.current = Some(current);
+impl ProjectionMetadata {
+    fn new(cached: &CachedProjection, collapse: bool) -> Self {
+        let candidates = &cached.candidates;
+        let ids = candidates
+            .iter()
+            .map(|candidate| candidate.resolved.summary.id.as_str())
+            .collect();
+        let current_id = candidates
+            .iter()
+            .find(|candidate| cached.current_id == Some(candidate.raw_id))
+            .map(|candidate| {
+                candidate
+                    .collapsed_source(collapse, &ids)
+                    .unwrap_or(&candidate.resolved.summary.id)
+            });
+        let visible: Vec<_> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.collapsed_source(collapse, &ids).is_none())
+            .map(|(index, _)| index)
+            .collect();
+        let current = visible
+            .iter()
+            .map(|&index| &candidates[index].resolved.summary)
+            .find(|summary| Some(summary.id.as_str()) == current_id)
+            .map(|summary| {
+                let mut summary = summary.clone();
+                summary.current = true;
+                summary
+            });
+        let bindings = visible
+            .iter()
+            .map(|&index| {
+                let candidate = &candidates[index];
+                let summary = &candidate.resolved.summary;
+                (
+                    summary.id.clone(),
+                    IdentityBinding {
+                        raw_id: candidate.raw_id,
+                        revision: summary.revision,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            current,
+            visible,
+            bindings: Arc::new(bindings),
+            // Even hidden echoes and non-matching rows protect their artifacts.
+            artifact_references: Arc::new(
+                candidates
+                    .iter()
+                    .flat_map(|candidate| candidate.resolved.generated_paths.iter().cloned())
+                    .collect(),
+            ),
         }
     }
 }
@@ -162,8 +215,8 @@ impl CachedProjection {
         let mut main = database.main().rev().peekable();
         let mut projection = Self {
             current_id: main.peek().map(Entry::id),
-            candidates: Vec::new(),
             complete: true,
+            ..Self::default()
         };
         for entry in database.favorites().rev().chain(main) {
             match backend.read_summary(entry, reader)? {
@@ -187,39 +240,14 @@ impl CachedProjection {
         query: &HistoryQuery,
         full_matches: Option<&HashSet<u64>>,
     ) -> QueryProjection {
-        let ids = self
-            .candidates
-            .iter()
-            .map(|candidate| candidate.resolved.summary.id.as_str())
-            .collect::<HashSet<_>>();
-        let current_id = self
-            .candidates
-            .iter()
-            .find(|candidate| self.current_id == Some(candidate.raw_id))
-            .map(|candidate| {
-                candidate
-                    .collapsed_source(query.collapse_self_echoes, &ids)
-                    .unwrap_or(&candidate.resolved.summary.id)
-            });
-        let mut projection = QueryProjection {
-            artifact_references: self
-                .candidates
-                .iter()
-                .flat_map(|candidate| candidate.resolved.generated_paths.iter().cloned())
-                .collect(),
-            complete: self.complete,
-            ..QueryProjection::default()
-        };
+        let metadata = self.views[usize::from(query.collapse_self_echoes)]
+            .get_or_init(|| ProjectionMetadata::new(self, query.collapse_self_echoes));
+        let current_id = metadata.current.as_ref().map(|summary| summary.id.as_str());
         let needle = search::fold(query.query.trim());
-        let matches = self
-            .candidates
+        let matches = metadata
+            .visible
             .iter()
-            .filter(|candidate| {
-                candidate
-                    .collapsed_source(query.collapse_self_echoes, &ids)
-                    .is_none()
-            })
-            .inspect(|candidate| projection.push(candidate, current_id))
+            .map(|&index| &self.candidates[index])
             .filter(|candidate| {
                 full_matches.map_or_else(
                     || matches_query(&candidate.resolved.summary, &needle),
@@ -229,7 +257,7 @@ impl CachedProjection {
             .map(|candidate| &candidate.resolved.summary);
         let (page, matched) =
             paginate(matches, query.offset, query.limit.clamp(1, MAX_QUERY_LIMIT));
-        projection.entries = page
+        let entries = page
             .into_iter()
             .map(|summary| {
                 let mut summary = summary.clone();
@@ -237,8 +265,14 @@ impl CachedProjection {
                 summary
             })
             .collect();
-        projection.matched = matched;
-        projection
+        QueryProjection {
+            current: metadata.current.clone(),
+            entries,
+            matched,
+            bindings: Arc::clone(&metadata.bindings),
+            artifact_references: Arc::clone(&metadata.artifact_references),
+            complete: self.complete,
+        }
     }
 }
 
@@ -246,7 +280,7 @@ impl CachedProjection {
 pub struct RingboardBackend {
     transaction: Arc<Mutex<()>>,
     operation_gate: Arc<tokio::sync::Mutex<()>>,
-    ids: Arc<Mutex<HashMap<String, IdentityBinding>>>,
+    ids: Arc<Mutex<Arc<IdentityBindings>>>,
     revision: Arc<Mutex<RevisionState>>,
     summaries: Arc<Mutex<SummaryCache>>,
     operations: Arc<Operations>,
@@ -322,7 +356,7 @@ impl RingboardBackend {
         let Some(message) = error else {
             return Ok(());
         };
-        self.ids.lock().map_err(|_| lock_error())?.remove(opaque_id);
+        Arc::make_mut(&mut *self.ids.lock().map_err(|_| lock_error())?).remove(opaque_id);
         Err(BackendError::stale(message))
     }
 
@@ -400,7 +434,7 @@ impl RingboardBackend {
             .get_raw(raw_id)
             .map_err(|_| BackendError::not_found("Clipboard entry is stale or missing"))?;
         let summary = self.summarize(entry, &mut reader)?.summary;
-        self.ids.lock().map_err(|_| lock_error())?.insert(
+        Arc::make_mut(&mut *self.ids.lock().map_err(|_| lock_error())?).insert(
             summary.id.clone(),
             IdentityBinding {
                 raw_id,
@@ -481,7 +515,7 @@ impl RingboardBackend {
     }
 
     fn clear_identity_state(&self) -> BackendResult<()> {
-        self.ids.lock().map_err(|_| lock_error())?.clear();
+        *self.ids.lock().map_err(|_| lock_error())? = Arc::default();
         *self.summaries.lock().map_err(|_| lock_error())? = SummaryCache::default();
         Ok(())
     }
@@ -610,7 +644,7 @@ fn finalize_query(
     backend: &RingboardBackend,
     query: HistoryQuery,
     token: u64,
-    mut projection: QueryProjection,
+    projection: QueryProjection,
 ) -> BackendResult<HistoryPage> {
     prune_thumbnails(
         projection
@@ -618,7 +652,7 @@ fn finalize_query(
             .iter()
             .map(|(id, binding)| (id.as_str(), binding.revision)),
     );
-    *backend.ids.lock().map_err(|_| lock_error())? = std::mem::take(&mut projection.bindings);
+    *backend.ids.lock().map_err(|_| lock_error())? = Arc::clone(&projection.bindings);
     backend.reconcile_projection(&projection)?;
     let consumed = query.offset.saturating_add(projection.entries.len());
     let has_more = projection.matched > consumed;
@@ -891,4 +925,146 @@ fn matches_query(summary: &EntrySummary, needle: &str) -> bool {
 
 fn lock_error() -> BackendError {
     operation_failed("Clipboard backend state is unavailable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CachedProjection, ProjectionMetadata, QueryCandidate, ResolvedEntry, RingboardBackend,
+    };
+    use crate::{
+        backend::{HistoryQuery, MAX_QUERY_LIMIT},
+        model::EntrySummary,
+    };
+    use std::{collections::HashSet, path::PathBuf, sync::Arc};
+
+    fn catalog() -> CachedProjection {
+        CachedProjection {
+            current_id: Some(2),
+            candidates: [
+                (1, "Needle", None),
+                (2, "echo", Some("1")),
+                (3, "orphan", Some("gone")),
+            ]
+            .into_iter()
+            .map(|(raw_id, preview, echo)| QueryCandidate {
+                raw_id,
+                resolved: ResolvedEntry {
+                    summary: EntrySummary {
+                        id: raw_id.to_string(),
+                        revision: raw_id + 10,
+                        kind: crate::model::EntryKind::Text,
+                        mime: "text/plain".into(),
+                        byte_size: 1,
+                        favorite: raw_id == 1,
+                        current: false,
+                        preview: preview.into(),
+                    },
+                    proof: [0; 32],
+                    generated_paths: [PathBuf::from(raw_id.to_string())].into(),
+                    echo_source_id: echo.map(str::to_owned),
+                },
+            })
+            .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn projection_preserves_identity_and_artifacts_independently_of_page_and_filter() {
+        let cached = catalog();
+        let full = HashSet::from([2, 3]);
+        for collapse in [false, true] {
+            let query = HistoryQuery {
+                query: String::new(),
+                generation: 1,
+                offset: 0,
+                limit: 100,
+                collapse_self_echoes: collapse,
+            };
+            let first = cached.project(&query);
+            for (needle, full_matches, expected) in [
+                ("", None, &[1, 2, 3][..]),
+                (" TEXT/PLAIN ", None, &[1, 2, 3]),
+                ("NEEDLE", None, &[1]),
+                ("absent", None, &[]),
+                ("", Some(&full), &[2, 3]),
+            ] {
+                let expected: Vec<_> = expected
+                    .iter()
+                    .filter(|&&id| !collapse || id != 2)
+                    .map(ToString::to_string)
+                    .collect();
+                for offset in [0, 1, usize::MAX] {
+                    for limit in [0, 1, usize::MAX] {
+                        let page = cached.project_matches(
+                            &HistoryQuery {
+                                query: needle.into(),
+                                offset,
+                                limit,
+                                ..query.clone()
+                            },
+                            full_matches,
+                        );
+                        let ids: Vec<_> = page.entries.iter().map(|entry| &entry.id).collect();
+                        assert_eq!(
+                            ids,
+                            expected
+                                .iter()
+                                .skip(offset)
+                                .take(limit.clamp(1, MAX_QUERY_LIMIT))
+                                .collect::<Vec<_>>()
+                        );
+                        assert_eq!(page.matched, expected.len());
+                        let current = page.current.unwrap();
+                        assert_eq!(current.id, if collapse { "1" } else { "2" });
+                        assert!(current.current);
+                        assert!(
+                            page.entries
+                                .iter()
+                                .all(|entry| entry.current == (entry.id == current.id))
+                        );
+                        assert_eq!(page.bindings.len(), if collapse { 2 } else { 3 });
+                        assert_eq!(page.bindings["1"].revision, 11);
+                        assert_eq!(page.artifact_references.len(), 3);
+                        assert!(!page.complete);
+                        assert!(Arc::ptr_eq(&first.bindings, &page.bindings));
+                        assert!(Arc::ptr_eq(
+                            &first.artifact_references,
+                            &page.artifact_references
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stale_identity_rejection_does_not_mutate_shared_projection_metadata() {
+        let cached = catalog();
+        let metadata = ProjectionMetadata::new(&cached, true);
+        let backend = RingboardBackend::default();
+        for (id, revision, expected, valid) in [
+            ("1", 11, Some(11), true),
+            ("1", 11, None, true),
+            ("1", 11, Some(99), false),
+            ("1", 22, Some(22), false),
+            ("reused", 11, Some(11), false),
+        ] {
+            *backend.ids.lock().unwrap() = Arc::clone(&metadata.bindings);
+            let mut summary = cached.candidates[0].resolved.summary.clone();
+            summary.id = id.into();
+            summary.revision = revision;
+            assert_eq!(
+                backend
+                    .verify_selection("1", expected, metadata.bindings["1"], &summary)
+                    .is_ok(),
+                valid
+            );
+            assert_eq!(backend.resolve("1").is_ok(), valid);
+            assert!(metadata.bindings.contains_key("1"));
+        }
+        backend.clear_identity_state().unwrap();
+        assert!(backend.resolve("1").is_err());
+    }
 }

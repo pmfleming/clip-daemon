@@ -41,6 +41,7 @@ fn fixture(size: usize) -> CachedProjection {
                 },
             })
             .collect(),
+        ..Default::default()
     }
 }
 
