@@ -686,7 +686,7 @@ impl ClipboardBackend for RingboardBackend {
         region: ScreenshotRegion,
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
-        run_backend!(self, capture_region(region, max_bytes))
+        self.capture_region(region, max_bytes).await
     }
 
     async fn interactive_screenshot(

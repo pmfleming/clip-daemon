@@ -1,9 +1,9 @@
 //! Explicit user captures: no shell, clipboard subprocess, or history-entry race.
 use std::{
     fs,
-    path::Path,
-    process::{Command as StdCommand, Stdio},
-    time::{Duration, Instant},
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
 };
 
 use tokio::{io::AsyncReadExt, process::Command};
@@ -20,15 +20,27 @@ use crate::{
     model::OperationResult,
 };
 
+/// Direct captures have no Operations entry to own their staging file.
+struct StagedCapture(PathBuf);
+impl Drop for StagedCapture {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 impl RingboardBackend {
-    pub(super) fn capture_region(
+    pub(super) async fn capture_region(
         &self,
         region: ScreenshotRegion,
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
+        if !ScreenshotRegion::valid_dimensions(region.width, region.height) {
+            return Err(operation_error("Invalid screenshot region"));
+        }
         let path = unique_path(&runtime_directory("clip-daemon/screenshots")?, "png");
         drop(private_file(&path)?);
-        let mut command = StdCommand::new("grim");
+        let staged = StagedCapture(path);
+        let mut command = Command::new("grim");
         command
             .args([
                 "-g",
@@ -37,20 +49,21 @@ impl RingboardBackend {
                     region.x, region.y, region.width, region.height
                 ),
             ])
-            .arg(&path);
-        let result =
-            command_status_with_timeout(&mut command, Duration::from_secs(15)).and_then(|status| {
-                if !status.success() {
-                    return Err(operation_error("Screenshot capture failed"));
-                }
-                publish_capture(self, &path, max_bytes)
-            });
-        let _ = fs::remove_file(path);
-        result?;
-        Ok(OperationResult::completed(
-            "screenshot",
-            "Screenshot published to the Wayland clipboard",
-        ))
+            .arg(&staged.0);
+        capture_command(&mut command, Duration::from_secs(15)).await?;
+        let backend = self.clone();
+        run_blocking(move || {
+            let _transaction = backend
+                .transaction
+                .lock()
+                .map_err(|_| super::lock_error())?;
+            publish_capture(&backend, &staged.0, max_bytes)?;
+            Ok(OperationResult::completed(
+                "screenshot",
+                "Screenshot published to the Wayland clipboard",
+            ))
+        })
+        .await
     }
 }
 
@@ -64,23 +77,25 @@ fn publish_capture(backend: &RingboardBackend, path: &Path, max_bytes: u64) -> B
     backend.selection_changed()
 }
 
-fn command_status_with_timeout(
-    command: &mut StdCommand,
-    timeout: Duration,
-) -> BackendResult<std::process::ExitStatus> {
+async fn capture_command(command: &mut Command, timeout: Duration) -> BackendResult<()> {
     let mut child = command
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
         .spawn()
         .map_err(|_| operation_error("Could not start screenshot capture"))?;
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().map_err(operation_error)? {
-            return Ok(status);
-        }
-        std::thread::sleep(Duration::from_millis(25));
+    let status = tokio::time::timeout(timeout, child.wait())
+        .await
+        .map_err(|_| operation_error("Screenshot capture timed out"))
+        .and_then(|status| status.map_err(operation_error));
+    if status.is_err() {
+        // Explicitly reap on timeout/I/O failure; kill_on_drop also handles a
+        // cancelled caller while waiting. Neither path leaves grim running.
+        let _ = child.kill().await;
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    Err(operation_error("Screenshot capture timed out"))
+    status?
+        .success()
+        .then_some(())
+        .ok_or_else(|| operation_error("Screenshot capture failed"))
 }
 
 pub(super) fn launch(
@@ -165,14 +180,8 @@ async fn grab(mode: ScreenshotMode, input: &Path) -> BackendResult<bool> {
         };
         command.args(["-g", &geometry]);
     }
-    command.arg(input).kill_on_drop(true).stdin(Stdio::null());
-    let status = tokio::time::timeout(Duration::from_secs(15), command.status())
-        .await
-        .map_err(operation_error)?
-        .map_err(operation_error)?;
-    if !status.success() {
-        return Err(operation_error("Screenshot capture failed"));
-    }
+    command.arg(input);
+    capture_command(&mut command, Duration::from_secs(15)).await?;
     Ok(true)
 }
 
@@ -253,18 +262,75 @@ fn parse_pair<T: std::str::FromStr>(value: &str, separator: char) -> BackendResu
 
 #[cfg(test)]
 mod tests {
-    use super::{command_status_with_timeout, select_region};
+    use super::{StagedCapture, capture_command, select_region};
     use std::os::unix::fs::PermissionsExt;
 
-    #[test]
-    fn screenshot_commands_are_bounded() {
-        let mut slow = std::process::Command::new("sleep");
-        slow.arg("1");
-        let started = std::time::Instant::now();
-        assert!(
-            command_status_with_timeout(&mut slow, std::time::Duration::from_millis(40)).is_err()
-        );
-        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    #[tokio::test]
+    async fn screenshot_commands_are_bounded_and_staging_is_scoped() {
+        use std::time::Duration;
+        use tokio::process::Command;
+        for (program, arguments, timeout, success) in [
+            ("true", vec![], Duration::from_secs(2), true),
+            ("false", vec![], Duration::from_secs(2), false),
+            (
+                "/no-such-clip-capture-command",
+                vec![],
+                Duration::from_secs(2),
+                false,
+            ),
+            ("sleep", vec!["30"], Duration::from_millis(20), false),
+        ] {
+            let mut command = Command::new(program);
+            command.args(arguments);
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                capture_command(&mut command, timeout),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), success, "{program}");
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("capture.png");
+        let pid_file = directory.path().join("pid");
+        let task = tokio::spawn({
+            let path = path.clone();
+            let pid_file = pid_file.clone();
+            async move {
+                std::fs::write(&path, b"staged").unwrap();
+                let _staged = StagedCapture(path);
+                let mut command = Command::new("sh");
+                command
+                    .args(["-c", "echo $$ > \"$1\"; exec sleep 30", "capture-test"])
+                    .arg(pid_file);
+                capture_command(&mut command, Duration::from_secs(30)).await
+            }
+        });
+        let pid = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|value| value.trim().parse().ok())
+                    .and_then(rustix::process::Pid::from_raw)
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(path.exists());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!path.exists());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while rustix::process::test_kill_process(pid).is_ok() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("cancelled child must be killed and reaped");
     }
 
     #[tokio::test]

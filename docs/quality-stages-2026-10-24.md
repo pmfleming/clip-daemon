@@ -25,3 +25,19 @@ test verifies committing jobs remain in the authoritative snapshot.
 
 Validation: all-target/all-feature tests and strict Clippy pass; formatting and
 `git diff --check` pass (`stage1.log`).
+
+## 2. Screenshot subprocess lifetime
+
+Direct and interactive grim captures now share the async timeout/status path.
+Timeout and wait failures explicitly kill and reap the child; dropped callers
+are covered by Tokio's kill-on-drop behavior. Removed the separate blocking
+25-ms poll loop. Direct captures validate dimensions at the backend boundary,
+use a scoped staging-file guard, and hold the history transaction only during
+publication, not while waiting for grim. The guard moves into blocking commit
+work so caller cancellation cannot delete a file still being published.
+
+The existing command test now checks successful/nonzero/missing commands,
+timeout, and cancellation of a real child, including eventual process reaping
+and staged-file deletion. No desktop programs or real clipboard are involved.
+All-target/all-feature tests, strict Clippy, formatting, and diff checks pass
+(`stage2.log`).
