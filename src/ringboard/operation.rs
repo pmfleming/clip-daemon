@@ -283,25 +283,26 @@ impl OperationControl {
 
 #[cfg(test)]
 impl super::RingboardBackend {
-    pub(crate) fn test_operation(&self, finish: oneshot::Receiver<bool>) -> OperationResult {
-        self.operations
-            .launch(
-                "annotate",
-                "Started",
-                vec![],
-                move |_| async move {
-                    if !finish.await.unwrap() {
-                        return Err(operation_error("Injected failure"));
-                    }
-                    Ok(OperationCompletion {
-                        status: "completed",
-                        message: "Done",
-                        warning: None,
-                    })
-                },
-                |_| async {},
-            )
-            .unwrap()
+    pub(crate) fn test_operation(
+        &self,
+        finish: oneshot::Receiver<bool>,
+    ) -> BackendResult<OperationResult> {
+        self.operations.launch(
+            "annotate",
+            "Started",
+            vec![],
+            move |_| async move {
+                if !finish.await.map_err(operation_error)? {
+                    return Err(operation_error("Injected failure"));
+                }
+                Ok(OperationCompletion {
+                    status: "completed",
+                    message: "Done",
+                    warning: None,
+                })
+            },
+            |_| async {},
+        )
     }
 }
 

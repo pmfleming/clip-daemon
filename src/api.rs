@@ -438,7 +438,7 @@ mod tests {
             for success in [false, true] {
                 let mut events = backend.operation_events();
                 let (finish, finished) = oneshot::channel();
-                let operation = backend.test_operation(finished);
+                let operation = backend.test_operation(finished).unwrap();
                 assert_eq!(events.recv().await.unwrap().status, "started");
                 if !early {
                     api.reconcile_operations(Some((&operation.id, Some(":1.1".into()))))
@@ -464,7 +464,7 @@ mod tests {
         }
         for owner in [None, Some(":1.1")] {
             let (_finish, finished) = oneshot::channel();
-            let operation = backend.test_operation(finished);
+            let operation = backend.test_operation(finished).unwrap();
             // Missing records are never equivalent to explicitly unowned jobs.
             assert!(!api.cancel_operation(&operation.id).await);
             assert!(backend.active_operations().unwrap().contains(&operation.id));

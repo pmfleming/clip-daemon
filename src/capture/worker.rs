@@ -45,6 +45,24 @@ pub(super) struct Session {
 }
 
 impl Session {
+    pub(super) fn new(
+        limit: u64,
+        jobs: SyncSender<Job>,
+        ready: oneshot::Sender<Result<(), String>>,
+    ) -> Self {
+        Self {
+            control: Arc::new(Control {
+                gate: Admission::default(),
+                stop: AtomicBool::new(false),
+                status: Mutex::new(Err("Capture is starting".into())),
+            }),
+            budget: Arc::new(Budget::default()),
+            ready: Mutex::new(Some(ready)),
+            jobs,
+            limit,
+        }
+    }
+
     pub fn stopped(&self) -> bool {
         self.control.stop.load(Ordering::SeqCst) || self.control.gate.admit().is_none()
     }
@@ -129,18 +147,8 @@ impl Worker {
     ) -> Result<(Self, oneshot::Receiver<Result<(), String>>), String> {
         let (jobs, incoming) = mpsc::sync_channel::<Job>(1);
         let (ready, acknowledged) = oneshot::channel();
-        let control = Arc::new(Control {
-            gate: Admission::default(),
-            stop: AtomicBool::new(false),
-            status: Mutex::new(Err("Capture is starting".into())),
-        });
-        let session = Arc::new(Session {
-            control: control.clone(),
-            budget: Arc::new(Budget::default()),
-            ready: Mutex::new(Some(ready)),
-            jobs,
-            limit,
-        });
+        let session = Arc::new(Session::new(limit, jobs, ready));
+        let control = session.control.clone();
         let thread = std::thread::Builder::new()
             .name("clip-capture".into())
             .spawn(move || session.run(sink, incoming, skip_initial))

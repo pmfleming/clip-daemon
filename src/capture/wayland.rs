@@ -268,6 +268,10 @@ impl State {
 pub(super) fn run(session: Arc<Session>, skip_initial: bool) -> Result<(), String> {
     let connection =
         Connection::connect_to_env().map_err(|_| "Wayland connection is unavailable")?;
+    run_on(connection, session, skip_initial)
+}
+
+fn run_on(connection: Connection, session: Arc<Session>, skip_initial: bool) -> Result<(), String> {
     let mut queue = connection.new_event_queue();
     let qh = queue.handle();
     let mut state = State {
@@ -407,3 +411,7 @@ dispatch_data_control!(
     ZwlrDataControlOfferV1,
     Wlr
 );
+
+#[cfg(test)]
+#[path = "wayland_tests.rs"]
+mod tests;
