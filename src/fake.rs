@@ -205,12 +205,7 @@ impl ClipboardBackend for FakeBackend {
         selection: FileSelection,
         _max_bytes: u64,
     ) -> BackendResult<OperationResult> {
-        if selection.paths.is_empty() {
-            return Err(BackendError::new(
-                crate::backend::BackendErrorKind::InvalidData,
-                "File selection is empty",
-            ));
-        }
+        selection.validate().map_err(crate::backend::invalid_data)?;
         completed("publish-files", "Fake file selection published")
     }
 

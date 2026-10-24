@@ -53,7 +53,8 @@ pub struct InteractiveScreenshot {
     pub annotate: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum FileSelectionOperation {
     Copy,
     Cut,
@@ -68,10 +69,22 @@ impl FileSelectionOperation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct FileSelection {
     pub operation: FileSelectionOperation,
     pub paths: Vec<PathBuf>,
+}
+
+impl FileSelection {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if !(1..=MAX_FILES).contains(&self.paths.len()) {
+            return Err("paths must contain between 1 and 100 files");
+        }
+        if self.paths.iter().any(|path| !path.is_absolute()) {
+            return Err("every file path must be absolute");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

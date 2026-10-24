@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     env,
     fs::{self, File, Permissions},
-    io::{BufReader, Read, Seek, SeekFrom},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
@@ -20,7 +20,7 @@ use crate::{
     },
     classification::{INSPECTION_LIMIT, bounded_preview, classify},
     model::{EntryDetails, EntryKind, EntrySummary, EntryThumbnail, FilePreview, ImageMetadata},
-    selection::read_selection,
+    selection::{read_path, read_selection},
 };
 
 use super::{MAX_DETAILS_BYTES, ResolvedEntry, RingboardBackend, ipc};
@@ -208,6 +208,17 @@ pub(super) struct LocalImageSource {
     pub dimensions: ImageMetadata,
 }
 
+impl LocalImageSource {
+    pub fn identity(&self) -> Option<String> {
+        if !self.path.symlink_metadata().ok()?.is_file() {
+            return None;
+        }
+        // Bound both metadata and actual bytes: a file can grow after stat.
+        let bytes = read_path(&self.path, MAX_WAYLAND_SELECTION_BYTES).ok()?;
+        Some(image_identity(self.mime, &bytes))
+    }
+}
+
 /// Daemon-owned semantic interpretation of bytes and MIME stored by Ringboard.
 pub(super) struct ResolvedContent<'a> {
     stored_mime: &'a str,
@@ -375,18 +386,15 @@ fn write_thumbnail(file: &File, path: &Path, edge: u32) -> BackendResult<(u32, u
 
 fn cached_dimensions(path: &Path) -> Option<(u32, u32)> {
     ImageReader::open(path)
-        .and_then(ImageReader::with_guessed_format)
+        .and_then(image_reader)
         .ok()?
         .into_dimensions()
         .ok()
 }
 
 fn decode_image(file: &File) -> BackendResult<DynamicImage> {
-    let mut reader = ImageReader::new(BufReader::new(file))
-        .with_guessed_format()
-        .map_err(|_| invalid_entry("Clipboard image format is invalid"))?;
-    reader.limits(image_decode_limits());
-    reader
+    image_reader(ImageReader::new(BufReader::new(file)))
+        .map_err(|_| invalid_entry("Clipboard image format is invalid"))?
         .decode()
         .map_err(|_| invalid_entry("Clipboard image could not be decoded"))
 }
@@ -398,17 +406,18 @@ pub(super) fn valid_edited_image(path: &Path, max_bytes: u64) -> bool {
     }) {
         return false;
     }
-    let Some(mut reader) = ImageReader::open(path)
-        .and_then(ImageReader::with_guessed_format)
-        .ok()
-    else {
-        return false;
-    };
-    if reader.format() != Some(image::ImageFormat::Png) {
-        return false;
-    }
+    ImageReader::open(path)
+        .and_then(image_reader)
+        .is_ok_and(|reader| {
+            reader.format() == Some(image::ImageFormat::Png) && reader.decode().is_ok()
+        })
+}
+
+/// Every image inspection uses the same format sniffing and decode budget.
+fn image_reader<R: BufRead + Seek>(reader: ImageReader<R>) -> io::Result<ImageReader<R>> {
+    let mut reader = reader.with_guessed_format()?;
     reader.limits(image_decode_limits());
-    reader.decode().is_ok()
+    Ok(reader)
 }
 
 fn image_decode_limits() -> Limits {
@@ -518,20 +527,14 @@ fn safe_local_file(uri: &str, max_bytes: u64) -> Option<PathBuf> {
 }
 
 fn inspect_local_image(path: &Path) -> Option<(&'static str, ImageMetadata)> {
-    let mut reader = ImageReader::open(path)
-        .and_then(ImageReader::with_guessed_format)
-        .ok()?;
+    let reader = ImageReader::open(path).and_then(image_reader).ok()?;
     let mime = reader.format()?.to_mime_type();
-    reader.limits(image_decode_limits());
     let (width, height) = reader.into_dimensions().ok()?;
     Some((mime, ImageMetadata { width, height }))
 }
 
 fn image_dimensions(bytes: &[u8]) -> Option<ImageMetadata> {
-    let mut reader = ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?;
-    reader.limits(image_decode_limits());
+    let reader = image_reader(ImageReader::new(io::Cursor::new(bytes))).ok()?;
     let (width, height) = reader.into_dimensions().ok()?;
     Some(ImageMetadata { width, height })
 }
@@ -603,37 +606,40 @@ mod tests {
 
     #[test]
     fn edited_images_must_fully_decode() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let valid = directory.path().join("valid.png");
-        let malformed = directory.path().join("malformed.png");
-        image::RgbaImage::new(2, 2)
-            .save(&valid)
-            .expect("write valid image");
-        fs::write(&malformed, b"\x89PNG\r\n\x1a\n").expect("write malformed image");
-
-        assert!(valid_edited_image(&valid, MAX_THUMBNAIL_BYTES));
-        assert!(!valid_edited_image(&valid, 1));
-        assert!(!valid_edited_image(&malformed, MAX_THUMBNAIL_BYTES));
-        let oversized = directory.path().join("oversized.png");
-        image::RgbaImage::new(16_385, 1).save(&oversized).unwrap();
-        assert!(!valid_edited_image(&oversized, MAX_THUMBNAIL_BYTES));
-        for format in [
-            image::ImageFormat::Jpeg,
-            image::ImageFormat::Gif,
-            image::ImageFormat::Tiff,
+        use image::ImageFormat::{Gif, Jpeg, Png, Tiff};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        let thumbnail = directory.path().join("thumbnail.png");
+        for (format, width, valid) in [
+            (Jpeg, 2, false),
+            (Gif, 2, false),
+            (Tiff, 2, false),
+            (Png, 16_385, false),
+            (Png, 2, true),
         ] {
-            let disguised = directory.path().join("not-really-png.png");
-            image::RgbImage::new(2, 2)
-                .save_with_format(&disguised, format)
+            image::RgbImage::new(width, 2)
+                .save_with_format(&path, format)
                 .unwrap();
-            assert!(
-                !valid_edited_image(&disguised, MAX_THUMBNAIL_BYTES),
-                "{format:?}"
+            assert_eq!(
+                valid_edited_image(&path, MAX_THUMBNAIL_BYTES),
+                valid,
+                "{format:?}/{width}"
             );
         }
+        assert!(!valid_edited_image(&path, 1));
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(
+            super::write_thumbnail(&file, &thumbnail, 1).unwrap(),
+            (1, 1)
+        );
+        assert_eq!(super::cached_dimensions(&thumbnail), Some((1, 1)));
         let link = directory.path().join("symlink.png");
-        symlink(&valid, &link).unwrap();
+        symlink(&path, &link).unwrap();
         assert!(!valid_edited_image(&link, MAX_THUMBNAIL_BYTES));
+        fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
+        assert!(!valid_edited_image(&path, MAX_THUMBNAIL_BYTES));
+        fs::remove_file(&path).unwrap();
+        assert!(!valid_edited_image(&path, MAX_THUMBNAIL_BYTES));
     }
 
     fn fingerprint(raw_id: u64, mime: &str, bytes: &[u8]) -> [u8; 32] {

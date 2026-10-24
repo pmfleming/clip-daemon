@@ -404,11 +404,7 @@ fn limits_match(limits: &crate::ringboard::ipc::EngineLimits, desired: &Clipboar
     limits.max_entries == desired.max_entries
         && limits.max_favorites == desired.max_favorites
         && limits.max_entry_bytes
-            == Some(
-                desired
-                    .max_entry_bytes
-                    .min(crate::backend::MAX_WAYLAND_SELECTION_BYTES),
-            )
+            == Some(crate::selection::effective_limit(desired.max_entry_bytes))
 }
 
 fn encoded_ringboard_config(value: &ClipboardSettings) -> Result<(PathBuf, Vec<u8>), String> {

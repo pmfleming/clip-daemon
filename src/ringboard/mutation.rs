@@ -11,12 +11,9 @@ use std::{
 use url::Url;
 
 use crate::{
-    backend::{
-        BackendResult, EntryTarget, MAX_WAYLAND_SELECTION_BYTES, invalid_data as invalid_entry,
-        operation_error,
-    },
+    backend::{BackendResult, EntryTarget, invalid_data as invalid_entry, operation_error},
     model::{EntryKind, OperationResult},
-    selection::read_path,
+    selection::{effective_limit, read_path},
 };
 
 use super::{
@@ -361,7 +358,7 @@ fn selected_image(
 }
 
 fn resolved_content<'a>(mime: &'a str, bytes: &[u8], max_bytes: u64) -> ResolvedContent<'a> {
-    ResolvedContent::resolve(mime, bytes, max_bytes.min(MAX_WAYLAND_SELECTION_BYTES))
+    ResolvedContent::resolve(mime, bytes, effective_limit(max_bytes))
 }
 
 fn publish_entry(

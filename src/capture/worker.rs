@@ -243,7 +243,7 @@ impl CaptureControl for Controller {
         if let Some(error) = &runtime.terminal_error {
             return Err(error.clone());
         }
-        let limit = max_bytes.min(crate::backend::MAX_WAYLAND_SELECTION_BYTES);
+        let limit = crate::selection::effective_limit(max_bytes);
         if !paused
             && let Some(worker) = &runtime.worker
             && worker.limit == limit

@@ -216,7 +216,10 @@ impl ApiService {
                     .publish_files(decode(params)?, self.max_entry_bytes()?)
                     .await
             }
-            _ => Err(unknown_method(method)),
+            _ => Err(ApiError::new(
+                "unsupported-method",
+                format!("Unsupported clip-api method: {method}"),
+            )),
         }
     }
 
@@ -225,8 +228,10 @@ impl ApiService {
         let expires = Instant::now() + Duration::from_secs(30);
         let mut challenges = self.wipe_challenges.lock().await;
         challenges.retain(|_, deadline| *deadline > Instant::now());
-        challenges.insert(id.clone(), expires);
-        Ok(json!({ "challenge": { "id": id, "confirmation": "WIPE", "expires_in_ms": 30000 } }))
+        let view =
+            json!({ "challenge": { "id": id, "confirmation": "WIPE", "expires_in_ms": 30000 } });
+        challenges.insert(id, expires);
+        Ok(view)
     }
 
     fn max_entry_bytes(&self) -> Result<u64, ApiError> {
@@ -356,21 +361,6 @@ fn policy_event(method: &str, data: &Value) -> Option<LifecycleEvent> {
         event: event.into(),
         data: data.clone(),
     })
-}
-
-fn unknown_method(method: &str) -> ApiError {
-    let (code, message) = if protocol::METHODS.contains(&method) {
-        (
-            "not-implemented",
-            format!("{method} is reserved by clip-api v1 but is not implemented yet"),
-        )
-    } else {
-        (
-            "unsupported-method",
-            format!("Unsupported clip-api method: {method}"),
-        )
-    };
-    ApiError::new(code, message)
 }
 
 fn settings_error(message: String) -> ApiError {

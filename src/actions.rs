@@ -14,8 +14,7 @@ use uuid::Uuid;
 use crate::{
     backend::{
         BackendError, BackendErrorKind, BackendMutation, ClipboardBackend, EntryTarget,
-        FileSelection, FileSelectionOperation, HistoryQuery, MAX_FILES, MAX_QUERY_LIMIT,
-        ScreenshotRegion, invalid_data as invalid,
+        FileSelection, HistoryQuery, MAX_QUERY_LIMIT, ScreenshotRegion, invalid_data as invalid,
     },
     model::{EntryDetails, EntryKind, FilePreview, OperationResult},
     session::SessionManager,
@@ -263,32 +262,11 @@ impl ClipboardService {
 
     pub(crate) async fn publish_files(
         &self,
-        params: PublishFilesParams,
+        params: FileSelection,
         max_entry_bytes: u64,
     ) -> Result<Value, ApiError> {
-        let operation = match params.operation.as_str() {
-            "copy" => FileSelectionOperation::Copy,
-            "cut" => FileSelectionOperation::Cut,
-            _ => return Err(ApiError::validation("operation must be copy or cut")),
-        };
-        if !(1..=MAX_FILES).contains(&params.paths.len()) {
-            return Err(ApiError::validation(
-                "paths must contain between 1 and 100 files",
-            ));
-        }
-        if params.paths.iter().any(|path| !path.is_absolute()) {
-            return Err(ApiError::validation("every file path must be absolute"));
-        }
-        let operation = self
-            .backend
-            .publish_files(
-                FileSelection {
-                    operation,
-                    paths: params.paths,
-                },
-                max_entry_bytes,
-            )
-            .await?;
+        params.validate().map_err(ApiError::validation)?;
+        let operation = self.backend.publish_files(params, max_entry_bytes).await?;
         Ok(json!({ "operation": operation }))
     }
 
@@ -522,12 +500,6 @@ pub(crate) struct PublishTextParams {
 pub(crate) struct SensitiveTextParams {
     text: String,
     expiry_seconds: u16,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct PublishFilesParams {
-    operation: String,
-    paths: Vec<PathBuf>,
 }
 
 #[derive(Deserialize)]

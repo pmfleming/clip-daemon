@@ -12,12 +12,9 @@ use shelllist_daemon_core::{XdgRoot, resolve_xdg_root};
 use url::Url;
 use uuid::Uuid;
 
-use crate::backend::{
-    BackendResult, MAX_WAYLAND_SELECTION_BYTES, operation_error as artifact_error,
-};
+use crate::backend::{BackendResult, operation_error as artifact_error};
 
 use super::content::{LocalImageSource, image_identity};
-use crate::selection::read_path;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ArtifactRecord {
@@ -186,7 +183,8 @@ impl ArtifactRegistry {
 
     pub fn match_local_image(&self, source: &LocalImageSource) -> Option<String> {
         let record = self.records.get(&source.path)?;
-        read_registered_image(source)
+        source
+            .identity()
             .filter(|identity| identity == &record.image_identity)
             .map(|_| record.source_entry_id.clone())
     }
@@ -295,15 +293,6 @@ fn inline_image_identity(mime: &str, digest: &[u8; 32]) -> String {
     hex::encode(hash.finalize())
 }
 
-fn read_registered_image(source: &LocalImageSource) -> Option<String> {
-    if !source.path.symlink_metadata().ok()?.is_file() {
-        return None;
-    }
-    // Reuse both metadata and actual-byte bounds: the file can grow after stat.
-    let bytes = read_path(&source.path, MAX_WAYLAND_SELECTION_BYTES).ok()?;
-    Some(image_identity(source.mime, &bytes))
-}
-
 fn owned_path(root: Option<&Path>, path: &Path) -> bool {
     let Some(root) = root else { return false };
     if path.parent() != Some(root) {
@@ -343,8 +332,8 @@ fn unix_time() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArtifactRegistry, LocalImageSource, MAX_WAYLAND_SELECTION_BYTES};
-    use crate::classification::INSPECTION_LIMIT;
+    use super::{ArtifactRegistry, LocalImageSource};
+    use crate::{backend::MAX_WAYLAND_SELECTION_BYTES, classification::INSPECTION_LIMIT};
 
     #[test]
     fn annotation_echoes_match_duplicates_but_not_the_replacement_source() {

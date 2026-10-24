@@ -18,8 +18,8 @@ use url::Url;
 use crate::{
     backend::{
         BackendError, BackendErrorKind, BackendMutation, BackendResult, ClipboardBackend,
-        EntryTarget, FileSelection, HistoryQuery, MAX_FILES, MAX_QUERY_LIMIT, ScreenshotRegion,
-        invalid_data, operation_error as operation_failed,
+        EntryTarget, FileSelection, HistoryQuery, MAX_QUERY_LIMIT, ScreenshotRegion, invalid_data,
+        operation_error as operation_failed,
     },
     model::{
         BackendStatus, EntryDetails, EntrySummary, EntryThumbnail, HistoryPage, OperationResult,
@@ -519,13 +519,8 @@ impl RingboardBackend {
         file_selection: FileSelection,
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
+        file_selection.validate().map_err(invalid_data)?;
         let file_count = file_selection.paths.len();
-        if !(1..=MAX_FILES).contains(&file_count) {
-            return Err(invalid_data(
-                "File selection must contain between 1 and 100 paths",
-            ));
-        }
-
         let uri_list = encode_file_uris(&file_selection.paths)?;
         self.selection
             .publish_files(file_selection.operation.as_str(), uri_list, max_bytes)?;
@@ -872,9 +867,6 @@ fn history_token_from_parts(
 
 fn encode_file_uris(paths: &[PathBuf]) -> BackendResult<Vec<u8>> {
     paths.iter().try_fold(Vec::new(), |mut bytes, path| {
-        if !path.is_absolute() {
-            return Err(invalid_data("File selection paths must be absolute"));
-        }
         let uri = Url::from_file_path(path)
             .map_err(|_| invalid_data("File selection path is invalid"))?;
         bytes.extend_from_slice(uri.as_str().as_bytes());

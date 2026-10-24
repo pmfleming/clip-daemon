@@ -57,32 +57,37 @@ impl SessionManager {
         view(id, target_available, "active")
     }
 
-    pub async fn validate_paste(&self, id: &str) -> Result<bool, &'static str> {
+    async fn with_session<T>(
+        &self,
+        id: &str,
+        use_session: impl FnOnce(&mut Session) -> T,
+    ) -> Result<T, &'static str> {
         let mut sessions = self.sessions.lock().await;
         let session = sessions
-            .get(id)
+            .get_mut(id)
             .ok_or("Paste session is unknown or expired")?;
         if session.expires <= Instant::now() {
             sessions.remove(id);
             return Err("Paste session expired");
         }
-        Ok(session.target.is_some())
+        Ok(use_session(session))
+    }
+
+    pub async fn validate_paste(&self, id: &str) -> Result<bool, &'static str> {
+        self.with_session(id, |session| session.target.is_some())
+            .await
     }
 
     /// Arm automatic paste only after the requested clipboard publication has
     /// succeeded. A session that disappears in the meantime degrades safely to
     /// copy-only behavior.
     pub async fn arm_paste(&self, id: &str) -> bool {
-        let mut sessions = self.sessions.lock().await;
-        let Some(session) = sessions.get_mut(id) else {
-            return false;
-        };
-        if session.expires <= Instant::now() {
-            sessions.remove(id);
-            return false;
-        }
-        session.paste_pending = session.target.is_some();
-        session.paste_pending
+        self.with_session(id, |session| {
+            session.paste_pending = session.target.is_some();
+            session.paste_pending
+        })
+        .await
+        .unwrap_or(false)
     }
 
     pub async fn hidden(&self, id: &str) -> Result<SessionView, &'static str> {
@@ -258,18 +263,30 @@ fn is_terminal(class: &str) -> bool {
 mod tests {
     use super::{SessionManager, valid_window_address};
 
+    async fn expired(manager: &SessionManager) -> String {
+        let id = manager.test_target().await;
+        assert!(manager.validate_paste(&id).await.unwrap());
+        manager.sessions.lock().await.get_mut(&id).unwrap().expires = std::time::Instant::now();
+        id
+    }
+
     #[tokio::test]
     async fn invalid_targets_and_expired_or_ended_sessions_cannot_trigger_paste() {
         assert!(!valid_window_address("0x0"));
         assert!(!valid_window_address("0x123'; os.execute('false')"));
         let manager = SessionManager::default();
-        let id = manager.test_target().await;
-        manager.sessions.lock().await.get_mut(&id).unwrap().expires = std::time::Instant::now();
+        let id = expired(&manager).await;
         assert!(manager.hidden(&id).await.is_err());
         assert!(!manager.arm_paste(&id).await);
         let id = manager.test_target().await;
         assert!(manager.end(&id).await.target_available);
         assert!(!manager.arm_paste(&id).await);
         assert!(manager.hidden(&id).await.is_err());
+        let id = expired(&manager).await;
+        assert!(!manager.arm_paste(&id).await);
+        assert!(manager.validate_paste(&id).await.is_err());
+        let id = expired(&manager).await;
+        let error = manager.validate_paste(&id).await.unwrap_err();
+        assert_eq!(error, "Paste session expired");
     }
 }
