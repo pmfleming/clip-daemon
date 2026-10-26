@@ -86,3 +86,56 @@ ownership on reconnect, and cancel an operation admitted after disconnect before
 acknowledgement (multi-worker runtime). No capture or hardware helpers run.
 Validation: 55 library / six integration passes, strict Clippy/formatting.
 Frontend opt-in and native Quickshell evidence are not claimed by this step.
+
+## Step 4 — frontend opt-in and native acceptance
+
+`SHELLLIST_CLIP_SOCKET=1` independently selects the shared Unix client. The bridge
+remains default; no automatic fallback or effect replay is introduced. Matching
+producer/frontend metadata is required on both transports. The clipboard delivery
+policy fences old history/detail reads against initial/reset/lag invalidations,
+clears sensitive preview caches, and rejects malformed or older watermarks before
+publication. Ordinary history refresh also repairs quiet invalidation loss.
+
+Only operations acknowledged to that consumer enter its recovery set. Owned
+status reads run at one-second intervals, with one outstanding and a five-second
+uncertainty deadline; a timed-out read never starts another read or effect.
+Terminal, malformed and unknown outcomes retire the operation locally. Late
+observations cannot reopen it or alter a peer's work. Gaps read status rather than
+clearing accepted-work guards. Drafts survive recovery; session discontinuity
+forgets paste authority and never acknowledges hidden or republishes to repair it.
+
+The feature-gated, normally ignored `native_quickshell_clip_socket_acceptance`
+launches actual Quickshell through the production shared client and recovery
+policy. Its private real listener/exported service uses an in-memory clipboard,
+isolated settings, no service/capture helpers and a read-only dispatch gate. Two
+consumers share one owner, read and reconcile a native history invalidation racing
+an older response, renew one subscription, destroy one consumer and verify the
+surviving peer. Owner disconnect is observed before listener shutdown. The child
+has an empty inherited environment, private HOME/runtime and nonexistent buses.
+See Shelllist `tests/README.md` for explicit invocation; absent inputs fail.
+
+Payload qualification also passes: a real socket accepts an exact 128 MiB request
+and rejects one byte over without executing the fixture deletion; an exact 32 MiB
+response (including LF) is accepted, while one byte over retires only its owner.
+A genuinely non-reading peer triggers the writer deadline and owned-operation
+cleanup without cancelling a healthy peer's work. The stalled test shortens the
+write deadline to 100 ms; this is failure-path evidence, not a production latency
+measurement. Run the normally ignored `payload_qualification` library tests
+explicitly with `-- --ignored`; ordinary release package checks include them.
+
+The native probe additionally sends a 16 MiB all-control-character fixture input
+(96 MiB escaped JSON) through a read-only query and receives a near-32 MiB UTF-8
+response. Clipboard alone reserves three bytes per UTF-16 unit for up to a 128 MiB
+record plus LF, with four calls outstanding. Other daemons retain their existing
+write budgets. The producer frame ceiling is unchanged; the larger frontend
+reservation fixes an otherwise incompatible generic 4 MiB budget.
+
+This is debug/private framing and read/recovery acceptance, not sustained mixed
+load, matched release performance, OS-process crash or installed-session evidence.
+No host service or clipboard state was changed.
+
+Step-4 validation: 55 ordinary library passes, five API and one retained-client
+integration pass; the two heavy payload tests and the native two-case probe pass
+when explicitly invoked. All-target/all-feature strict Clippy and formatting pass.
+The frontend reports 429 Qt passes / one existing renderer skip, strict QML lint,
+generated-contract and offline producer parity, surface and build-input checks.

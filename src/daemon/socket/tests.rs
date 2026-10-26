@@ -19,6 +19,10 @@ use tokio::{
     time::{Duration, timeout},
 };
 
+#[cfg(feature = "native-quickshell-socket")]
+mod native;
+mod payload;
+
 const DEADLINE: Duration = Duration::from_secs(5);
 type Peer = BufReader<UnixStream>;
 struct Fixture {
@@ -34,7 +38,10 @@ impl Fixture {
     async fn new(backend: Arc<dyn ClipboardBackend>) -> Self {
         let bus = Bus::new();
         let server = bus.connect().await;
-        let api = Arc::new(ApiService::new(backend));
+        let api = Arc::new(ApiService::with_settings(
+            backend,
+            crate::settings::SettingsManager::isolated(),
+        ));
         let tasks = shelllist_daemon_tokio::TaskGroup::default();
         let owners = Owners::start(server.clone(), api.clone(), &tasks)
             .await

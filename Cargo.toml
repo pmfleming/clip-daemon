@@ -40,6 +40,7 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
 [features]
 benchmarks = []
+native-quickshell-socket = []
 
 [dev-dependencies]
 wayland-server = "0.31"

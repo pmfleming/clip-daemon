@@ -52,6 +52,9 @@
             ];
             buildInputs = [ pkgs.dbus ];
             nativeCheckInputs = [ pkgs.dbus ];
+            # Include private heavy framing cases; native Quickshell acceptance
+            # remains excluded by its non-default Cargo feature.
+            checkFlags = [ "--include-ignored" ];
             strictDeps = true;
             # Only the pinned Ringboard crates need core_io_borrowed_buf.
             RUSTC_BOOTSTRAP = "clipboard_history_core,clipboard_history_client_sdk";

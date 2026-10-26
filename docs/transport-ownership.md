@@ -1,5 +1,10 @@
 # Clipboard transport ownership prerequisite
 
+Historical prerequisite checkpoint (`aeaed46`). For subsequently implemented
+operation ownership, recovery, direct ingress and frontend acceptance, see
+[the staged migration record](unix-jsonl-migration.md). The blockers and test
+counts below describe this earlier checkpoint, not the current implementation.
+
 The Unix JSONL migration remains incomplete. This stage fixes existing producer
 ownership before exposing another ingress. There is no clipboard socket listener
 or frontend socket opt-in in this stage; the retained D-Bus/client path remains.

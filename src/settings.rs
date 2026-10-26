@@ -145,6 +145,32 @@ const SETTINGS_SAVED: &str = "Clipboard settings were saved";
 const CAPTURE_SAVED: &str = "Capture preference was saved";
 
 impl SettingsManager {
+    #[cfg(test)]
+    pub(crate) fn isolated() -> Self {
+        struct NoServices;
+        #[async_trait::async_trait]
+        impl ServiceControl for NoServices {
+            async fn control(&self, _: &str, _: &[&str]) -> Result<(), String> {
+                Err("Private fixture has no services".into())
+            }
+            async fn limits(&self) -> Result<crate::ringboard::ipc::EngineLimits, String> {
+                Err("Private fixture has no engine".into())
+            }
+        }
+        Self {
+            state: StdMutex::new(SettingsState {
+                value: ClipboardSettings::default(),
+                load_error: None,
+                capture_verified: false,
+                capture_error: None,
+            }),
+            path: None,
+            transaction: AsyncMutex::new(()),
+            services: Arc::new(NoServices),
+            capture: Arc::new(crate::capture::Unavailable),
+        }
+    }
+
     pub(crate) fn with_capture(capture: Arc<dyn CaptureControl>) -> Self {
         Self {
             capture,
