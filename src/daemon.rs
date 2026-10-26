@@ -1,4 +1,4 @@
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -226,16 +226,11 @@ pub async fn run_with_capture(
 }
 
 async fn serve(api: Arc<ApiService>) -> Result<()> {
-    let event_revision = Arc::new(AtomicU64::new(0));
     let (history_events, _) = tokio::sync::broadcast::channel(32);
     let tasks = shelllist_daemon_tokio::TaskGroup::default();
     tasks.spawn(
         "clipboard-history",
-        subscription::observe_history(
-            Arc::clone(&api),
-            Arc::clone(&event_revision),
-            history_events.clone(),
-        ),
+        subscription::observe_history(Arc::clone(&api), history_events.clone()),
     );
     let connection = connection::Builder::session()
         .context("connect to session D-Bus")?

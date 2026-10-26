@@ -16,7 +16,10 @@ use crate::{
     settings::{SettingsManager, SettingsUpdate},
 };
 
+mod history;
 mod operations;
+#[cfg(test)]
+mod recovery_tests;
 
 pub const PROTOCOL: &str = protocol::NAME;
 pub const VERSION: u8 = protocol::VERSION;
@@ -50,6 +53,8 @@ struct WipeChallenge {
 }
 
 pub struct ApiService {
+    epoch: String,
+    history: Mutex<history::Clock>,
     wipe_challenges: Mutex<HashMap<String, WipeChallenge>>,
     settings: SettingsManager,
     actions: ClipboardService,
@@ -65,6 +70,8 @@ impl ApiService {
     pub(crate) fn with_settings(backend: actions::Backend, settings: SettingsManager) -> Self {
         let (lifecycle_events, _) = broadcast::channel(64);
         Self {
+            epoch: Uuid::new_v4().to_string(),
+            history: Mutex::new(history::Clock::default()),
             wipe_challenges: Mutex::new(HashMap::new()),
             settings,
             actions: ClipboardService::new(backend),
@@ -90,11 +97,25 @@ impl ApiService {
         }
     }
 
-    pub(crate) async fn change_token(&self) -> Result<u64, EnvelopeError> {
-        self.actions
-            .change_token()
+    pub(crate) async fn history_observation(&self) -> Result<Value, EnvelopeError> {
+        self.observe_history()
             .await
             .map_err(|error| EnvelopeError::new(error.code, error.message))
+    }
+
+    async fn observe_history(&self) -> Result<Value, ApiError> {
+        let mut clock = self.history.lock().await;
+        let token = match self.actions.change_token().await {
+            Ok(token) => token,
+            Err(error) => {
+                clock.invalidate();
+                return Err(error);
+            }
+        };
+        let revision = clock.observe(token)?;
+        Ok(
+            json!({"history_revision":token.to_string(), "_history":{"epoch":self.epoch, "revision":revision}, "change":"reset"}),
+        )
     }
 
     pub(crate) fn operation_events(&self) -> actions::OperationEvents {
@@ -144,9 +165,41 @@ impl ApiService {
         let _ = self.lifecycle_events.send(LifecycleEvent {
             stream: protocol::stream::OPERATION,
             event: record.operation.status.clone(),
-            data: json!({"operation": record.operation}),
+            data: json!({"operation": self.operation_payload(&record.operation, record.revision)}),
             audience: EventAudience::Owner(record.owner.clone()),
         });
+    }
+
+    fn operation_payload(&self, operation: &crate::model::OperationResult, revision: u64) -> Value {
+        let mut value = json!(operation);
+        value["_publication"] = json!({"epoch":self.epoch, "revision":revision});
+        value
+    }
+
+    fn operation_status(&self, params: Value, owner: Option<&str>) -> Result<Value, ApiError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Status {
+            operation_id: String,
+        }
+        let params: Status = decode(params)?;
+        if params.operation_id.is_empty() || params.operation_id.len() > 256 {
+            return Err(ApiError::validation("Invalid operation identity"));
+        }
+        self.refresh_operation(&params.operation_id);
+        let mut book = self.operations.lock().unwrap_or_else(|p| p.into_inner());
+        book.prune();
+        let record = book
+            .records
+            .get(&params.operation_id)
+            .filter(|record| record.owner.as_deref() == owner)
+            .ok_or_else(|| {
+                ApiError::new(
+                    "operation-unknown",
+                    "Operation outcome is unknown or expired; do not replay",
+                )
+            })?;
+        Ok(json!({"operation":self.operation_payload(&record.operation, record.revision)}))
     }
 
     fn refresh_operation(&self, id: &str) {
@@ -226,10 +279,13 @@ impl ApiService {
     ) -> Value {
         const METHOD: &str = "clipboard.selection.publish";
         tracing::debug!(method = METHOD, "clip-api request started");
-        let result = match self.max_entry_bytes() {
+        let mut result = match self.max_entry_bytes() {
             Ok(limit) => self.actions.publish(mime, bytes, limit).await,
             Err(error) => Err(error),
         };
+        if let Ok(data) = &mut result {
+            self.stamp_receipt(data);
+        }
         if let Ok(data) = &result {
             self.publish_lifecycle(METHOD, data, owner);
         }
@@ -256,21 +312,25 @@ impl ApiService {
         } else {
             None
         };
-        let result = if method == "clipboard.history.query" {
+        let mut result = if method == "clipboard.history.query" {
             self.query_history(params, owner.as_deref()).await
         } else {
             self.dispatch_method(method, params, owner.as_deref()).await
         };
-        if let Ok(data) = &result {
-            self.publish_lifecycle(method, data, owner.as_deref());
-        }
-        if let Some(data) = result
-            .as_ref()
-            .ok()
-            .filter(|data| started_operation_id(data).is_some())
-            && let Ok(operation) = serde_json::from_value(data["operation"].clone())
+        if let Some(data) = result.as_ref().ok().filter(|data| {
+            method != "clipboard.operation.status" && started_operation_id(data).is_some()
+        }) && let Ok(operation) = serde_json::from_value(data["operation"].clone())
         {
-            self.track_operation(operation, owner);
+            self.track_operation(operation, owner.clone());
+            result = self.operation_status(
+                json!({"operation_id":data["operation"]["id"]}),
+                owner.as_deref(),
+            );
+        } else if let Ok(data) = &mut result {
+            self.stamp_receipt(data);
+            if method != "clipboard.operation.status" {
+                self.publish_lifecycle(method, data, owner.as_deref());
+            }
         }
         finish_request(method, result)
     }
@@ -320,6 +380,14 @@ impl ApiService {
         owners
     }
 
+    fn stamp_receipt(&self, data: &mut Value) {
+        if let Some(operation) = data.get_mut("operation")
+            && operation.get("_publication").is_none()
+        {
+            operation["_publication"] = json!({"epoch":self.epoch, "revision":1});
+        }
+    }
+
     fn publish_lifecycle(&self, method: &str, data: &Value, owner: Option<&str>) {
         for event in [
             operation_event(data, owner),
@@ -339,6 +407,7 @@ impl ApiService {
         owner: Option<&str>,
     ) -> Result<Value, ApiError> {
         match method {
+            "clipboard.operation.status" => self.operation_status(params, owner),
             "clipboard.history.revision" => self.history_revision().await,
             "clipboard.entry.details" => self.actions.details(decode(params)?).await,
             "clipboard.entry.thumbnail" => self.actions.thumbnail(decode(params)?).await,
@@ -359,8 +428,13 @@ impl ApiService {
     }
 
     async fn history_revision(&self) -> Result<Value, ApiError> {
-        let revision = self.actions.change_token().await?;
-        Ok(json!({ "revision": revision, "snapshot_revision": revision.to_string() }))
+        let observation = self.observe_history().await?;
+        let token = observation["history_revision"]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok());
+        Ok(
+            json!({"revision":token, "snapshot_revision":observation["history_revision"], "_history":observation["_history"]}),
+        )
     }
 
     async fn query_history(&self, params: Value, owner: Option<&str>) -> Result<Value, ApiError> {
@@ -369,7 +443,21 @@ impl ApiService {
             .get()
             .map_err(settings_error)?
             .collapse_self_echoes;
-        self.actions.query(decode(params)?, collapse, owner).await
+        let mut clock = self.history.lock().await;
+        let before = self.actions.change_token().await?;
+        clock.observe(before)?;
+        let mut data = self.actions.query(decode(params)?, collapse, owner).await?;
+        let after = self.actions.change_token().await?;
+        let revision = clock.observe(after)?;
+        if before != after {
+            return Err(ApiError::new(
+                "stale-history",
+                "History changed during the query; refresh without replaying effects",
+            ));
+        }
+        data["_history"] = json!({"epoch":self.epoch, "revision":revision});
+        data["history"]["snapshot_revision"] = json!(after.to_string());
+        Ok(data)
     }
 
     async fn dispatch_wipe(

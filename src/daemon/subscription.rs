@@ -1,10 +1,4 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use serde_json::{Value, json};
 use shelllist_daemon_core::{
@@ -40,7 +34,7 @@ struct SubscriptionTask {
 
 #[derive(Default)]
 struct HistoryState {
-    previous: Option<u64>,
+    previous: Option<Value>,
     unavailable: bool,
 }
 
@@ -113,11 +107,11 @@ where
 }
 
 impl HistoryState {
-    fn update(&mut self, result: Result<u64, ApiError>) -> Option<HistoryUpdate> {
+    fn update(&mut self, result: Result<Value, ApiError>) -> Option<HistoryUpdate> {
         match result {
-            Ok(token) => self
-                .changed(token)
-                .then_some(HistoryUpdate::Changed(Value::from(token))),
+            Ok(observation) => self
+                .changed(observation.clone())
+                .then_some(HistoryUpdate::Changed(observation)),
             Err(error) if !std::mem::replace(&mut self.unavailable, true) => {
                 Some(HistoryUpdate::Unavailable(error))
             }
@@ -125,10 +119,10 @@ impl HistoryState {
         }
     }
 
-    fn changed(&mut self, token: u64) -> bool {
+    fn changed(&mut self, token: Value) -> bool {
         // An initial reset closes the race between a frontend's first query and
         // establishing this subscription's history baseline.
-        let previous = self.previous.replace(token);
+        let previous = self.previous.replace(token.clone());
         std::mem::replace(&mut self.unavailable, false)
             || previous.is_none_or(|previous| previous != token)
     }
@@ -174,7 +168,6 @@ pub(super) async fn start(
 
 pub(super) async fn observe_history(
     api_service: Arc<ApiService>,
-    event_revision: Arc<AtomicU64>,
     events: tokio::sync::broadcast::Sender<HistoryUpdate>,
 ) {
     let mut state = HistoryState::default();
@@ -182,13 +175,12 @@ pub(super) async fn observe_history(
     timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         timer.tick().await;
-        observe_history_tick(&api_service, &event_revision, &events, &mut state).await;
+        observe_history_tick(&api_service, &events, &mut state).await;
     }
 }
 
 async fn observe_history_tick(
     api_service: &ApiService,
-    event_revision: &AtomicU64,
     events: &tokio::sync::broadcast::Sender<HistoryUpdate>,
     state: &mut HistoryState,
 ) {
@@ -196,19 +188,8 @@ async fn observe_history_tick(
         *state = HistoryState::default();
         return;
     }
-    let Some(update) = state.update(api_service.change_token().await) else {
+    let Some(update) = state.update(api_service.history_observation().await) else {
         return;
-    };
-    let update = match update {
-        HistoryUpdate::Changed(history_revision) => {
-            let revision = event_revision.fetch_add(1, Ordering::Relaxed) + 1;
-            HistoryUpdate::Changed(json!({
-                "revision": revision,
-                "history_revision": history_revision,
-                "change": "reset"
-            }))
-        }
-        unavailable => unavailable,
     };
     let _ = events.send(update);
 }
@@ -220,10 +201,11 @@ async fn receive_history(
     subscription_id: &str,
     requested: RequestedStreams,
 ) {
-    let initial = match api_service.change_token().await {
-        Ok(token) => HistoryUpdate::Changed(json!({
-            "change": "reset", "reason": "initial", "history_revision": token
-        })),
+    let initial = match api_service.history_observation().await {
+        Ok(mut observation) => {
+            observation["reason"] = json!("initial");
+            HistoryUpdate::Changed(observation)
+        }
         Err(error) => HistoryUpdate::Unavailable(error),
     };
     emit_update(emitter, subscription_id, requested, initial).await;
@@ -349,12 +331,12 @@ mod tests {
     fn history_state_emits_initial_changes_outages_and_recovery_once() {
         let mut state = HistoryState::default();
         assert!(matches!(
-            state.update(Ok(1)),
+            state.update(Ok(serde_json::json!(1))),
             Some(HistoryUpdate::Changed(_))
         ));
-        assert!(state.update(Ok(1)).is_none());
+        assert!(state.update(Ok(serde_json::json!(1))).is_none());
         assert!(matches!(
-            state.update(Ok(2)),
+            state.update(Ok(serde_json::json!(2))),
             Some(HistoryUpdate::Changed(_))
         ));
         assert!(matches!(
@@ -367,7 +349,7 @@ mod tests {
                 .is_none()
         );
         assert!(matches!(
-            state.update(Ok(2)),
+            state.update(Ok(serde_json::json!(2))),
             Some(HistoryUpdate::Changed(_))
         ));
     }

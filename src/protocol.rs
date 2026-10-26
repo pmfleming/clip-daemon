@@ -34,6 +34,7 @@ pub const METHODS: &[&str] = &[
     "clipboard.settings.update",
     "clipboard.history.wipe.prepare",
     "clipboard.history.wipe.commit",
+    "clipboard.operation.status",
 ];
 
 pub const STREAMS: &[&str] = &[

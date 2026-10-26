@@ -33,7 +33,7 @@ impl CorrelationPolicy for ClipCorrelation {
         stream == crate::protocol::stream::OPERATION
             && matches!(
                 event.get("event").and_then(Value::as_str),
-                Some("completed" | "failed" | "cancelled")
+                Some("completed" | "failed" | "cancelled" | "unknown")
             )
     }
 }
@@ -108,35 +108,39 @@ pub async fn screenshot(screen: bool, annotate: bool) -> Result<()> {
             .and_then(Value::as_str)
             .unwrap_or("Screenshot request failed")
     );
-    if response["data"]["operation"]["status"] == "started" {
-        let id = response["data"]["operation"]["id"]
-            .as_str()
-            .context("Missing screenshot operation identity")?;
-        loop {
-            let message = events
-                .next()
-                .await
-                .context("Screenshot outcome unknown; do not replay")?;
-            let (_, event): (String, String) = message.body().deserialize()?;
-            let event: Value = serde_json::from_str(&event)?;
-            if event["subscription_id"] != subscription {
-                continue;
+    let id = response["data"]["operation"]["id"]
+        .as_str()
+        .context("Missing screenshot operation identity")?;
+    let mut operation = response["data"]["operation"].clone();
+    let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    while operation["status"] == "started" {
+        tokio::select! {
+            message = events.next() => {
+                let message = message.context("Screenshot outcome unknown; do not replay")?;
+                let (_, event): (String, String) = message.body().deserialize()?;
+                let event: Value = serde_json::from_str(&event)?;
+                if event["subscription_id"] == subscription && event["data"]["operation"]["id"] == id {
+                    operation = event["data"]["operation"].clone();
+                }
             }
-            anyhow::ensure!(
-                event["event"] != "gap",
-                "Screenshot outcome unknown; do not replay"
-            );
-            if event["data"]["operation"]["id"] != id || event["event"] == "started" {
-                continue;
+            _ = timer.tick() => {
+                let params = serde_json::json!({"operation_id":id}).to_string();
+                let status: String = tokio::time::timeout(std::time::Duration::from_secs(3),
+                    proxy.call("Call", &("clipboard.operation.status", params))).await
+                    .context("Screenshot outcome unknown; do not replay")??;
+                let status: Value = serde_json::from_str(&status)?;
+                anyhow::ensure!(status["ok"] == true && status["data"]["operation"]["id"] == id,
+                    "Screenshot outcome unknown; do not replay");
+                operation = status["data"]["operation"].clone();
             }
-            anyhow::ensure!(
-                event["event"] == "completed",
-                "Screenshot did not complete: {}",
-                event["event"].as_str().unwrap_or("unknown")
-            );
-            break;
         }
     }
+    anyhow::ensure!(
+        operation["status"] == "completed",
+        "Screenshot did not complete: {}",
+        operation["status"].as_str().unwrap_or("unknown")
+    );
     Ok(())
 }
 

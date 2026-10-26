@@ -26,6 +26,8 @@ pub struct FakeBackend {
     fail_publication: bool,
     #[cfg(test)]
     pub(crate) details_gate: Option<Arc<DetailsGate>>,
+    #[cfg(test)]
+    pub(crate) query_gate: Option<Arc<DetailsGate>>,
 }
 
 #[cfg(test)]
@@ -44,6 +46,8 @@ impl Default for FakeBackend {
             fail_publication: false,
             #[cfg(test)]
             details_gate: None,
+            #[cfg(test)]
+            query_gate: None,
         }
     }
 }
@@ -139,6 +143,11 @@ impl ClipboardBackend for FakeBackend {
     }
 
     async fn query(&self, query: HistoryQuery) -> BackendResult<HistoryPage> {
+        #[cfg(test)]
+        if let Some(gate) = &self.query_gate {
+            gate.entered.notify_one();
+            gate.release.acquire().await.unwrap().forget();
+        }
         let needle = query.query.to_lowercase();
         let entries = self.entries()?;
         let current = entries

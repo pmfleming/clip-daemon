@@ -1,5 +1,12 @@
 {
   "protocol": "clip-api",
+  "recovery": {
+    "history": "_history epoch/revision seals queries and invalidations; content tokens compare only for equality",
+    "operation": "operation._publication epoch/revision is per operation; status never restarts work",
+    "capture": "interactive captures use operation status; settings are configuration, not completion evidence",
+    "session": "lost hidden/publication receipts remain uncertain; never repeat hidden or paste during recovery",
+    "unknown": "missing, expired, foreign or lost-before-ack identities never imply success"
+  },
   "history_example": {
     "revision": 1,
     "generation": 0,
@@ -215,6 +222,17 @@
         },
         "response_key": "operation",
         "stream": "clipboard.operation"
+      },
+      {
+        "name": "clipboard.operation.status",
+        "params_example": { "operation_id": "operation-opaque" },
+        "response_key": "operation",
+        "stream": null,
+        "read_only": true,
+        "owner_scoped": true,
+        "terminal_retention_seconds": 300,
+        "terminal_capacity": 256,
+        "unknown_error": "operation-unknown"
       }
     ],
     "protocol": "clip-api",
@@ -245,6 +263,7 @@
           "completed",
           "failed",
           "cancelled",
+          "unknown",
           "gap"
         ],
         "name": "clipboard.operation"
