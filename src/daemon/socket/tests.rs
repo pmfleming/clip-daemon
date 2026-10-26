@@ -22,6 +22,7 @@ use tokio::{
 #[cfg(feature = "native-quickshell-socket")]
 mod native;
 mod payload;
+mod process;
 
 const DEADLINE: Duration = Duration::from_secs(5);
 type Peer = BufReader<UnixStream>;
