@@ -139,3 +139,24 @@ integration pass; the two heavy payload tests and the native two-case probe pass
 when explicitly invoked. All-target/all-feature strict Clippy and formatting pass.
 The frontend reports 429 Qt passes / one existing renderer skip, strict QML lint,
 generated-contract and offline producer parity, surface and build-input checks.
+
+## Step 5 — matched release qualification, not rollout
+
+Producer `a017338` and frontend `0b2c848` pass sibling-source snapshot preflight
+and Nix `clipDaemonContract`, `qmlTests` and `buildInputs`, without source overrides
+or bypasses. The release producer runs 57 library, five API and one retained-client
+test, including both heavy framing cases. The packaged frontend runs 429 actual
+Qt cases / one existing renderer skip. Source checks, strict Clippy/formatting,
+QML lint, generated/offline contract parity and surface/build-input review pass.
+The explicit native probe passes both ordinary and large-record cases, separately
+from the release package's test suite.
+
+Shelllist's tracked `tests/clipboard-socket-qualification.md` records source
+identities, reproduction, scope and remaining gates. The Projects-level migration
+report/plan are updated too. All five daemon paths now have scoped opt-ins and
+private acceptance, but the wider migration is incomplete. BT/NM lifecycle rows,
+sustained mixed load, matched release performance, actual clipboard daemon process
+crash/restart, full startup/activation and installed-session acceptance remain.
+The bridge remains default; matching producers are required on both transports.
+No rollout, deployment, push or live clipboard/hardware operation is authorized
+or performed by this qualification stage.
