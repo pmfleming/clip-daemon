@@ -24,10 +24,31 @@ pub(crate) struct LifecycleEvent {
     pub stream: &'static str,
     pub event: String,
     pub data: Value,
+    audience: EventAudience,
+}
+
+#[derive(Clone, Debug)]
+enum EventAudience {
+    Everyone,
+    Owner(Option<String>),
+}
+
+impl LifecycleEvent {
+    pub(crate) fn visible_to(&self, owner: Option<&str>) -> bool {
+        match &self.audience {
+            EventAudience::Everyone => true,
+            EventAudience::Owner(expected) => expected.as_deref() == owner,
+        }
+    }
+}
+
+struct WipeChallenge {
+    owner: Option<String>,
+    expires: Instant,
 }
 
 pub struct ApiService {
-    wipe_challenges: Mutex<HashMap<String, Instant>>,
+    wipe_challenges: Mutex<HashMap<String, WipeChallenge>>,
     settings: SettingsManager,
     actions: ClipboardService,
     lifecycle_events: broadcast::Sender<LifecycleEvent>,
@@ -125,6 +146,15 @@ impl ApiService {
     }
 
     pub async fn publish_selection(&self, mime: &str, bytes: Vec<u8>) -> Value {
+        self.publish_selection_owned(mime, bytes, None).await
+    }
+
+    pub(crate) async fn publish_selection_owned(
+        &self,
+        mime: &str,
+        bytes: Vec<u8>,
+        owner: Option<&str>,
+    ) -> Value {
         const METHOD: &str = "clipboard.selection.publish";
         tracing::debug!(method = METHOD, "clip-api request started");
         let result = match self.max_entry_bytes() {
@@ -132,7 +162,7 @@ impl ApiService {
             Err(error) => Err(error),
         };
         if let Ok(data) = &result {
-            self.publish_lifecycle(METHOD, data);
+            self.publish_lifecycle(METHOD, data, owner);
         }
         finish_request(METHOD, result)
     }
@@ -151,10 +181,10 @@ impl ApiService {
         let result = if method == "clipboard.history.query" {
             self.query_history(params, owner.as_deref()).await
         } else {
-            self.dispatch_method(method, params).await
+            self.dispatch_method(method, params, owner.as_deref()).await
         };
         if let Ok(data) = &result {
-            self.publish_lifecycle(method, data);
+            self.publish_lifecycle(method, data, owner.as_deref());
         }
         let registration = result
             .as_ref()
@@ -167,31 +197,62 @@ impl ApiService {
         finish_request(method, result)
     }
 
-    fn publish_lifecycle(&self, method: &str, data: &Value) {
-        for event in [operation_event(data), policy_event(method, data)]
-            .into_iter()
-            .flatten()
+    /// Release only uncommitted editing/paste authority. This does not undo an
+    /// accepted publication or infer the outcome of a background image operation.
+    pub(crate) async fn release_owner(&self, owner: &str) {
+        self.actions.release_owner(owner).await;
+        self.wipe_challenges
+            .lock()
+            .await
+            .retain(|_, challenge| challenge.owner.as_deref() != Some(owner));
+    }
+
+    pub(crate) async fn resource_owners(&self) -> std::collections::HashSet<String> {
+        let mut owners: std::collections::HashSet<_> =
+            self.actions.owners().await.into_iter().collect();
+        let mut challenges = self.wipe_challenges.lock().await;
+        challenges.retain(|_, challenge| challenge.expires > Instant::now());
+        owners.extend(
+            challenges
+                .values()
+                .filter_map(|challenge| challenge.owner.clone()),
+        );
+        owners
+    }
+
+    fn publish_lifecycle(&self, method: &str, data: &Value, owner: Option<&str>) {
+        for event in [
+            operation_event(data, owner),
+            policy_event(method, data, owner),
+        ]
+        .into_iter()
+        .flatten()
         {
             let _ = self.lifecycle_events.send(event);
         }
     }
 
-    async fn dispatch_method(&self, method: &str, params: Value) -> Result<Value, ApiError> {
+    async fn dispatch_method(
+        &self,
+        method: &str,
+        params: Value,
+        owner: Option<&str>,
+    ) -> Result<Value, ApiError> {
         match method {
             "clipboard.history.revision" => self.history_revision().await,
             "clipboard.entry.details" => self.actions.details(decode(params)?).await,
             "clipboard.entry.thumbnail" => self.actions.thumbnail(decode(params)?).await,
             method if method.starts_with("clipboard.entry.") => {
                 self.actions
-                    .dispatch_entry(method, params, self.max_entry_bytes()?)
+                    .dispatch_entry(method, params, self.max_entry_bytes()?, owner)
                     .await
             }
             "clipboard.entries.delete" => self.actions.delete_entries(params).await,
             method if method.starts_with("clipboard.session.") => {
-                self.actions.dispatch_session(method, params).await
+                self.actions.dispatch_session(method, params, owner).await
             }
             method if method.starts_with("clipboard.history.wipe.") => {
-                self.dispatch_wipe(method, params).await
+                self.dispatch_wipe(method, params, owner).await
             }
             _ => self.dispatch_policy(method, params).await,
         }
@@ -211,10 +272,15 @@ impl ApiService {
         self.actions.query(decode(params)?, collapse, owner).await
     }
 
-    async fn dispatch_wipe(&self, method: &str, params: Value) -> Result<Value, ApiError> {
+    async fn dispatch_wipe(
+        &self,
+        method: &str,
+        params: Value,
+        owner: Option<&str>,
+    ) -> Result<Value, ApiError> {
         match method {
-            "clipboard.history.wipe.prepare" => self.prepare_wipe().await,
-            "clipboard.history.wipe.commit" => self.commit_wipe(decode(params)?).await,
+            "clipboard.history.wipe.prepare" => self.prepare_wipe(owner).await,
+            "clipboard.history.wipe.commit" => self.commit_wipe(decode(params)?, owner).await,
             _ => Err(ApiError::unsupported("Unsupported wipe method")),
         }
     }
@@ -254,14 +320,20 @@ impl ApiService {
         }
     }
 
-    async fn prepare_wipe(&self) -> Result<Value, ApiError> {
+    async fn prepare_wipe(&self, owner: Option<&str>) -> Result<Value, ApiError> {
         let id = format!("challenge-{}", Uuid::new_v4());
         let expires = Instant::now() + Duration::from_secs(30);
         let mut challenges = self.wipe_challenges.lock().await;
-        challenges.retain(|_, deadline| *deadline > Instant::now());
+        challenges.retain(|_, challenge| challenge.expires > Instant::now());
         let view =
             json!({ "challenge": { "id": id, "confirmation": "WIPE", "expires_in_ms": 30000 } });
-        challenges.insert(id, expires);
+        challenges.insert(
+            id,
+            WipeChallenge {
+                owner: owner.map(str::to_owned),
+                expires,
+            },
+        );
         Ok(view)
     }
 
@@ -301,19 +373,30 @@ impl ApiService {
         }, "settings": settings }))
     }
 
-    async fn commit_wipe(&self, params: WipeParams) -> Result<Value, ApiError> {
+    async fn commit_wipe(
+        &self,
+        params: WipeParams,
+        owner: Option<&str>,
+    ) -> Result<Value, ApiError> {
         if params.response != "WIPE" {
             return Err(ApiError::validation("wipe confirmation must be WIPE"));
         }
-        let deadline = self
-            .wipe_challenges
-            .lock()
-            .await
-            .remove(&params.challenge_id)
-            .ok_or_else(|| {
-                ApiError::new("stale-action", "wipe challenge is unknown or already used")
-            })?;
-        if deadline <= Instant::now() {
+        let challenge = {
+            let mut challenges = self.wipe_challenges.lock().await;
+            if challenges
+                .get(&params.challenge_id)
+                .is_none_or(|challenge| challenge.owner.as_deref() != owner)
+            {
+                return Err(ApiError::new(
+                    "stale-action",
+                    "wipe challenge is unknown or already used",
+                ));
+            }
+            challenges
+                .remove(&params.challenge_id)
+                .expect("checked under the same lock")
+        };
+        if challenge.expires <= Instant::now() {
             return Err(ApiError::new("stale-action", "wipe challenge expired"));
         }
         let capture = self.settings.quiesce().await.map_err(settings_error)?;
@@ -348,17 +431,18 @@ fn started_operation_id(data: &Value) -> Option<&str> {
         .flatten()
 }
 
-fn operation_event(data: &Value) -> Option<LifecycleEvent> {
+fn operation_event(data: &Value, owner: Option<&str>) -> Option<LifecycleEvent> {
     let operation = data.get("operation")?;
     let status = operation["status"].as_str().unwrap_or("completed");
     (status != "started").then(|| LifecycleEvent {
         stream: protocol::stream::OPERATION,
         event: status.into(),
         data: json!({ "operation": operation }),
+        audience: EventAudience::Owner(owner.map(str::to_owned)),
     })
 }
 
-fn policy_event(method: &str, data: &Value) -> Option<LifecycleEvent> {
+fn policy_event(method: &str, data: &Value, owner: Option<&str>) -> Option<LifecycleEvent> {
     let (stream, event) = match method {
         "clipboard.capture.setPaused" | "clipboard.capture.screenshot" => {
             (protocol::stream::CAPTURE, "changed")
@@ -391,6 +475,11 @@ fn policy_event(method: &str, data: &Value) -> Option<LifecycleEvent> {
         stream,
         event: event.into(),
         data: data.clone(),
+        audience: if method == "clipboard.capture.setPaused" {
+            EventAudience::Everyone
+        } else {
+            EventAudience::Owner(owner.map(str::to_owned))
+        },
     })
 }
 
@@ -429,6 +518,79 @@ mod tests {
     use crate::{backend::ClipboardBackend, ringboard::RingboardBackend};
     use std::{sync::Arc, time::Duration};
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn wipe_challenges_are_owner_scoped_single_use_and_released() {
+        use serde_json::json;
+        let api = ApiService::new(Arc::new(crate::fake::FakeBackend::default()));
+        let owner = Some(":1.1".to_owned());
+        let prepared = api
+            .dispatch_owned("clipboard.history.wipe.prepare", json!({}), owner.clone())
+            .await;
+        let id = prepared["data"]["challenge"]["id"].as_str().unwrap();
+        let params = || json!({"challenge_id":id, "response":"WIPE"});
+        for foreign in [None, Some(":1.2".to_owned())] {
+            let result = api
+                .dispatch_owned("clipboard.history.wipe.commit", params(), foreign)
+                .await;
+            assert_eq!(result["error"]["code"], "stale-action");
+            assert!(api.wipe_challenges.lock().await.contains_key(id));
+        }
+        let result = api
+            .dispatch_owned("clipboard.history.wipe.commit", params(), owner.clone())
+            .await;
+        // Unavailable capture can acknowledge pause, but cannot resume. Only
+        // the empty fake history is wiped; no host capture or storage is used.
+        assert_eq!(result["ok"], true);
+        assert!(result["data"]["operation"]["warning"].is_string());
+        assert!(!api.wipe_challenges.lock().await.contains_key(id));
+        assert_eq!(
+            api.dispatch_owned("clipboard.history.wipe.commit", params(), owner.clone())
+                .await["error"]["code"],
+            "stale-action"
+        );
+        for other in [owner.clone(), Some(":1.2".into()), None] {
+            api.dispatch_owned("clipboard.history.wipe.prepare", json!({}), other)
+                .await;
+        }
+        api.release_owner(":1.1").await;
+        assert_eq!(api.wipe_challenges.lock().await.len(), 2);
+        assert_eq!(api.resource_owners().await, [":1.2".to_owned()].into());
+    }
+
+    #[test]
+    fn lifecycle_receipts_are_private_but_capture_configuration_remains_shared() {
+        use serde_json::json;
+        for owner in [None, Some(":1.1")] {
+            for method in [
+                "clipboard.session.begin",
+                "clipboard.session.hidden",
+                "clipboard.session.end",
+                "clipboard.capture.screenshot",
+                "clipboard.entry.action",
+            ] {
+                let data = json!({"session":{"id":"private-session", "target_available":true},
+                    "operation":{"id":"private-operation", "action":"paste", "status":"completed"}});
+                for event in [
+                    super::policy_event(method, &data, owner),
+                    super::operation_event(&data, owner),
+                ] {
+                    let event = event.unwrap();
+                    assert!(event.visible_to(owner));
+                    assert!(!event.visible_to(Some(":1.2")));
+                    assert_eq!(event.visible_to(None), owner.is_none());
+                }
+            }
+        }
+        let configuration = super::policy_event(
+            "clipboard.capture.setPaused",
+            &json!({"capture":{"paused":true}}),
+            Some(":1.1"),
+        )
+        .unwrap();
+        assert!(configuration.visible_to(Some(":1.2")));
+        assert!(configuration.visible_to(None));
+    }
 
     #[tokio::test]
     async fn ownership_tracks_live_jobs_without_relying_on_event_delivery() {

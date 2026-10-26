@@ -24,6 +24,14 @@ pub struct FakeBackend {
     operation_events: broadcast::Sender<OperationResult>,
     #[cfg(test)]
     fail_publication: bool,
+    #[cfg(test)]
+    pub(crate) details_gate: Option<Arc<DetailsGate>>,
+}
+
+#[cfg(test)]
+pub(crate) struct DetailsGate {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Semaphore,
 }
 
 impl Default for FakeBackend {
@@ -34,6 +42,8 @@ impl Default for FakeBackend {
             operation_events,
             #[cfg(test)]
             fail_publication: false,
+            #[cfg(test)]
+            details_gate: None,
         }
     }
 }
@@ -157,6 +167,11 @@ impl ClipboardBackend for FakeBackend {
         opaque_id: &str,
         _max_text_bytes: usize,
     ) -> BackendResult<EntryDetails> {
+        #[cfg(test)]
+        if let Some(gate) = &self.details_gate {
+            gate.entered.notify_one();
+            gate.release.acquire().await.unwrap().forget();
+        }
         self.with_entry(opaque_id, Clone::clone)
     }
 

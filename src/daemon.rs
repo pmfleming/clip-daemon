@@ -10,6 +10,7 @@ use crate::{
     backend::ClipboardBackend,
 };
 
+mod owner;
 mod subscription;
 
 pub const BUS_NAME: &str = "org.laufan.ClipDaemon";
@@ -19,8 +20,32 @@ pub const INTERFACE: &str = "org.laufan.ClipDaemon2";
 pub struct ClipDaemon {
     boundary: shelllist_daemon_tokio::ServiceBoundary,
     api: Arc<ApiService>,
+    owners: owner::Owners,
     history_events: tokio::sync::broadcast::Sender<subscription::HistoryUpdate>,
     subscriptions: Arc<OwnedTaskRegistry>,
+}
+
+impl ClipDaemon {
+    fn new(
+        api: Arc<ApiService>,
+        history_events: tokio::sync::broadcast::Sender<subscription::HistoryUpdate>,
+        owners: owner::Owners,
+    ) -> Self {
+        Self {
+            // Large clipboard bodies are intentional; bound their concurrency as well.
+            boundary: shelllist_daemon_tokio::ServiceBoundary::with_limits(
+                shelllist_daemon_core::ApiIdentity::new(api::PROTOCOL, api::VERSION as u32),
+                4,
+                16,
+                shelllist_daemon_core::MAX_JSONL_REQUEST_BYTES,
+                shelllist_daemon_core::MAX_JSONL_REQUEST_BYTES,
+            ),
+            api,
+            owners,
+            history_events,
+            subscriptions: Arc::new(OwnedTaskRegistry::default()),
+        }
+    }
 }
 
 #[zbus::interface(name = "org.laufan.ClipDaemon2")]
@@ -46,12 +71,29 @@ impl ClipDaemon {
                     .to_string();
             }
         };
-        admitted.encode(
-            &self
-                .api
-                .dispatch_owned(method, params, header.sender().map(ToString::to_string))
-                .await,
-        )
+        let Some(owner) = header.sender().map(ToString::to_string) else {
+            return api::error(
+                "owner-unavailable",
+                "Clipboard caller is unavailable".into(),
+            )
+            .to_string();
+        };
+        let owners = self.owners.clone();
+        let api = self.api.clone();
+        let method = method.to_owned();
+        // The existing unclassified boundary has no execution policy for run().
+        // Keep its admission and cleanup alive even if the D-Bus waiter leaves.
+        tokio::spawn(async move {
+            admitted.encode(&owners.dispatch(&api, &method, params, owner).await)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            api::error(
+                "outcome-unknown",
+                "Clipboard execution outcome is unknown; do not replay".into(),
+            )
+            .to_string()
+        })
     }
 
     async fn subscribe(
@@ -92,7 +134,12 @@ impl ClipDaemon {
                 Ok(admitted) => admitted,
                 Err(response) => return response,
             };
-        admitted.encode(&self.api.publish_selection(mime, bytes).await)
+        admitted.encode(
+            &self
+                .api
+                .publish_selection_owned(mime, bytes, header.sender().map(|sender| sender.as_str()))
+                .await,
+        )
     }
 
     async fn cancel(&self, request_id: &str, #[zbus(header)] header: Header<'_>) -> String {
@@ -182,29 +229,25 @@ async fn serve(api: Arc<ApiService>) -> Result<()> {
             history_events.clone(),
         ),
     );
-    let subscriptions = Arc::new(OwnedTaskRegistry::default());
-    let daemon = ClipDaemon {
-        // Large clipboard bodies are intentional; bound their concurrency as well.
-        boundary: shelllist_daemon_tokio::ServiceBoundary::with_limits(
-            shelllist_daemon_core::ApiIdentity::new(api::PROTOCOL, api::VERSION as u32),
-            4,
-            16,
-            shelllist_daemon_core::MAX_JSONL_REQUEST_BYTES,
-            shelllist_daemon_core::MAX_JSONL_REQUEST_BYTES,
-        ),
-        api: api.clone(),
-        history_events,
-        subscriptions: Arc::clone(&subscriptions),
-    };
     let connection = connection::Builder::session()
         .context("connect to session D-Bus")?
-        .name(BUS_NAME)
-        .context("claim clip-daemon bus name")?
-        .serve_at(OBJECT_PATH, daemon)
-        .context("export clip-daemon interface")?
         .build()
         .await
         .context("start clip-daemon D-Bus service")?;
+    let owners = owner::Owners::start(connection.clone(), api.clone(), &tasks).await?;
+    let daemon = ClipDaemon::new(api.clone(), history_events, owners.clone());
+    let subscriptions = daemon.subscriptions.clone();
+    connection
+        .object_server()
+        .at(OBJECT_PATH, daemon)
+        .await
+        .context("export clip-daemon interface")?;
+    // Publish the well-known name only after the object and owner monitor are
+    // ready, preserving the retained client's D-Bus activation ordering.
+    connection
+        .request_name(BUS_NAME)
+        .await
+        .context("claim clip-daemon bus name")?;
     // Claim singleton ownership before any collector can open admission.
     api.initialize().await;
     tracing::info!(
@@ -213,8 +256,12 @@ async fn serve(api: Arc<ApiService>) -> Result<()> {
         "clip-daemon started"
     );
     let result = shelllist_daemon_tokio::wait_for_shutdown().await;
-    drop(connection);
+    owners.shutdown(&api).await;
+    let closed = connection
+        .close()
+        .await
+        .context("close clip-daemon D-Bus service");
     subscriptions.shutdown().await;
     tasks.shutdown().await;
-    result
+    result.and(closed)
 }

@@ -51,6 +51,7 @@
               pkgs.pkg-config
             ];
             buildInputs = [ pkgs.dbus ];
+            nativeCheckInputs = [ pkgs.dbus ];
             strictDeps = true;
             # Only the pinned Ringboard crates need core_io_borrowed_buf.
             RUSTC_BOOTSTRAP = "clipboard_history_core,clipboard_history_client_sdk";

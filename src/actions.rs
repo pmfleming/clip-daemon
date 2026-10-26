@@ -82,18 +82,20 @@ impl ClipboardService {
         method: &str,
         params: Value,
         max_entry_bytes: u64,
+        owner: Option<&str>,
     ) -> Result<Value, ApiError> {
         self.edits
             .lock()
             .await
             .retain(|_, lease| lease.expires > Instant::now());
         match method {
-            "clipboard.entry.action" => self.action(decode(params)?, max_entry_bytes).await,
-            "clipboard.entry.edit.begin" => self.begin_edit(decode(params)?).await,
+            "clipboard.entry.action" => self.action(decode(params)?, max_entry_bytes, owner).await,
+            "clipboard.entry.edit.begin" => self.begin_edit(decode(params)?, owner).await,
             "clipboard.entry.edit.commit" => {
-                self.commit_edit(decode(params)?, max_entry_bytes).await
+                self.commit_edit(decode(params)?, max_entry_bytes, owner)
+                    .await
             }
-            "clipboard.entry.edit.cancel" => self.cancel_edit(decode(params)?).await,
+            "clipboard.entry.edit.cancel" => self.cancel_edit(decode(params)?, owner).await,
             _ => Err(ApiError::unsupported("Unsupported entry method")),
         }
     }
@@ -105,17 +107,22 @@ impl ClipboardService {
         Ok(json!({ "operation": operation }))
     }
 
-    pub async fn dispatch_session(&self, method: &str, params: Value) -> Result<Value, ApiError> {
+    pub async fn dispatch_session(
+        &self,
+        method: &str,
+        params: Value,
+        owner: Option<&str>,
+    ) -> Result<Value, ApiError> {
         let params = || decode::<SessionParams>(params);
         match method {
-            "clipboard.session.begin" => Ok(json!({ "session": self.sessions.begin().await })),
+            "clipboard.session.begin" => Ok(json!({ "session": self.sessions.begin(owner).await })),
             "clipboard.session.end" => {
-                Ok(json!({ "session": self.sessions.end(&params()?.session_id).await }))
+                Ok(json!({ "session": self.sessions.end(&params()?.session_id, owner).await }))
             }
             "clipboard.session.hidden" => {
                 let session = self
                     .sessions
-                    .hidden(&params()?.session_id)
+                    .hidden(&params()?.session_id, owner)
                     .await
                     .map_err(stale_target)?;
                 Ok(json!({ "session": session }))
@@ -299,12 +306,34 @@ impl ClipboardService {
         self.edits.lock().await.clear();
     }
 
-    async fn action(&self, params: ActionParams, max_entry_bytes: u64) -> Result<Value, ApiError> {
+    pub(crate) async fn release_owner(&self, owner: &str) {
+        self.sessions.release_owner(owner).await;
+        self.edits
+            .lock()
+            .await
+            .retain(|_, lease| lease.owner.as_deref() != Some(owner));
+    }
+
+    pub(crate) async fn owners(&self) -> Vec<String> {
+        let mut owners = self.sessions.owners().await;
+        let mut edits = self.edits.lock().await;
+        edits.retain(|_, lease| lease.expires > Instant::now());
+        owners.extend(edits.values().filter_map(|lease| lease.owner.clone()));
+        owners
+    }
+
+    async fn action(
+        &self,
+        params: ActionParams,
+        max_entry_bytes: u64,
+        owner: Option<&str>,
+    ) -> Result<Value, ApiError> {
         let details = self
             .load_details(&params.entry_id, Some(params.revision))
             .await?;
         validate_action(&details, &params.action)?;
-        self.execute_action(params, details, max_entry_bytes).await
+        self.execute_action(params, details, max_entry_bytes, owner)
+            .await
     }
 
     async fn execute_action(
@@ -312,6 +341,7 @@ impl ClipboardService {
         params: ActionParams,
         details: EntryDetails,
         max_entry_bytes: u64,
+        owner: Option<&str>,
     ) -> Result<Value, ApiError> {
         if matches!(
             params.action.as_str(),
@@ -320,7 +350,7 @@ impl ClipboardService {
             return launch_action(&params, &details).await;
         }
         if matches!(params.action.as_str(), "paste" | "image-as-file") {
-            return self.paste(params, max_entry_bytes).await;
+            return self.paste(params, max_entry_bytes, owner).await;
         }
         let mutation = required_mutation(&params.action, max_entry_bytes)?;
         let mut operation = self
@@ -331,18 +361,23 @@ impl ClipboardService {
         Ok(json!({ "operation": operation }))
     }
 
-    async fn paste(&self, params: ActionParams, max_entry_bytes: u64) -> Result<Value, ApiError> {
+    async fn paste(
+        &self,
+        params: ActionParams,
+        max_entry_bytes: u64,
+        owner: Option<&str>,
+    ) -> Result<Value, ApiError> {
         let session_id = params
             .session_id
             .as_deref()
             .ok_or_else(|| ApiError::validation("session_id is required for paste"))?;
-        let has_target = self.validate_paste(Some(session_id)).await?;
+        let has_target = self.validate_paste(Some(session_id), owner).await?;
         let mutation = required_mutation(&params.action, max_entry_bytes)?;
         let mut operation = self
             .backend
             .mutate(&params.entry_id, Some(params.revision), mutation)
             .await?;
-        let has_target = has_target && self.sessions.arm_paste(session_id).await;
+        let has_target = has_target && self.sessions.arm_paste(session_id, owner).await;
         let feedback = paste_feedback(has_target, &params.action);
         operation.status = feedback.0.into();
         operation.message = feedback.1.into();
@@ -350,14 +385,26 @@ impl ClipboardService {
         Ok(json!({ "operation": operation }))
     }
 
-    async fn validate_paste(&self, session_id: Option<&str>) -> Result<bool, ApiError> {
+    async fn validate_paste(
+        &self,
+        session_id: Option<&str>,
+        owner: Option<&str>,
+    ) -> Result<bool, ApiError> {
         match session_id {
-            Some(id) => self.sessions.validate_paste(id).await.map_err(stale_target),
+            Some(id) => self
+                .sessions
+                .validate_paste(id, owner)
+                .await
+                .map_err(stale_target),
             None => Ok(false),
         }
     }
 
-    async fn begin_edit(&self, params: EntryParams) -> Result<Value, ApiError> {
+    async fn begin_edit(
+        &self,
+        params: EntryParams,
+        owner: Option<&str>,
+    ) -> Result<Value, ApiError> {
         let details = self.load_details(&params.entry_id, params.revision).await?;
         let value = editable_value(&details)?;
         let id = format!("edit-{}", Uuid::new_v4());
@@ -369,6 +416,7 @@ impl ClipboardService {
         self.edits.lock().await.insert(
             id,
             EditLease {
+                owner: owner.map(str::to_owned),
                 entry_id: details.entry.id,
                 revision: details.entry.revision,
                 mime: details.entry.mime,
@@ -382,16 +430,23 @@ impl ClipboardService {
         &self,
         params: EditCommitParams,
         max_entry_bytes: u64,
+        owner: Option<&str>,
     ) -> Result<Value, ApiError> {
         let paste_target = self
-            .validate_paste(params.paste_session_id.as_deref())
+            .validate_paste(params.paste_session_id.as_deref(), owner)
             .await?;
-        let lease = self
-            .edits
-            .lock()
-            .await
-            .remove(&params.edit_id)
-            .ok_or_else(|| edit_error("Edit session is unknown or already used"))?;
+        let lease = {
+            let mut edits = self.edits.lock().await;
+            if edits
+                .get(&params.edit_id)
+                .is_none_or(|lease| lease.owner.as_deref() != owner)
+            {
+                return Err(edit_error("Edit session is unknown or already used"));
+            }
+            edits
+                .remove(&params.edit_id)
+                .expect("checked under the same lock")
+        };
         let replacement = lease
             .replace(&self.backend, &params.value, max_entry_bytes)
             .await?;
@@ -407,7 +462,7 @@ impl ClipboardService {
             // Arming does not inject input: the existing hidden handshake owns it.
             let prepared = replacement.selection_published
                 && paste_target
-                && self.sessions.arm_paste(&session_id).await;
+                && self.sessions.arm_paste(&session_id, owner).await;
             result["paste"] = json!({
                 "session_id": session_id,
                 "prepared": prepared,
@@ -419,13 +474,22 @@ impl ClipboardService {
         Ok(result)
     }
 
-    async fn cancel_edit(&self, params: EditCancelParams) -> Result<Value, ApiError> {
-        let cancelled = self.edits.lock().await.remove(&params.edit_id).is_some();
+    async fn cancel_edit(
+        &self,
+        params: EditCancelParams,
+        owner: Option<&str>,
+    ) -> Result<Value, ApiError> {
+        let mut edits = self.edits.lock().await;
+        let cancelled = edits
+            .get(&params.edit_id)
+            .is_some_and(|lease| lease.owner.as_deref() == owner)
+            && edits.remove(&params.edit_id).is_some();
         Ok(json!({ "edit": { "id": params.edit_id, "cancelled": cancelled } }))
     }
 }
 
 struct EditLease {
+    owner: Option<String>,
     entry_id: String,
     revision: u64,
     mime: String,
@@ -740,10 +804,133 @@ mod tests {
                 "clipboard.entry.edit.begin",
                 json!({"entry_id":"entry", "revision":1}),
                 1024,
+                None,
             )
             .await
             .unwrap()["edit"]["id"]
             .take()
+    }
+
+    #[tokio::test]
+    async fn edits_and_paste_authority_are_owner_scoped_before_publication() {
+        let backend = Arc::new(FakeBackend::with_entries(vec![text_details(false)]));
+        let service = ClipboardService::new(backend.clone());
+        let owner = Some(":1.1");
+        let session = service.sessions.test_target_owned(owner).await;
+        let edit = service
+            .dispatch_entry(
+                "clipboard.entry.edit.begin",
+                json!({"entry_id":"entry", "revision":1}),
+                1024,
+                owner,
+            )
+            .await
+            .unwrap();
+        let id = &edit["edit"]["id"];
+        for foreign in [None, Some(":1.2")] {
+            let rejected = service
+                .dispatch_entry(
+                    "clipboard.entry.edit.commit",
+                    json!({"edit_id":id, "value":"foreign"}),
+                    1024,
+                    foreign,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(rejected.code, "edit-error");
+            let cancel = service
+                .dispatch_entry(
+                    "clipboard.entry.edit.cancel",
+                    json!({"edit_id":id}),
+                    1024,
+                    foreign,
+                )
+                .await
+                .unwrap();
+            assert_eq!(cancel["edit"]["cancelled"], false);
+            let rejected = service.dispatch_entry("clipboard.entry.action",
+                json!({"entry_id":"entry", "revision":1, "action":"paste", "session_id":session}),
+                1024, foreign).await.unwrap_err();
+            assert_eq!(rejected.code, "stale-target");
+            let unchanged = backend.details("entry", 1024).await.unwrap();
+            assert_eq!(unchanged.text.as_deref(), Some("https://example.test"));
+            assert!(!unchanged.entry.current);
+            assert!(!service.sessions.test_is_armed(&session).await);
+        }
+        // An owned edit must not be committed into a different owner's session.
+        let peer = service.sessions.test_target_owned(Some(":1.2")).await;
+        let rejected = service
+            .dispatch_entry(
+                "clipboard.entry.edit.commit",
+                json!({"edit_id":id, "value":"replacement", "paste_session_id":peer}),
+                1024,
+                owner,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.code, "stale-target");
+        let committed = service
+            .dispatch_entry(
+                "clipboard.entry.edit.commit",
+                json!({"edit_id":id, "value":"replacement", "paste_session_id":session}),
+                1024,
+                owner,
+            )
+            .await
+            .unwrap();
+        assert_eq!(committed["paste"]["prepared"], true);
+        assert!(!service.sessions.test_is_armed(&peer).await);
+        assert!(service.sessions.test_is_armed(&session).await);
+        service.release_owner(":1.1").await;
+        assert!(
+            service
+                .sessions
+                .validate_paste(&session, owner)
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .sessions
+                .validate_paste(&peer, Some(":1.2"))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_an_owner_preserves_peer_and_unowned_edit_leases() {
+        let service =
+            ClipboardService::new(Arc::new(FakeBackend::with_entries(vec![text_details(
+                false,
+            )])));
+        let mut edits = Vec::new();
+        for owner in [Some(":1.1"), Some(":1.2"), None] {
+            let edit = service
+                .dispatch_entry(
+                    "clipboard.entry.edit.begin",
+                    json!({"entry_id":"entry", "revision":1}),
+                    1024,
+                    owner,
+                )
+                .await
+                .unwrap();
+            edits.push((owner, edit["edit"]["id"].clone()));
+        }
+        service.release_owner(":1.1").await;
+        service.release_owner(":1.1").await;
+        for (owner, id) in edits {
+            let cancel = service
+                .dispatch_entry(
+                    "clipboard.entry.edit.cancel",
+                    json!({"edit_id":id}),
+                    1024,
+                    owner,
+                )
+                .await
+                .unwrap();
+            assert_eq!(cancel["edit"]["cancelled"], owner != Some(":1.1"));
+        }
     }
 
     #[tokio::test]
@@ -756,7 +943,7 @@ mod tests {
         for action in ["paste", "image-as-file"] {
             let error = service.dispatch_entry("clipboard.entry.action", json!({
                 "entry_id": "entry", "revision": 1, "action": action, "session_id": session_id
-            }), 1024).await.unwrap_err();
+            }), 1024, None).await.unwrap_err();
             assert_eq!(error.code, "operation-failed");
             assert!(!service.sessions.test_is_armed(&session_id).await);
         }
@@ -777,7 +964,7 @@ mod tests {
             let params =
                 json!({"edit_id":edit_id, "value":"replacement", "paste_session_id": session});
             let result = service
-                .dispatch_entry("clipboard.entry.edit.commit", params.clone(), 1024)
+                .dispatch_entry("clipboard.entry.edit.commit", params.clone(), 1024, None)
                 .await
                 .unwrap();
             assert_eq!(result["entry"]["text"], "replacement");
@@ -792,7 +979,7 @@ mod tests {
             assert_eq!(service.sessions.test_is_armed(&session).await, published);
             assert_eq!(
                 service
-                    .dispatch_entry("clipboard.entry.edit.commit", params, 1024)
+                    .dispatch_entry("clipboard.entry.edit.commit", params, 1024, None)
                     .await
                     .unwrap_err()
                     .code,
@@ -822,6 +1009,7 @@ mod tests {
                     json!({"edit_id":edit_id, "value":"stale value",
                     "paste_session_id":stale_session.then_some("expired")}),
                     1024,
+                    None,
                 )
                 .await
                 .unwrap_err();

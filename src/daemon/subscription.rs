@@ -36,6 +36,7 @@ struct SubscriptionTask {
     id: String,
     streams: Vec<String>,
     requested: RequestedStreams,
+    owner: String,
 }
 
 #[derive(Default)]
@@ -167,6 +168,7 @@ pub(super) async fn start(
         id: id.clone(),
         streams,
         requested,
+        owner: owner.to_string(),
     };
     if let Err(error) = daemon.subscriptions.spawn_for_owner(
         id.clone(),
@@ -304,7 +306,9 @@ impl SubscriptionTask {
     }
 
     async fn emit(&self, update: api::LifecycleEvent) {
-        if !self.streams.iter().any(|stream| stream == update.stream) {
+        if !update.visible_to(Some(&self.owner))
+            || !self.streams.iter().any(|stream| stream == update.stream)
+        {
             return;
         }
         emit_event(
