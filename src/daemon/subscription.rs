@@ -5,9 +5,8 @@ use shelllist_daemon_core::{
     ApiError,
     wire::{EventBody, Gap},
 };
-use shelllist_daemon_tokio::{BroadcastEvent, forward_broadcast};
+use shelllist_daemon_tokio::{BroadcastEvent, EventEmitter, forward_broadcast};
 use tokio::{sync::broadcast::error::RecvError, time::MissedTickBehavior};
-use zbus::{names::UniqueName, object_server::SignalEmitter};
 
 use crate::{api, api::ApiService, protocol};
 
@@ -23,9 +22,10 @@ struct RequestedStreams {
 }
 
 struct SubscriptionTask {
-    destination: SignalEmitter<'static>,
+    destination: EventEmitter<'static>,
     api_service: Arc<ApiService>,
-    history_events: tokio::sync::broadcast::Sender<HistoryUpdate>,
+    history_events: Option<tokio::sync::broadcast::Receiver<HistoryUpdate>>,
+    lifecycle_events: Option<tokio::sync::broadcast::Receiver<api::LifecycleEvent>>,
     id: String,
     streams: Vec<String>,
     requested: RequestedStreams,
@@ -69,22 +69,20 @@ impl RequestedStreams {
 }
 
 impl SubscriptionTask {
-    async fn run(self) {
+    async fn run(mut self) {
         // Register receivers before acknowledging the subscription. Each history
         // subscriber also gets its own fresh baseline, even if polling is active.
-        let history = self.requested.watches_clipboard().then(|| {
+        let history = self.history_events.take().map(|events| {
             receive_history(
                 &self.destination,
-                self.history_events.subscribe(),
+                events,
                 &self.api_service,
                 &self.id,
                 self.requested,
             )
         });
-        let lifecycle = self
-            .requested
-            .lifecycle
-            .then(|| self.receive_lifecycle(self.api_service.lifecycle_events()));
+        let lifecycle_events = self.lifecycle_events.take();
+        let lifecycle = lifecycle_events.map(|events| self.receive_lifecycle(events));
         for stream in &self.streams {
             emit_event(&self.destination, stream, "subscribed", &self.id, None).await;
         }
@@ -131,8 +129,9 @@ impl HistoryState {
 pub(super) async fn start(
     daemon: &ClipDaemon,
     streams: Vec<String>,
-    owner: UniqueName<'static>,
-    emitter: SignalEmitter<'_>,
+    owner: String,
+    destination: EventEmitter<'static>,
+    stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> String {
     let Some(requested) = RequestedStreams::parse(&streams) else {
         return api::error(
@@ -142,24 +141,25 @@ pub(super) async fn start(
         .to_string();
     };
     let id = daemon.subscriptions.next_id("subscription");
-    let destination = emitter.set_destination(owner.clone().into()).to_owned();
-    let connection = destination.connection().clone();
     let response = api::success(json!({ "subscription": { "id": id, "streams": streams } }));
     let task = SubscriptionTask {
         destination,
         api_service: Arc::clone(&daemon.api),
-        history_events: daemon.history_events.clone(),
+        // Establish receivers before spawning or acknowledging; pre-ack events
+        // remain bounded and correlated by the shared output actor.
+        history_events: requested
+            .watches_clipboard()
+            .then(|| daemon.history_events.subscribe()),
+        lifecycle_events: requested.lifecycle.then(|| daemon.api.lifecycle_events()),
         id: id.clone(),
         streams,
         requested,
         owner: owner.to_string(),
     };
-    if let Err(error) = daemon.subscriptions.spawn_for_owner(
-        id.clone(),
-        Some(owner.to_string()),
-        &connection,
-        task.run(),
-    ) {
+    if let Err(error) = daemon
+        .subscriptions
+        .spawn_until(id.clone(), Some(owner), stop, task.run())
+    {
         return api::error("subscription-unavailable", error.to_string()).to_string();
     }
     tracing::debug!(subscription_id = %id, "clipboard subscription started");
@@ -195,7 +195,7 @@ async fn observe_history_tick(
 }
 
 async fn receive_history(
-    emitter: &SignalEmitter<'_>,
+    emitter: &EventEmitter<'_>,
     mut events: tokio::sync::broadcast::Receiver<HistoryUpdate>,
     api_service: &ApiService,
     subscription_id: &str,
@@ -291,7 +291,7 @@ fn lag_data(skipped: u64) -> EventBody {
 }
 
 async fn emit_update(
-    emitter: &SignalEmitter<'_>,
+    emitter: &EventEmitter<'_>,
     subscription_id: &str,
     requested: RequestedStreams,
     update: HistoryUpdate,
@@ -306,7 +306,7 @@ async fn emit_update(
 }
 
 async fn emit_requested(
-    emitter: &SignalEmitter<'_>,
+    emitter: &EventEmitter<'_>,
     subscription_id: &str,
     requested: RequestedStreams,
     events: (&str, &str),

@@ -15,13 +15,13 @@ use std::{
 use tokio::time::timeout;
 
 const DEADLINE: Duration = Duration::from_secs(5);
-struct Bus {
+pub(crate) struct Bus {
     child: Child,
     address: String,
     _directory: tempfile::TempDir,
 }
 impl Bus {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("bus");
         let child = Command::new("dbus-daemon")
@@ -55,7 +55,7 @@ impl Bus {
         bus.address = bus.address.trim().into();
         bus
     }
-    async fn connect(&self) -> zbus::Connection {
+    pub(crate) async fn connect(&self) -> zbus::Connection {
         zbus::connection::Builder::address(self.address.as_str())
             .unwrap()
             .build()
@@ -69,7 +69,7 @@ impl Drop for Bus {
         let _ = self.child.wait();
     }
 }
-fn entry() -> EntryDetails {
+pub(crate) fn entry() -> EntryDetails {
     EntryDetails {
         entry: EntrySummary {
             id: "fixture".into(),

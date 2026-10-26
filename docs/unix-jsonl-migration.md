@@ -62,3 +62,27 @@ read-only repeated status, decreasing content tokens and mutation during a block
 history query. Validation: 53 library / six integration passes, strict Clippy/fmt;
 producer fixture export, regenerated frontend bindings, offline contract parity
 and QML lint pass. Frontend consumption and socket acceptance are later steps.
+
+## Step 3 — direct Unix ingress
+
+`$XDG_RUNTIME_DIR/clip-daemon.sock` uses the shared canonical private-runtime,
+same-UID listener. Calls, subscription admission and cancellation go through the
+same exported in-process service as D-Bus, never a proxy or second policy engine.
+Request IDs, routes and generations use `ClipCorrelation`. The clipboard framing
+allowance matches the retained client's 128 MiB escaped-text request limit;
+connections and in-flight socket requests are capped at four each, in addition to
+shared service admission. Responses retain the shared 32 MiB bound. Output and
+pre-ack queues are bounded and delivery loss closes the affected connection.
+
+Receivers are established before subscription acknowledgement. Socket lifetime
+owns subscription cancellation and API cleanup, including accepted work finishing
+after disconnect. D-Bus monitoring never probes a socket identity or retires a
+healthy socket owner on an unrelated bus-owner loss. Shared history/operation
+observers are started once per exported service, not once per consumer.
+
+Private real-listener tests compare D-Bus/socket reads and validation, preserve
+routes, reject foreign status/cancellation, preserve a healthy peer, reject old
+ownership on reconnect, and cancel an operation admitted after disconnect before
+acknowledgement (multi-worker runtime). No capture or hardware helpers run.
+Validation: 55 library / six integration passes, strict Clippy/formatting.
+Frontend opt-in and native Quickshell evidence are not claimed by this step.

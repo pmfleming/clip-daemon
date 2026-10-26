@@ -12,7 +12,7 @@ const ENDPOINT: DaemonEndpoint =
     DaemonEndpoint::new("clip-daemon", BUS_NAME, OBJECT_PATH, INTERFACE);
 
 #[derive(Debug, Clone, Copy)]
-struct ClipCorrelation;
+pub(crate) struct ClipCorrelation;
 
 impl CorrelationPolicy for ClipCorrelation {
     fn operation_id<'a>(&self, response: &'a Value) -> Option<&'a str> {

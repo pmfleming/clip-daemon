@@ -28,6 +28,16 @@ pub struct FakeBackend {
     pub(crate) details_gate: Option<Arc<DetailsGate>>,
     #[cfg(test)]
     pub(crate) query_gate: Option<Arc<DetailsGate>>,
+    #[cfg(test)]
+    operations: Option<Arc<TestOperations>>,
+    #[cfg(test)]
+    pub(crate) operation_gate: Option<Arc<DetailsGate>>,
+}
+
+#[cfg(test)]
+struct TestOperations {
+    backend: crate::ringboard::RingboardBackend,
+    finishes: std::sync::Mutex<std::collections::VecDeque<tokio::sync::oneshot::Receiver<bool>>>,
 }
 
 #[cfg(test)]
@@ -48,6 +58,10 @@ impl Default for FakeBackend {
             details_gate: None,
             #[cfg(test)]
             query_gate: None,
+            #[cfg(test)]
+            operations: None,
+            #[cfg(test)]
+            operation_gate: None,
         }
     }
 }
@@ -58,6 +72,18 @@ impl FakeBackend {
             entries: Arc::new(RwLock::new(entries)),
             ..Self::default()
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_operations(
+        mut self,
+        finishes: Vec<tokio::sync::oneshot::Receiver<bool>>,
+    ) -> Self {
+        self.operations = Some(Arc::new(TestOperations {
+            backend: Default::default(),
+            finishes: std::sync::Mutex::new(finishes.into()),
+        }));
+        self
     }
 
     #[cfg(test)]
@@ -127,7 +153,50 @@ impl FakeBackend {
 #[async_trait]
 impl ClipboardBackend for FakeBackend {
     fn operation_events(&self) -> broadcast::Receiver<OperationResult> {
+        #[cfg(test)]
+        if let Some(operations) = &self.operations {
+            return operations.backend.operation_events();
+        }
         self.operation_events.subscribe()
+    }
+
+    #[cfg(test)]
+    fn operation_status(&self, id: &str) -> BackendResult<Option<OperationResult>> {
+        match &self.operations {
+            Some(operations) => operations.backend.operation_status(id),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn active_operations(&self) -> BackendResult<HashSet<String>> {
+        match &self.operations {
+            Some(operations) => operations.backend.active_operations(),
+            None => Ok(Default::default()),
+        }
+    }
+
+    #[cfg(test)]
+    async fn interactive_screenshot(
+        &self,
+        _: crate::backend::InteractiveScreenshot,
+        _: u64,
+    ) -> BackendResult<OperationResult> {
+        if let Some(gate) = &self.operation_gate {
+            gate.entered.notify_one();
+            gate.release.acquire().await.unwrap().forget();
+        }
+        let operations = self
+            .operations
+            .as_ref()
+            .ok_or_else(|| BackendError::unavailable("No test operation fixture"))?;
+        let finish = operations
+            .finishes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| BackendError::unavailable("No test operation queued"))?;
+        operations.backend.test_operation(finish)
     }
 
     async fn status(&self) -> BackendStatus {
@@ -320,6 +389,10 @@ impl ClipboardBackend for FakeBackend {
     }
 
     async fn cancel_operation(&self, _operation_id: &str) -> BackendResult<bool> {
+        #[cfg(test)]
+        if let Some(operations) = &self.operations {
+            return operations.backend.cancel_operation(_operation_id).await;
+        }
         Ok(false)
     }
 }

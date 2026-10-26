@@ -1,5 +1,5 @@
 //! D-Bus resource lifetime, including work that finishes after its caller leaves.
-//! Background image jobs deliberately keep their existing lifecycle in this stage.
+//! Socket owners are never probed on D-Bus or retired by unrelated bus loss.
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -12,7 +12,7 @@ use shelllist_daemon_tokio::{OwnerLossError, OwnerLossMonitor, TaskGroup};
 use crate::api::ApiService;
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 #[derive(Clone)]
 pub(super) struct Owners {
@@ -38,7 +38,12 @@ impl Owners {
                 match losses.recv().await {
                     Ok(owner) => api.release_owner(&owner).await,
                     Err(OwnerLossError::Lagged(_)) => {
-                        for owner in api.resource_owners().await {
+                        for owner in api
+                            .resource_owners()
+                            .await
+                            .into_iter()
+                            .filter(|owner| owner.starts_with(':'))
+                        {
                             if !watcher.alive(&owner).await {
                                 api.release_owner(&owner).await;
                             }
@@ -56,7 +61,12 @@ impl Owners {
 
     pub async fn shutdown(&self, api: &ApiService) {
         self.stopped.store(true, Ordering::Release);
-        for owner in api.resource_owners().await {
+        for owner in api
+            .resource_owners()
+            .await
+            .into_iter()
+            .filter(|owner| owner.starts_with(':'))
+        {
             api.release_owner(&owner).await;
         }
     }
