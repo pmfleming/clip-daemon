@@ -676,6 +676,10 @@ impl ClipboardBackend for RingboardBackend {
         self.operations.subscribe()
     }
 
+    fn operation_status(&self, id: &str) -> BackendResult<Option<OperationResult>> {
+        self.operations.status(id)
+    }
+
     async fn status(&self) -> BackendStatus {
         let result = spawn_blocking(|| Self::open_database().map(|_| ()))
             .await

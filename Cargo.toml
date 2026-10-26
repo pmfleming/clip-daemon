@@ -15,6 +15,7 @@ clipboard-history-client-sdk = { version = "=0.16.2", features = ["watcher-utils
 # Use the reviewed core API directly. Cargo.lock also keeps the SDK's broad
 # internal `version = "0"` range on 0.16.2; core 0.17 is incompatible.
 clipboard-history-core = "=0.16.2"
+futures-util = "0.3"
 hex = "0.4"
 hmac = "0.12"
 shelllist-search = { path = "vendor/shelllist-search" }
@@ -41,7 +42,6 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 benchmarks = []
 
 [dev-dependencies]
-futures-util = "0.3"
 wayland-server = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["server"] }
 allocation-counter = "0.8.1"

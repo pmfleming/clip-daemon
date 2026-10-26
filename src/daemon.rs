@@ -23,6 +23,7 @@ pub struct ClipDaemon {
     owners: owner::Owners,
     history_events: tokio::sync::broadcast::Sender<subscription::HistoryUpdate>,
     subscriptions: Arc<OwnedTaskRegistry>,
+    _workers: shelllist_daemon_tokio::TaskGroup,
 }
 
 impl ClipDaemon {
@@ -31,7 +32,14 @@ impl ClipDaemon {
         history_events: tokio::sync::broadcast::Sender<subscription::HistoryUpdate>,
         owners: owner::Owners,
     ) -> Self {
+        let workers = shelllist_daemon_tokio::TaskGroup::default();
+        let events = api.operation_events();
+        let observed = api.clone();
+        workers.spawn("clipboard-operations", async move {
+            observed.observe_operations(events).await
+        });
         Self {
+            _workers: workers,
             // Large clipboard bodies are intentional; bound their concurrency as well.
             boundary: shelllist_daemon_tokio::ServiceBoundary::with_limits(
                 shelllist_daemon_core::ApiIdentity::new(api::PROTOCOL, api::VERSION as u32),

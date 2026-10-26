@@ -1,6 +1,7 @@
 //! Shared image-operation lifecycle: registration, cancellation and commit draining.
+use std::time::{Duration, Instant};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env,
     fs::{self, File, OpenOptions},
     future::Future,
@@ -24,7 +25,7 @@ use crate::{
 
 pub(super) struct Operations {
     editor: ImageEditorCommand,
-    active: Mutex<HashMap<String, OperationTask>>,
+    active: Mutex<OperationState>,
     events: broadcast::Sender<OperationResult>,
 }
 
@@ -38,7 +39,35 @@ impl Default for Operations {
     }
 }
 
+#[derive(Default)]
+struct OperationState {
+    active: HashMap<String, OperationTask>,
+    cancelling: HashMap<String, (OperationResult, Arc<OperationControl>)>,
+    terminal: VecDeque<(Instant, OperationResult)>,
+}
+
+impl OperationState {
+    fn retain(&mut self, result: OperationResult) {
+        self.prune();
+        if self.terminal.len() == 256 {
+            self.terminal.pop_front();
+        }
+        self.terminal.push_back((Instant::now(), result));
+    }
+
+    fn prune(&mut self) {
+        while self
+            .terminal
+            .front()
+            .is_some_and(|(at, _)| at.elapsed() >= Duration::from_secs(300))
+        {
+            self.terminal.pop_front();
+        }
+    }
+}
+
 struct OperationTask {
+    initial: OperationResult,
     action: &'static str,
     control: Arc<OperationControl>,
     handle: JoinHandle<()>,
@@ -71,14 +100,37 @@ impl Operations {
             .map_err(operation_error)
     }
 
-    fn active(&self) -> BackendResult<MutexGuard<'_, HashMap<String, OperationTask>>> {
+    fn active(&self) -> BackendResult<MutexGuard<'_, OperationState>> {
         self.active
             .lock()
             .map_err(|_| operation_error("Clipboard operation state is unavailable"))
     }
 
     pub fn active_ids(&self) -> BackendResult<std::collections::HashSet<String>> {
-        Ok(self.active()?.keys().cloned().collect())
+        let state = self.active()?;
+        Ok(state
+            .active
+            .keys()
+            .chain(state.cancelling.keys())
+            .cloned()
+            .collect())
+    }
+
+    pub fn status(&self, id: &str) -> BackendResult<Option<OperationResult>> {
+        let mut state = self.active()?;
+        state.prune();
+        Ok(state
+            .active
+            .get(id)
+            .map(|task| task.initial.clone())
+            .or_else(|| state.cancelling.get(id).map(|(result, _)| result.clone()))
+            .or_else(|| {
+                state
+                    .terminal
+                    .iter()
+                    .find(|(_, result)| result.id == id)
+                    .map(|(_, result)| result.clone())
+            }))
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<OperationResult> {
@@ -86,7 +138,12 @@ impl Operations {
     }
 
     pub fn contains(&self, action: &str) -> BackendResult<bool> {
-        Ok(self.active()?.values().any(|task| task.action == action))
+        let state = self.active()?;
+        Ok(state.active.values().any(|task| task.action == action)
+            || state
+                .cancelling
+                .values()
+                .any(|(result, _)| result.action == action))
     }
 
     // Callers hold the backend operation gate across staging and launch. The
@@ -116,9 +173,10 @@ impl Operations {
                 after(event).await;
             }
         });
-        active.insert(
+        active.active.insert(
             operation.id.clone(),
             OperationTask {
+                initial: operation.clone(),
                 action,
                 control,
                 handle,
@@ -149,10 +207,8 @@ impl Operations {
             Ok(()) => work(control.clone()).await,
             Err(_) => Err(operation_error("Clipboard operation could not start")),
         };
-        let claimed = self
-            .active()
-            .is_ok_and(|mut active| active.remove(&id).is_some());
-        let event = claimed.then(|| {
+        let event = self.active().ok().and_then(|mut state| {
+            state.active.remove(&id)?;
             let event = match result {
                 Ok(completion) => {
                     let mut event =
@@ -162,46 +218,79 @@ impl Operations {
                 }
                 Err(error) => OperationResult::with_id(id, action, "failed", &error.to_string()),
             };
+            state.retain(event.clone());
             let _ = self.events.send(event.clone());
-            event
+            Some(event)
         });
         control.finish();
         event
     }
 
-    pub async fn cancel(&self, id: &str) -> BackendResult<bool> {
+    pub async fn cancel(self: &Arc<Self>, id: &str) -> BackendResult<bool> {
         let operation = {
             let mut active = self.active()?;
-            if !active.get(id).is_some_and(|task| task.control.cancel()) {
+            if !active
+                .active
+                .get(id)
+                .is_some_and(|task| task.control.cancel())
+            {
                 // Committing jobs retain their files and report their real outcome.
                 return Ok(false);
             }
-            active.remove(id)
+            let task = active.active.remove(id);
+            if let Some(task) = &task {
+                active
+                    .cancelling
+                    .insert(id.into(), (task.initial.clone(), task.control.clone()));
+            }
+            task
         };
-        let Some(mut task) = operation else {
+        let Some(task) = operation else {
             return Ok(false);
         };
+        let operations = self.clone();
+        let id = id.to_owned();
+        // Cancellation cleanup retains ownership even if its waiter disappears.
+        tokio::spawn(async move { operations.finish_cancel(id, task).await })
+            .await
+            .map_err(operation_error)?
+    }
+
+    async fn finish_cancel(&self, id: String, mut task: OperationTask) -> BackendResult<bool> {
         task.handle.abort();
         let _ = (&mut task.handle).await;
         let control = task.control.clone();
         let action = task.action;
         drop(task);
-        let _ = self.events.send(OperationResult::with_id(
+        let event = OperationResult::with_id(
             id.to_owned(),
             action,
             "cancelled",
             "Image operation cancelled",
-        ));
+        );
+        let mut state = self.active()?;
+        state.cancelling.remove(&id);
+        state.retain(event.clone());
+        let _ = self.events.send(event);
         control.finish();
         Ok(true)
     }
 
-    pub async fn stop(&self) -> BackendResult<()> {
-        let active: Vec<_> = self
-            .active()?
-            .iter()
-            .map(|(id, task)| (id.clone(), task.control.clone()))
-            .collect();
+    pub async fn stop(self: &Arc<Self>) -> BackendResult<()> {
+        let active: Vec<_> = {
+            let state = self.active()?;
+            state
+                .active
+                .iter()
+                .map(|(id, task)| (id.clone(), task.control.clone()))
+                .chain(
+                    state
+                        .cancelling
+                        .iter()
+                        .map(|(id, (_, control))| (id.clone(), control.clone())),
+                )
+                .collect()
+        };
         for (id, control) in active {
             if !self.cancel(&id).await? {
                 // The committing job needs the backend transaction lock; never

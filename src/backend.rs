@@ -201,6 +201,11 @@ pub trait ClipboardBackend: Send + Sync {
     fn active_operations(&self) -> BackendResult<std::collections::HashSet<String>> {
         Ok(Default::default())
     }
+    /// Current asynchronous operation or a bounded retained terminal result.
+    /// Absence is unknown/expired, never proof of success or permission to replay.
+    fn operation_status(&self, _id: &str) -> BackendResult<Option<OperationResult>> {
+        Ok(None)
+    }
     async fn status(&self) -> BackendStatus;
     async fn change_token(&self) -> BackendResult<u64>;
     async fn query(&self, query: HistoryQuery) -> BackendResult<HistoryPage>;

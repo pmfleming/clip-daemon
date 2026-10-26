@@ -281,6 +281,10 @@ impl ClipboardService {
         Ok(self.backend.active_operations()?)
     }
 
+    pub(crate) fn operation_status(&self, id: &str) -> Result<Option<OperationResult>, ApiError> {
+        Ok(self.backend.operation_status(id)?)
+    }
+
     pub(crate) fn operation_events(&self) -> OperationEvents {
         self.backend.operation_events()
     }

@@ -16,6 +16,8 @@ use crate::{
     settings::{SettingsManager, SettingsUpdate},
 };
 
+mod operations;
+
 pub const PROTOCOL: &str = protocol::NAME;
 pub const VERSION: u8 = protocol::VERSION;
 const API: ApiIdentity = ApiIdentity::new(PROTOCOL, VERSION as u32);
@@ -52,7 +54,7 @@ pub struct ApiService {
     settings: SettingsManager,
     actions: ClipboardService,
     lifecycle_events: broadcast::Sender<LifecycleEvent>,
-    operation_owners: Mutex<HashMap<String, Option<String>>>,
+    operations: Arc<std::sync::Mutex<operations::Book>>,
 }
 
 impl ApiService {
@@ -67,7 +69,7 @@ impl ApiService {
             settings,
             actions: ClipboardService::new(backend),
             lifecycle_events,
-            operation_owners: Mutex::new(HashMap::new()),
+            operations: Arc::new(std::sync::Mutex::new(operations::Book::default())),
         }
     }
 
@@ -108,41 +110,108 @@ impl ApiService {
     }
 
     pub async fn cancel_operation_owned(&self, operation_id: &str, owner: Option<&str>) -> bool {
-        if self.reconcile_operations(None).await.is_err()
-            || self
-                .operation_owners
-                .lock()
-                .await
-                .get(operation_id)
-                .map(Option::as_deref)
-                != Some(owner)
+        self.refresh_operations();
+        if !self
+            .operations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .records
+            .get(operation_id)
+            .is_some_and(|record| record.owner.as_deref() == owner && record.active())
         {
             return false;
         }
         // Never hold the ownership lock while waiting for backend cancellation.
         let cancelled = self.actions.cancel(operation_id).await;
-        if cancelled {
-            self.operation_owners.lock().await.remove(operation_id);
-        }
+        self.refresh_operation(operation_id);
         cancelled
     }
 
-    /// Prune at API boundaries using authoritative liveness, not lossy events.
-    /// Dormant records are bounded by the last live snapshot; history cannot
-    /// accumulate across calls. Early completion is never re-registered.
-    async fn reconcile_operations(
-        &self,
-        registration: Option<(&str, Option<String>)>,
-    ) -> Result<(), ApiError> {
-        let mut owners = self.operation_owners.lock().await;
-        let active = self.actions.active_operations()?;
-        owners.retain(|id, _| active.contains(id));
-        if let Some((id, owner)) = registration
-            && active.contains(id)
-        {
-            owners.insert(id.into(), owner);
+    fn track_operation(&self, initial: crate::model::OperationResult, owner: Option<String>) {
+        let mut book = self.operations.lock().unwrap_or_else(|p| p.into_inner());
+        let current = self
+            .actions
+            .operation_status(&initial.id)
+            .ok()
+            .flatten()
+            .unwrap_or(initial);
+        let id = current.id.clone();
+        book.register(current, owner);
+        self.emit_operation(&book.records[&id]);
+    }
+
+    fn emit_operation(&self, record: &operations::Record) {
+        let _ = self.lifecycle_events.send(LifecycleEvent {
+            stream: protocol::stream::OPERATION,
+            event: record.operation.status.clone(),
+            data: json!({"operation": record.operation}),
+            audience: EventAudience::Owner(record.owner.clone()),
+        });
+    }
+
+    fn refresh_operation(&self, id: &str) {
+        let mut book = self.operations.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(record) = book.records.get_mut(id) else {
+            return;
+        };
+        if !record.active() {
+            return;
         }
-        Ok(())
+        // A queued backend event is only an invalidation. Reading current status
+        // under this lock cannot regress a terminal result to a delayed start.
+        let Ok(current) = self.actions.operation_status(id) else {
+            return;
+        };
+        let current = match current {
+            Some(current) => current,
+            None if self
+                .actions
+                .active_operations()
+                .is_ok_and(|active| !active.contains(id)) =>
+            {
+                crate::model::OperationResult::with_id(
+                    id.into(),
+                    &record.operation.action,
+                    "unknown",
+                    "Operation outcome is unavailable; do not replay",
+                )
+            }
+            None => return,
+        };
+        if record.operation != current {
+            record.operation = current;
+            record.revision += 1;
+            record.updated = Instant::now();
+            self.emit_operation(record);
+        }
+    }
+
+    fn refresh_operations(&self) {
+        let ids: Vec<_> = self
+            .operations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .records
+            .keys()
+            .cloned()
+            .collect();
+        for id in ids {
+            self.refresh_operation(&id);
+        }
+        self.operations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .prune();
+    }
+
+    pub(crate) async fn observe_operations(&self, mut events: actions::OperationEvents) {
+        loop {
+            match events.recv().await {
+                Ok(operation) => self.refresh_operation(&operation.id),
+                Err(broadcast::error::RecvError::Lagged(_)) => self.refresh_operations(),
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
     }
 
     pub async fn publish_selection(&self, mime: &str, bytes: Vec<u8>) -> Value {
@@ -178,6 +247,15 @@ impl ApiService {
         owner: Option<String>,
     ) -> Value {
         tracing::debug!(%method, "clip-api request started");
+        self.refresh_operations();
+        let _reservation = if operations::may_start(method, &params) {
+            match operations::Book::reserve(&self.operations, owner.as_deref()) {
+                Ok(reservation) => Some(reservation),
+                Err(error) => return finish_request(method, Err(error)),
+            }
+        } else {
+            None
+        };
         let result = if method == "clipboard.history.query" {
             self.query_history(params, owner.as_deref()).await
         } else {
@@ -186,21 +264,34 @@ impl ApiService {
         if let Ok(data) = &result {
             self.publish_lifecycle(method, data, owner.as_deref());
         }
-        let registration = result
+        if let Some(data) = result
             .as_ref()
             .ok()
-            .and_then(started_operation_id)
-            .map(|id| (id, owner));
-        if let Err(error) = self.reconcile_operations(registration).await {
-            tracing::warn!(message = %error.message, "Could not reconcile operation ownership");
+            .filter(|data| started_operation_id(data).is_some())
+            && let Ok(operation) = serde_json::from_value(data["operation"].clone())
+        {
+            self.track_operation(operation, owner);
         }
         finish_request(method, result)
     }
 
-    /// Release only uncommitted editing/paste authority. This does not undo an
-    /// accepted publication or infer the outcome of a background image operation.
+    /// Revoke authority and request cancellation. Committing work retains its
+    /// actual outcome; disconnect is never evidence of rollback or completion.
     pub(crate) async fn release_owner(&self, owner: &str) {
         self.actions.release_owner(owner).await;
+        let ids: Vec<_> = self
+            .operations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .records
+            .iter()
+            .filter(|(_, record)| record.active() && record.owner.as_deref() == Some(owner))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            self.actions.cancel(&id).await;
+            self.refresh_operation(&id);
+        }
         self.wipe_challenges
             .lock()
             .await
@@ -210,6 +301,15 @@ impl ApiService {
     pub(crate) async fn resource_owners(&self) -> std::collections::HashSet<String> {
         let mut owners: std::collections::HashSet<_> =
             self.actions.owners().await.into_iter().collect();
+        owners.extend(
+            self.operations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .records
+                .values()
+                .filter(|record| record.active())
+                .filter_map(|record| record.owner.clone()),
+        );
         let mut challenges = self.wipe_challenges.lock().await;
         challenges.retain(|_, challenge| challenge.expires > Instant::now());
         owners.extend(
@@ -593,6 +693,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn asynchronous_receipts_and_release_are_owned_even_after_early_completion() {
+        let backend = Arc::new(RingboardBackend::default());
+        let api = Arc::new(ApiService::new(backend.clone()));
+        let mut receipts = api.lifecycle_events();
+        let raw = api.operation_events();
+        let watched = api.clone();
+        let observer = tokio::spawn(async move { watched.observe_operations(raw).await });
+        let (finish_a, wait_a) = oneshot::channel();
+        let (_finish_b, wait_b) = oneshot::channel();
+        let a = backend.test_operation(wait_a).unwrap();
+        let b = backend.test_operation(wait_b).unwrap();
+        finish_a.send(true).unwrap();
+        // Force terminal-before-registration, without relying on broadcast delivery.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while backend.active_operations().unwrap().contains(&a.id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        api.track_operation(a.clone(), Some(":1.a".into()));
+        api.track_operation(b.clone(), Some(":1.b".into()));
+        let first = receipts.recv().await.unwrap();
+        assert_eq!(first.event, "completed");
+        assert!(first.visible_to(Some(":1.a")));
+        assert!(!first.visible_to(Some(":1.b")));
+        assert!(!first.visible_to(None));
+        let second = receipts.recv().await.unwrap();
+        assert!(second.visible_to(Some(":1.b")));
+        api.release_owner(":1.a").await;
+        assert!(backend.active_operations().unwrap().contains(&b.id));
+        api.release_owner(":1.b").await;
+        assert!(!backend.active_operations().unwrap().contains(&b.id));
+        let cancelled = receipts.recv().await.unwrap();
+        assert_eq!(cancelled.event, "cancelled");
+        assert!(!cancelled.visible_to(Some(":1.a")));
+        // Loss can precede registration. The transport's post-dispatch cleanup
+        // must also cancel that newly accepted work, without a permanent tombstone.
+        let (_finish, waiting) = oneshot::channel();
+        let late = backend.test_operation(waiting).unwrap();
+        api.track_operation(late.clone(), Some(":1.a".into()));
+        api.release_owner(":1.a").await;
+        assert!(!backend.active_operations().unwrap().contains(&late.id));
+        observer.abort();
+        let _ = observer.await;
+    }
+
+    #[tokio::test]
     async fn ownership_tracks_live_jobs_without_relying_on_event_delivery() {
         let backend = Arc::new(RingboardBackend::default());
         let api = ApiService::new(backend.clone());
@@ -603,10 +751,8 @@ mod tests {
                 let operation = backend.test_operation(finished).unwrap();
                 assert_eq!(events.recv().await.unwrap().status, "started");
                 if !early {
-                    api.reconcile_operations(Some((&operation.id, Some(":1.1".into()))))
-                        .await
-                        .unwrap();
-                    assert_eq!(api.operation_owners.lock().await.len(), 1);
+                    api.track_operation(operation.clone(), Some(":1.1".into()));
+                    assert!(api.operations.lock().unwrap().records[&operation.id].active());
                 }
                 finish.send(success).unwrap();
                 let terminal = tokio::time::timeout(Duration::from_secs(2), events.recv())
@@ -618,10 +764,14 @@ mod tests {
                     if success { "completed" } else { "failed" }
                 );
                 // No API event observer: the snapshot also covers lost/lagged events.
-                api.reconcile_operations(Some((&operation.id, Some(":1.1".into()))))
-                    .await
-                    .unwrap();
-                assert!(api.operation_owners.lock().await.is_empty());
+                if early {
+                    api.track_operation(operation.clone(), Some(":1.1".into()));
+                }
+                api.refresh_operations();
+                let book = api.operations.lock().unwrap();
+                let record = &book.records[&operation.id];
+                assert_eq!(record.operation, terminal);
+                assert!(!record.active());
             }
         }
         for owner in [None, Some(":1.1")] {
@@ -630,16 +780,19 @@ mod tests {
             // Missing records are never equivalent to explicitly unowned jobs.
             assert!(!api.cancel_operation(&operation.id).await);
             assert!(backend.active_operations().unwrap().contains(&operation.id));
-            api.reconcile_operations(Some((&operation.id, owner.map(str::to_owned))))
-                .await
-                .unwrap();
+            api.track_operation(operation.clone(), owner.map(str::to_owned));
             assert!(
                 !api.cancel_operation_owned(&operation.id, Some(":1.2"))
                     .await
             );
             assert!(api.cancel_operation_owned(&operation.id, owner).await);
             assert!(!api.cancel_operation_owned(&operation.id, owner).await);
-            assert!(api.operation_owners.lock().await.is_empty());
+            assert_eq!(
+                api.operations.lock().unwrap().records[&operation.id]
+                    .operation
+                    .status,
+                "cancelled"
+            );
         }
     }
 }

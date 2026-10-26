@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use futures_util::StreamExt;
 use serde_json::Value;
 use shelllist_daemon_core::{DaemonEndpoint, MAX_JSONL_REQUEST_BYTES};
 use shelllist_daemon_tokio::{
@@ -65,6 +66,32 @@ pub async fn publish(mime: &str, bytes: Vec<u8>) -> Result<()> {
 pub async fn screenshot(screen: bool, annotate: bool) -> Result<()> {
     let connection = zbus::Connection::session().await?;
     let proxy = zbus::Proxy::new(&connection, BUS_NAME, OBJECT_PATH, INTERFACE).await?;
+    let mut events = proxy.receive_signal("Event").await?;
+    let subscribed: String = proxy
+        .call("Subscribe", &(vec![crate::protocol::stream::OPERATION],))
+        .await?;
+    let subscribed: Value = serde_json::from_str(&subscribed)?;
+    anyhow::ensure!(
+        subscribed["ok"] == true,
+        "Could not observe screenshot completion"
+    );
+    let subscription = subscribed["data"]["subscription"]["id"]
+        .as_str()
+        .context("Missing subscription identity")?;
+    // Ensure the receiver exists before launching. Keep this connection alive
+    // throughout the interactive effect; CLI success now means a terminal result,
+    // not merely acceptance followed by owner-loss cancellation.
+    loop {
+        let message = events
+            .next()
+            .await
+            .context("Screenshot observation ended")?;
+        let (_, event): (String, String) = message.body().deserialize()?;
+        let event: Value = serde_json::from_str(&event)?;
+        if event["subscription_id"] == subscription && event["event"] == "subscribed" {
+            break;
+        }
+    }
     let params = serde_json::json!({
         "mode": if screen { "screen" } else { "region" }, "annotate": annotate,
     })
@@ -81,6 +108,35 @@ pub async fn screenshot(screen: bool, annotate: bool) -> Result<()> {
             .and_then(Value::as_str)
             .unwrap_or("Screenshot request failed")
     );
+    if response["data"]["operation"]["status"] == "started" {
+        let id = response["data"]["operation"]["id"]
+            .as_str()
+            .context("Missing screenshot operation identity")?;
+        loop {
+            let message = events
+                .next()
+                .await
+                .context("Screenshot outcome unknown; do not replay")?;
+            let (_, event): (String, String) = message.body().deserialize()?;
+            let event: Value = serde_json::from_str(&event)?;
+            if event["subscription_id"] != subscription {
+                continue;
+            }
+            anyhow::ensure!(
+                event["event"] != "gap",
+                "Screenshot outcome unknown; do not replay"
+            );
+            if event["data"]["operation"]["id"] != id || event["event"] == "started" {
+                continue;
+            }
+            anyhow::ensure!(
+                event["event"] == "completed",
+                "Screenshot did not complete: {}",
+                event["event"].as_str().unwrap_or("unknown")
+            );
+            break;
+        }
+    }
     Ok(())
 }
 

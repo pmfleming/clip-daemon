@@ -25,7 +25,6 @@ const HISTORY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 struct RequestedStreams {
     history: bool,
     current: bool,
-    operation: bool,
     lifecycle: bool,
 }
 
@@ -64,7 +63,6 @@ impl RequestedStreams {
         Some(Self {
             history: wants(protocol::stream::HISTORY),
             current: wants(protocol::stream::CURRENT),
-            operation: wants(protocol::stream::OPERATION),
             lifecycle: wants(protocol::stream::OPERATION)
                 || wants(protocol::stream::CAPTURE)
                 || wants(protocol::stream::SESSION),
@@ -89,13 +87,6 @@ impl SubscriptionTask {
                 self.requested,
             )
         });
-        let operations = self.requested.operation.then(|| {
-            poll_operations(
-                &self.destination,
-                self.api_service.operation_events(),
-                &self.id,
-            )
-        });
         let lifecycle = self
             .requested
             .lifecycle
@@ -105,7 +96,6 @@ impl SubscriptionTask {
         }
         tokio::select! {
             () = await_optional(history) => {}
-            () = await_optional(operations) => {}
             () = await_optional(lifecycle) => {}
         }
         tracing::debug!(subscription_id = %self.id, "clipboard subscription ended");
@@ -255,40 +245,6 @@ async fn receive_history(
             Err(RecvError::Closed) => return,
         }
     }
-}
-
-async fn poll_operations(
-    emitter: &SignalEmitter<'_>,
-    events: tokio::sync::broadcast::Receiver<crate::model::OperationResult>,
-    subscription_id: &str,
-) {
-    forward_broadcast(events, move |update| async move {
-        match update {
-            BroadcastEvent::Item(operation) => {
-                let event = &operation.status;
-                emit_event(
-                    emitter,
-                    protocol::stream::OPERATION,
-                    event,
-                    subscription_id,
-                    Some(EventBody::data(json!({ "operation": operation }))),
-                )
-                .await;
-            }
-            BroadcastEvent::Lagged(skipped) => {
-                tracing::warn!(%subscription_id, skipped, "clipboard operation events lagged");
-                emit_event(
-                    emitter,
-                    protocol::stream::OPERATION,
-                    "gap",
-                    subscription_id,
-                    Some(lag_data(skipped)),
-                )
-                .await;
-            }
-        }
-    })
-    .await;
 }
 
 impl SubscriptionTask {
