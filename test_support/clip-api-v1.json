@@ -40,6 +40,14 @@
         "stream": "clipboard.session"
       },
       {
+        "name": "clipboard.session.wait",
+        "params_example": {
+          "session_id": "session-opaque"
+        },
+        "response_key": "session",
+        "stream": null
+      },
+      {
         "name": "clipboard.history.query",
         "params_example": {
           "generation": 1,

@@ -135,6 +135,31 @@ impl SessionManager {
         .await
     }
 
+    /// Observe dispatch completion without arming, replaying or taking ownership
+    /// of the task. The caller must stay connected; end/owner loss still aborts it.
+    pub async fn wait(&self, id: &str, owner: Option<&str>) -> Result<SessionView, &'static str> {
+        loop {
+            {
+                let sessions = self.sessions.lock().await;
+                let session = sessions
+                    .get(id)
+                    .filter(|session| session.owner.as_deref() == owner && session.hidden)
+                    .ok_or("Hidden paste session is unknown or cancelled")?;
+                if session.expires <= Instant::now() {
+                    return Err("Paste session expired");
+                }
+                if session
+                    .paste_task
+                    .as_ref()
+                    .is_none_or(|task| task.is_finished())
+                {
+                    return Ok(view(id.into(), session.target.is_some(), "finished"));
+                }
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     pub async fn end(&self, id: &str, owner: Option<&str>) -> SessionView {
         let mut sessions = self.sessions.lock().await;
         let available = if sessions
@@ -198,14 +223,12 @@ impl SessionManager {
     }
 
     async fn remove_expired(&self) {
-        self.sessions.lock().await.retain(|_, session| {
-            session.expires > Instant::now()
-                && (!session.hidden
-                    || session
-                        .paste_task
-                        .as_ref()
-                        .is_some_and(|task| !task.is_finished()))
-        });
+        // Retain completed hidden sessions until expiry so a fast dispatch or
+        // reopening the picker cannot race its owner's completion observation.
+        self.sessions
+            .lock()
+            .await
+            .retain(|_, session| session.expires > Instant::now());
     }
 }
 
@@ -370,6 +393,67 @@ mod tests {
         );
         assert!(manager.validate_paste(&peer, Some(":1.2")).await.unwrap());
         assert!(manager.validate_paste(&id, owner).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn wait_observes_hidden_dispatch_without_replaying_or_detaching_it() {
+        let manager = SessionManager::default();
+        let owner = Some(":1.1");
+        let id = manager.test_target_owned(owner).await;
+        assert!(manager.wait(&id, owner).await.is_err());
+        assert!(manager.arm_paste(&id, owner).await);
+        let (finish, pending) = tokio::sync::oneshot::channel::<()>();
+        manager
+            .hide_with(&id, owner, |_| {
+                tokio::spawn(async move {
+                    let _ = pending.await;
+                })
+            })
+            .await
+            .unwrap();
+        assert!(manager.wait(&id, Some(":1.2")).await.is_err());
+        assert!(manager.wait(&id, None).await.is_err());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(40),
+                manager.wait(&id, owner)
+            )
+            .await
+            .is_err()
+        );
+        finish.send(()).unwrap();
+        let completed =
+            tokio::time::timeout(std::time::Duration::from_secs(2), manager.wait(&id, owner))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(completed.state, "finished");
+        manager.remove_expired().await;
+        assert_eq!(manager.wait(&id, owner).await.unwrap().state, "finished");
+        assert!(manager.hidden(&id, owner).await.is_err());
+        assert!(!manager.arm_paste(&id, owner).await);
+
+        let id = manager.test_target_owned(owner).await;
+        assert!(manager.arm_paste(&id, owner).await);
+        let (cancelled, cancellation) = tokio::sync::oneshot::channel::<()>();
+        manager
+            .hide_with(&id, owner, |_| {
+                tokio::spawn(async move {
+                    let _sender = cancelled;
+                    std::future::pending::<()>().await;
+                })
+            })
+            .await
+            .unwrap();
+        let (waited, ()) = tokio::join!(manager.wait(&id, owner), async {
+            tokio::task::yield_now().await;
+            manager.release_owner(":1.1").await;
+        });
+        assert!(waited.is_err());
+        assert!(
+            cancellation.await.is_err(),
+            "waiting must not detach the task from its owner"
+        );
     }
 
     #[tokio::test]

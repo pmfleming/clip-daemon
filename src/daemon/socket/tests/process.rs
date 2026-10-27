@@ -844,13 +844,21 @@ async fn paste_case(phase: &str) {
         assert_eq!(held["ok"], true);
     } else if phase == "paste-delivered" {
         assert_eq!(request(&mut a, hidden(), &mut events).await["ok"], true);
-        timeout(DEADLINE, async {
-            while !audit(&directory).iter().any(|row| row["kind"] == "paste") {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
+        let wait = || {
+            call(
+                "wait",
+                "clipboard.session.wait",
+                json!({"session_id":session_id}),
+            )
+        };
+        assert_eq!(request(&mut b, wait(), &mut events).await["ok"], false);
+        let finished = request(&mut a, wait(), &mut events).await;
+        assert_eq!(finished["ok"], true);
+        assert_eq!(finished["data"]["session"]["state"], "finished");
+        assert!(
+            audit(&directory).iter().any(|row| row["kind"] == "paste"),
+            "completion receipt must follow the delayed native dispatch"
+        );
         assert_eq!(
             request(&mut a, hidden(), &mut events).await["ok"],
             false,

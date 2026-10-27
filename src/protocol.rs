@@ -15,6 +15,7 @@ pub const METHODS: &[&str] = &[
     "clipboard.session.begin",
     "clipboard.session.end",
     "clipboard.session.hidden",
+    "clipboard.session.wait",
     "clipboard.history.query",
     "clipboard.history.revision",
     "clipboard.entry.details",

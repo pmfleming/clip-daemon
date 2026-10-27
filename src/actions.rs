@@ -119,6 +119,14 @@ impl ClipboardService {
             "clipboard.session.end" => {
                 Ok(json!({ "session": self.sessions.end(&params()?.session_id, owner).await }))
             }
+            "clipboard.session.wait" => {
+                let session = self
+                    .sessions
+                    .wait(&params()?.session_id, owner)
+                    .await
+                    .map_err(stale_target)?;
+                Ok(json!({ "session": session }))
+            }
             "clipboard.session.hidden" => {
                 let session = self
                     .sessions
