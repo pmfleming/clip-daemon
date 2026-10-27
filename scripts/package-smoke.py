@@ -125,17 +125,45 @@ def private_environment(root):
 
 
 class ProcessGroup:
-    """Own only groups we spawned, never signal a PID learned from D-Bus."""
+    """Keep our leader unreaped until group cleanup; never adopt a foreign PID.
+
+    Only inspected tools/fixtures that retain their group are supported, not
+    arbitrary process-tree containment. Callers must not poll/wait the Popen.
+    """
     def __init__(self, argv, env, *, output=False):
+        self.closed = False
         self.process = subprocess.Popen(
             list(map(str, argv)), env=env, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE if output else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True,
         )
 
+    def exit_code(self):
+        require(self.process.returncode is None, "private process leader already reaped")
+        try:
+            status = os.waitid(os.P_PID, self.process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            raise SmokeError("private process leader already reaped") from None
+        if status is None:
+            return None
+        return status.si_status if status.si_code == os.CLD_EXITED else -status.si_status
+
+    def wait_until(self, deadline):
+        while True:
+            remaining = deadline - time.monotonic()
+            require(remaining > 0, "private command deadline exceeded")
+            code = self.exit_code()
+            if code is not None:
+                return code
+            time.sleep(min(0.01, remaining))
+
     def close(self):
-        # Activated children remain in this group (covered by the inert fixture).
-        # Clean the group even if its leader failed/exited before readiness.
+        if self.closed:
+            return
+        self.exit_code()  # Verify ownership without reaping, including external waitpid misuse.
+        self.closed = True
+        # Even an exited leader reserves its identity until our final wait.
+        # Activated children retain this group (covered by the inert fixture).
         for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
                 os.killpg(self.process.pid, sig)
@@ -143,9 +171,13 @@ class ProcessGroup:
                 break
             if sig == signal.SIGTERM:
                 time.sleep(0.05)
-        self.process.wait(timeout=1)
-        if self.process.stdout:
-            self.process.stdout.close()
+        try:
+            self.process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            raise SmokeError("private process cleanup deadline exceeded") from None
+        finally:
+            if self.process.stdout:
+                self.process.stdout.close()
 
 
 def run_bounded(argv, env, timeout=3, limit=65536):
@@ -167,13 +199,11 @@ def run_bounded(argv, env, timeout=3, limit=65536):
                 require(len(chunks) <= limit, "private command output limit exceeded")
                 if not block:
                     break
-        code = child.process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        # EOF does not imply exit. Observe under the same deadline without
+        # releasing the leader identity before the finally block cleans its group.
+        code = child.wait_until(deadline)
         require(code == 0, f"private command failed (exit {code})")
         return bytes(chunks)
-    except subprocess.TimeoutExpired:
-        # EOF does not imply process exit. Keep the wait-deadline path consistent
-        # with selector expiry, without leaking the child argv in diagnostics.
-        raise SmokeError("private command deadline exceeded") from None
     finally:
         child.close()
 
@@ -229,7 +259,7 @@ class PrivateBus:
             ], self.env)
             deadline = time.monotonic() + self.timeout
             while not (self.root / "run/bus").exists():
-                code = self.child.process.poll()
+                code = self.child.exit_code()
                 require(code is None, f"private bus failed to start (exit {code})")
                 require(time.monotonic() < deadline, "private bus startup deadline exceeded")
                 time.sleep(0.01)

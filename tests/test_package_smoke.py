@@ -140,6 +140,39 @@ class ConstructionTests(unittest.TestCase):
         self.assertNotIn("DBUS_SESSION_BUS_ADDRESS", actual)
         self.assertEqual(actual["PATH"], env["PATH"])
 
+    def test_completed_command_keeps_leader_identity_until_idempotent_cleanup(self):
+        binary = self.executable("completed", 'print("complete")\n')
+        env = smoke.private_environment(self.root)
+        original_close = smoke.ProcessGroup.close
+        observed = []
+
+        def close(group):
+            observed.append(group.process.returncode)
+            self.assertIsNone(group.process.returncode, "must not reap before group cleanup")
+            original_close(group)
+            with patch.object(smoke.os, "killpg", side_effect=AssertionError("already closed")):
+                original_close(group)
+
+        with patch.object(smoke.ProcessGroup, "close", close):
+            self.assertEqual(smoke.run_bounded([binary], env), b"complete\n")
+        self.assertEqual(observed, [None])
+
+    def test_externally_reaped_leader_never_authorizes_group_signal(self):
+        binary = self.executable("inert", "pass\n")
+        env = smoke.private_environment(self.root)
+        for reaper in ("popen", "waitpid"):
+            with self.subTest(reaper=reaper):
+                group = smoke.ProcessGroup([binary], env)
+                # Deliberate misuse; these inert children have no descendants.
+                if reaper == "popen":
+                    group.process.wait(timeout=3)
+                else:
+                    os.waitpid(group.process.pid, 0)
+                with patch.object(smoke.os, "killpg") as kill:
+                    with self.assertRaisesRegex(smoke.SmokeError, "already reaped"):
+                        group.close()
+                kill.assert_not_called()
+
     def test_output_and_startup_deadlines(self):
         flood = self.executable("flood", "import os\nos.write(1, b'x' * 4096)\n")
         slow = self.executable("slow", "import time\ntime.sleep(5)\n")
@@ -327,7 +360,7 @@ class PrivateActivationTests(unittest.TestCase):
                 self.assertNotEqual(owner, new_owner)
                 with self.assertRaises(smoke.SmokeError):
                     bus.read_settings()
-                self.assertIsNone(replacement.process.poll())
+                self.assertIsNone(replacement.exit_code())
                 self.assertEqual([row["kind"] for row in self.rows()], ["start", "read", "start"])
             finally:
                 replacement.close()

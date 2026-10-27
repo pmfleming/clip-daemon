@@ -55,7 +55,12 @@ It is not a producer-policy implementation or a fake packaged-main pass.
   selected coreutils `timeout` bounds the bus to 15s (KILL after 1s) even if the
   Python runner dies; the fixture has an independent 10s lifetime. Spawned process groups receive TERM then KILL and are
   waited before removing private data, including failed startup and exceptions.
-  No signal targets a PID discovered through D-Bus. Native regression verifies
+  The leader remains unreaped until group signalling finishes: non-reaping
+  `waitid(..., WNOWAIT)` observes completion/startup failure under the deadline.
+  Cleanup is idempotent and rejects already-reaped identities, including external
+  `waitpid` misuse. Callers must not independently reap the owned `Popen`.
+  This supports inspected tools/fixtures that retain their group, not arbitrary
+  detached-process containment. No signal targets a PID discovered through D-Bus. Native regression verifies
   the activated fixture belongs to the owned bus group and leaves no live child.
 
 The fixture uses only Gio/GLib on its explicit private connection and stdlib
@@ -91,10 +96,11 @@ lock/unit/flake edits, stale producer binaries or real service execution.
 
 ## Retained gates / integration requests
 
-1. Coordinator-owned flake/check wiring should run Python syntax + construction
-   tests and the explicit private native cases with Python/Gio, D-Bus and busctl
-   declared as test inputs. The existing Rust-only package check does not discover
-   Python tests. No automatic whole-smoke/real-main activation should be added.
+1. Coordinator-owned `checks.<system>.packageSmoke` now runs the construction and
+   explicit private native cases with declared Python/Gio, D-Bus and busctl inputs,
+   plus static wiring inspection of the real built package. Development checks also
+   compile Python syntax. The Rust-only package check does not discover Python
+   tests; this separate check does. It never starts real main/engine or rollback.
 2. Safe real packaged-main and pinned-engine cold start, configuration failure,
    persisted-state privacy, engine version negotiation, upgrades and rollback
    still require an authorized producer-safe fixture/acceptance environment. Do
@@ -110,7 +116,7 @@ lock/unit/flake edits, stale producer binaries or real service execution.
    and RSS/PSS/private memory or unavailable metrics. This synthetic correctness
    fixture must not be used to claim daemon/desktop performance.
 
-## Bounded quality checkpoint
+## Worker quality checkpoint (historical)
 
 Rust/QML Quality Lenses do not certify Python. No Rust/QML/JS/TS/shell/Nix source
 changes are part of this tranche. The quality continuation reviewed the full
@@ -137,4 +143,42 @@ are retained under the task's `quality/` artifacts and clipboard-specific qualit
 evidence. This is **partial unsupported-language quality evidence**, not a Lens
 pass or universal semantic/complexity certification. Gio's existing object
 registration deprecation remains recorded; actual package-main/session/engine,
-upgrade/rollback, Nix wiring and performance gates above remain unchanged.
+upgrade/rollback and performance remain separate. Nix wiring was still open at
+that worker handoff; the following coordinator checkpoint closes only the isolated
+CI/static-wiring request.
+
+## Coordinator lifetime quality checkpoint — 2026-10-27
+
+Implementation integration `1777c03` adds the reviewed worker tree and isolated
+Nix check. All fourteen combined project gates passed before this separate quality
+refactor. Manual Python review then identified a group-identity hazard: normal
+command completion and startup polling could reap the leader before cleanup
+signalled its numeric process-group ID. An idempotence guard alone is insufficient.
+
+A safe BEFORE witness used only inert Python children and mocked **every** group
+signal: cleanup requested TERM/KILL with an already-reaped leader; explicit external
+reaping was not rejected. The two new regression cases also fail against the exact
+archived implementation helper (three assertions, including Popen/raw-waitpid
+subcases). These are real behavior regressions with simulated signals, not actual
+PID-reuse experiments or signals to foreign processes.
+
+The refactor preserves the leader identity with non-reaping exit observation,
+uses the same deadline after EOF, checks parent-child ownership before cleanup,
+signals before final wait, and makes repeated close a no-op. Externally reaped
+identities fail closed without signalling. The AFTER witness observes an unreaped
+leader during normal cleanup and zero signal requests for the rejected identity.
+Native owner-loss tests use the same non-reaping observer. No activation retry,
+command/output limit relaxation, fixture expansion or domain effect was added.
+
+Python 3.13.13 syntax and **23 construction/private native tests, zero skips** pass
+in development and the matching Nix `packageSmoke` check. Static real-package
+wiring passes; its dependency rebuild passes 59 Rust library + six integration
+tests. Real packaged-main/engine/rollback remains explicitly NOT RUN. The combined
+frontend still passes 522 Qt tests with one existing renderer skip. Source seals
+and process quiescence were checked before adding documentation.
+
+Evidence: `shelllist-orchestration/20261026T232107Z/integration-review/remaining/`
+`coordinator-quality/{before,after}/`, the safe witness/regression drivers, exact
+logs and source captures. Python/Nix review remains unsupported by Rust/QML Lens;
+actual syntax, execution, Nix parsing/build and manual lifetime review are scoped
+evidence, not universal semantic or process-tree containment certification.
