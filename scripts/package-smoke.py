@@ -1,152 +1,301 @@
 #!/usr/bin/env python3
-"""Installed-package/optional rollback checks in private HOME, bus and history."""
+"""Static package wiring check and private, synthetic activation test boundary.
+
+Real packaged-main/engine/rollback acceptance is deliberately gated: main creates
+Ringboard and capture policy, which the inert activation fixture does not test.
+Nothing in this module starts that main or discovers tools from inherited PATH.
+"""
+import argparse
+import configparser
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import selectors
+import shlex
 import signal
-import socket
 import subprocess
-import sys
 import tempfile
 import time
+from xml.sax.saxutils import escape
 
 BUS = "org.laufan.ClipDaemon"
+OBJECT = "/org/laufan/ClipDaemon"
+INTERFACE = "org.laufan.ClipDaemon2"
+DBUS = "org.freedesktop.DBus"
+DBUS_OBJECT = "/org/freedesktop/DBus"
+GATE = ("packaged-main/engine/rollback acceptance is not enabled: it requires "
+        "a separately authorized safe backend/capture fixture; synthetic activation "
+        "is not packaged-main acceptance")
 
 
-def call(method):
-    wire = subprocess.check_output(["busctl", "--user", "--json=short", "call", BUS,
-        "/org/laufan/ClipDaemon", BUS + "1", "Call", "ss", method, "{}"], timeout=30)
-    result = json.loads(json.loads(wire)["data"][0])
-    assert result["ok"], result
-    return result["data"]
+class SmokeError(RuntimeError):
+    """A failed check, never an invitation to retry activation or a domain effect."""
 
 
-def wait_for(read):
-    for _ in range(200):
-        value = read()
-        if value:
-            return value
-        time.sleep(0.025)
-    raise TimeoutError("isolated package did not become ready")
+def require(condition, message):
+    if not condition:
+        raise SmokeError(message)
 
 
-def server_path(package):
-    unit = (package / "share/systemd/user/ringboard-server.service").read_text()
-    return Path(next(line.removeprefix("ExecStart=") for line in unit.splitlines() if line.startswith("ExecStart=")))
+def executable(path):
+    path = Path(path)
+    require(path.is_absolute(), "selected executable must be absolute")
+    require(path.is_file() and os.access(path, os.X_OK), "selected executable is missing")
+    return path
 
 
-def check(package, previous):
-    binary = package / "bin/clip-daemon"
+def ini(path):
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    with path.open() as source:
+        parser.read_file(source)
+    # systemd/D-Bus definitions have no ConfigParser-style inherited defaults.
+    # Accepting these could hide a missing actual Exec/ExecStart directive.
+    require(not parser.defaults(), "packaged service definitions cannot inherit INI defaults")
+    return parser
+
+
+def inspect_package(package):
+    """Read rendered definitions only. Do not invoke binaries or a user manager."""
+    package = Path(package).resolve(strict=True)
+    binary = executable(package / "bin/clip-daemon")
     units = package / "share/systemd/user"
-    paths = list(units.glob("*.service"))
-    assert {path.name for path in paths} == {"clip-daemon.service", "ringboard-server.service"}
-    daemon_unit = (units / "clip-daemon.service").read_text()
-    engine_unit = (units / "ringboard-server.service").read_text()
-    assert "Conflicts=ringboard-wayland.service" in daemon_unit
-    assert "Wants=ringboard-server.service\n" in daemon_unit
-    assert "PartOf=graphical-session.target\n" in daemon_unit
-    assert "Requires=ringboard-server.service" not in daemon_unit
-    assert "ringboard-wayland.service" not in engine_unit
-    assert "Type=notify" in engine_unit and "configure-engine" in engine_unit
-    subprocess.run(["systemd-analyze", "--user", "verify", *map(str, paths)], check=True)
-    server = server_path(package)
-    assert "@" not in str(server) and server.is_file()
-    subprocess.run([binary, "configure-engine"], check=True)
-    settings = Path(os.environ["XDG_STATE_HOME"]) / "clip-daemon/settings.json"
-    assert settings.stat().st_mode & 0o077 == 0
-    saved = json.loads(settings.read_text())
-    settings.write_text("invalid")
-    assert subprocess.run([binary, "configure-engine"], stderr=subprocess.DEVNULL).returncode != 0
-    saved.update(capture_paused=True, private_mode=True)
-    settings.write_text(json.dumps(saved))
-    processes = []
-    daemon_pid = None
+    require({p.name for p in units.iterdir()} == {
+        "clip-daemon.service", "ringboard-server.service"}, "unexpected packaged units")
+    daemon = ini(units / "clip-daemon.service")
+    engine = ini(units / "ringboard-server.service")
+    require(shlex.split(daemon["Service"]["ExecStart"]) == [str(binary), "daemon"],
+            "daemon unit does not select this package")
+    require(daemon["Service"]["Type"] == "dbus" and daemon["Service"]["BusName"] == BUS,
+            "wrong daemon unit bus contract")
+    require(daemon["Unit"]["Conflicts"].split() == ["ringboard-wayland.service"],
+            "legacy collector exclusion missing")
+    require(daemon["Unit"]["Wants"].split() == ["ringboard-server.service"],
+            "engine start relationship changed")
+    require("ringboard-server.service" not in daemon["Unit"].get("Requires", "").split(),
+            "facade must survive engine restart")
+    require(daemon["Unit"]["PartOf"] == "graphical-session.target", "wrong session lifetime")
+    require(engine["Service"]["Type"] == "notify", "engine readiness contract changed")
+    require(shlex.split(engine["Service"]["ExecStartPre"]) == [str(binary), "configure-engine"],
+            "engine policy command does not select this package")
+    server = shlex.split(engine["Service"]["ExecStart"])
+    require(len(server) == 1 and "@" not in server[0], "unrendered/invalid engine path")
+    executable(server[0])
+    require("ringboard-wayland.service" not in (units / "ringboard-server.service").read_text(),
+            "engine must not start the retired collector")
+    services = package / "share/dbus-1/services"
+    require({p.name for p in services.iterdir()} == {BUS + ".service"},
+            "unexpected packaged activation services")
+    service = ini(services / (BUS + ".service"))["D-BUS Service"]
+    require(service["Name"] == BUS and service["SystemdService"] == "clip-daemon.service",
+            "wrong activation identity")
+    require(shlex.split(service["Exec"]) == [str(binary), "daemon"],
+            "activation does not select this package")
+    return {"package": str(package), "binary": str(binary), "engine": server[0]}
 
-    def start_server(path):
-        process = subprocess.Popen([path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        processes.append(process)
-        def ready():
-            assert process.poll() is None
+
+@dataclass(frozen=True)
+class Tools:
+    dbus_daemon: Path
+    busctl: Path
+    timeout: Path
+
+    def __post_init__(self):
+        executable(self.dbus_daemon)
+        executable(self.busctl)
+        executable(self.timeout)
+
+
+def private_environment(root):
+    """Allowlist, not a denylist. No loader, helper, bus or compositor inheritance."""
+    env = {"LANG": "C", "LC_ALL": "C"}
+    for name, relative in {
+        "HOME": "home", "XDG_CONFIG_HOME": "config", "XDG_CONFIG_DIRS": "config-dirs",
+        "XDG_DATA_HOME": "data", "XDG_DATA_DIRS": "data-dirs", "XDG_STATE_HOME": "state",
+        "XDG_CACHE_HOME": "cache", "XDG_RUNTIME_DIR": "run", "TMPDIR": "tmp",
+        "PATH": "empty-bin",
+    }.items():
+        path = root / relative
+        path.mkdir(mode=0o700)
+        env[name] = str(path)
+    env.update(DBUS_SYSTEM_BUS_ADDRESS="unix:path=" + str(root / "run/no-system-bus"),
+               WAYLAND_DISPLAY=str(root / "run/no-wayland"))
+    return env
+
+
+class ProcessGroup:
+    """Own only groups we spawned, never signal a PID learned from D-Bus."""
+    def __init__(self, argv, env, *, output=False):
+        self.process = subprocess.Popen(
+            list(map(str, argv)), env=env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if output else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+
+    def close(self):
+        # Activated children remain in this group (covered by the inert fixture).
+        # Clean the group even if its leader failed/exited before readiness.
+        for sig in (signal.SIGTERM, signal.SIGKILL):
             try:
-                with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
-                    client.settimeout(1)
-                    client.connect(os.environ["RINGBOARD_SOCK"])
-                    client.send(b"\xc1")
-                    return client.recv(1) == b"\xc1"
-            except OSError:
-                return False
-        wait_for(ready)
-        return process
-
-    try:
-        process = start_server(server)
-        # The installed activation file must start the facade; no manual launch.
-        state = call("clipboard.settings.get")
-        assert state["retention"]["synchronized"], state
-        assert state["capture"]["verified"] and state["capture"]["private_mode"], state
-        owner = subprocess.check_output(["busctl", "--user", "--json=short", "call",
-            "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
-            "GetConnectionUnixProcessID", "s", BUS])
-        daemon_pid = json.loads(owner)["data"][0]
-        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
-            client.settimeout(2)
-            client.connect(os.environ["RINGBOARD_SOCK"])
-            client.send(b"\xc2")
-            assert client.recv(1) == b"\xc2", "packaged engine lacks capture ingestion"
-        print("PASS two-units, legacy-conflict, private-files, invalid-policy, D-Bus-activation, private-startup, live-v2-limits")
-        if previous:
-            subprocess.run([server.parent / "ringboard", "add"], input=b"synthetic-migration-fixture", check=True, stdout=subprocess.DEVNULL)
-            before = call("clipboard.history.query")["history"]["entries"]
-            assert len(before) == 1
-            # Validate data/settings compatibility across engine rollback/upgrade.
-            # This is not a real systemd login/activation test.
-            for executable in (server_path(previous), server):
-                process.terminate()
-                process.wait(timeout=10)
-                process = start_server(executable)
-                assert call("clipboard.history.query")["history"]["entries"] == before
-                state = call("clipboard.settings.get")
-                assert state["capture"]["verified"] and state["capture"]["private_mode"]
-            print("PASS previous-engine-rollback-and-upgrade-preserve-history-and-private-intent")
-    finally:
-        if daemon_pid:
-            os.kill(daemon_pid, signal.SIGTERM)
-        for process in reversed(processes):
-            if process.poll() is None:
-                process.terminate()
-                process.wait(timeout=10)
-
-
-def main():
-    package = Path(sys.argv[1]).resolve()
-    previous = Path(sys.argv[2]).resolve() if len(sys.argv) > 2 else None
-    if "_CLIP_PACKAGE_SMOKE" in os.environ:
-        check(package, previous)
-        return
-    with tempfile.TemporaryDirectory(prefix="clip-install-") as directory:
-        root = Path(directory)
-        env = dict(os.environ, _CLIP_PACKAGE_SMOKE="1")
-        for variable, relative in {"HOME": "home", "XDG_DATA_HOME": "data", "XDG_CONFIG_HOME": "config",
-            "XDG_STATE_HOME": "state", "XDG_CACHE_HOME": "cache", "XDG_RUNTIME_DIR": "runtime"}.items():
-            path = root / relative
-            path.mkdir(mode=0o700)
-            env[variable] = str(path)
-        env.update(XDG_DATA_DIRS=str(package / "share"), RINGBOARD_SOCK=str(root / "runtime/ring.sock"))
-        for name in ("DBUS_SESSION_BUS_ADDRESS", "WAYLAND_DISPLAY", "DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE"):
-            env.pop(name, None)
-        args = ["dbus-run-session", "--", sys.executable, __file__, str(package)]
-        if previous:
-            args.append(str(previous))
-        child = subprocess.Popen(args, env=env, start_new_session=True)
-        try:
-            code = child.wait(timeout=90)
-        finally:
-            try:
-                os.killpg(child.pid, signal.SIGTERM)
+                os.killpg(self.process.pid, sig)
             except ProcessLookupError:
-                pass
-        assert code == 0, code
+                break
+            if sig == signal.SIGTERM:
+                time.sleep(0.05)
+        self.process.wait(timeout=1)
+        if self.process.stdout:
+            self.process.stdout.close()
+
+
+def run_bounded(argv, env, timeout=3, limit=65536):
+    """Deadline AND output bound; diagnostics cannot accidentally dump clipboard data."""
+    child = ProcessGroup(argv, env, output=True)
+    try:
+        chunks = bytearray()
+        deadline = time.monotonic() + timeout
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SmokeError("private command deadline exceeded")
+                if not selector.select(remaining):
+                    raise SmokeError("private command deadline exceeded")
+                block = os.read(child.process.stdout.fileno(), min(8192, limit + 1 - len(chunks)))
+                chunks.extend(block)
+                require(len(chunks) <= limit, "private command output limit exceeded")
+                if not block:
+                    break
+        code = child.process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        require(code == 0, f"private command failed (exit {code})")
+        return bytes(chunks)
+    except subprocess.TimeoutExpired:
+        # EOF does not imply process exit. Keep the wait-deadline path consistent
+        # with selector expiry, without leaking the child argv in diagnostics.
+        raise SmokeError("private command deadline exceeded") from None
+    finally:
+        child.close()
+
+
+def activation_exec(argv):
+    require(bool(argv), "empty synthetic activation command")
+    executable(argv[0])
+    require(all(not any(ord(c) < 32 or ord(c) == 127 for c in str(arg)) for arg in argv),
+            "control character in activation argument")
+    # D-Bus Exec tokenization, not a shell command. Percent is literal to dbus-daemon.
+    return " ".join('"' + str(arg).replace("\\", "\\\\").replace('"', '\\"') + '"' for arg in argv)
+
+
+class PrivateBus:
+    """Synthetic-service harness, NOT authority to start a production daemon.
+
+    The caller supplies an inspected inert, bounded fixture command. The CLI never
+    constructs this class with the package's activation executable. No systemd
+    activation helper or host service directory is loaded.
+    """
+    def __init__(self, tools, fixture_argv, *, timeout=3):
+        self.tools = tools
+        self.fixture_exec = activation_exec(fixture_argv)
+        self.timeout = timeout
+        self.directory = None
+        self.child = None
+        self.owner = None
+        self.activation_attempted = False
+
+    def __enter__(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="clip-smoke-")
+        self.root = Path(self.directory.name)
+        try:
+            self.env = private_environment(self.root)
+            self.address = "unix:path=" + str(self.root / "run/bus")
+            self.env["DBUS_SESSION_BUS_ADDRESS"] = self.address
+            services = self.root / "services"
+            services.mkdir(mode=0o700)
+            (services / (BUS + ".service")).write_text(
+                f"[D-BUS Service]\nName={BUS}\nExec={self.fixture_exec}\n")
+            config = self.root / "bus.conf"
+            config.write_text(
+                '<busconfig><type>session</type><auth>EXTERNAL</auth>'
+                f'<listen>{escape(self.address)}</listen>'
+                f'<servicedir>{escape(str(services))}</servicedir>'
+                '<limit name="service_start_timeout">2000</limit>'
+                '<policy context="default"><allow send_destination="*"/>'
+                '<allow receive_sender="*"/><allow own="*"/></policy></busconfig>')
+            # Independent lifetime even if the Python test runner is killed.
+            self.child = ProcessGroup([
+                self.tools.timeout, "--signal=TERM", "--kill-after=1", "15",
+                self.tools.dbus_daemon, "--nofork", "--nopidfile", "--config-file=" + str(config)
+            ], self.env)
+            deadline = time.monotonic() + self.timeout
+            while not (self.root / "run/bus").exists():
+                code = self.child.process.poll()
+                require(code is None, f"private bus failed to start (exit {code})")
+                require(time.monotonic() < deadline, "private bus startup deadline exceeded")
+                time.sleep(0.01)
+            names = self.bus_call(DBUS, DBUS_OBJECT, DBUS, "ListActivatableNames")
+            require(set(names[0]) == {DBUS, BUS}, "unexpected private activation registry")
+            require(self.bus_call(DBUS, DBUS_OBJECT, DBUS, "NameHasOwner", "s", BUS) == [False],
+                    "synthetic service was already running")
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def bus_call(self, destination, path, interface, member, *args):
+        wire = run_bounded([
+            self.tools.busctl, "--address=" + self.address, "--auto-start=no",
+            "--timeout=" + str(self.timeout), "--json=short", "call",
+            destination, path, interface, member, *args,
+        ], self.env, timeout=self.timeout)
+        return json.loads(wire)["data"]
+
+    def activate(self):
+        require(not self.activation_attempted, "activation is single-attempt; no implicit retry")
+        self.activation_attempted = True
+        self.bus_call(DBUS, DBUS_OBJECT, DBUS, "StartServiceByName", "su", BUS, "0")
+        owner = self.bus_call(DBUS, DBUS_OBJECT, DBUS, "GetNameOwner", "s", BUS)[0]
+        require(isinstance(owner, str) and owner.startswith(":"), "missing unique owner")
+        self.owner = owner
+        return owner
+
+    def read_settings(self):
+        require(self.owner is not None, "activate the synthetic service first")
+        # Bind to the captured unique owner: losing/replacing it cannot re-activate
+        # the well-known name or redirect even this read to a different lifetime.
+        data = self.bus_call(self.owner, OBJECT, INTERFACE, "Call", "ss",
+                             "clipboard.settings.get", "{}")
+        require(len(data) == 1 and isinstance(data[0], str), "invalid Call result")
+        result = json.loads(data[0])
+        require(result.get("ok") is True and isinstance(result.get("data"), dict),
+                "settings read failed")
+        return result["data"]
+
+    def __exit__(self, *_):
+        try:
+            if self.child:
+                self.child.close()
+        finally:
+            if self.directory:
+                self.directory.cleanup()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("package", type=Path)
+    parser.add_argument("previous", type=Path, nargs="?", help="rollback gate (not enabled)")
+    parser.add_argument("--wiring-only", action="store_true", help="static definitions only; no binaries run")
+    args = parser.parse_args(argv)
+    if not args.wiring_only or args.previous is not None:
+        parser.exit(2, "NOT RUN: " + GATE + "\n")
+    try:
+        identity = inspect_package(args.package)
+    except (SmokeError, OSError, KeyError, ValueError, configparser.Error) as error:
+        parser.exit(1, f"FAIL package wiring: {error}\n")
+    print("PASS static package wiring " + json.dumps(identity, sort_keys=True))
+    print("NOT RUN: " + GATE)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
