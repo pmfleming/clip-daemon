@@ -126,7 +126,7 @@ impl HistoryBackend {
     }
 
     fn revision_sync(&self, id: &str) -> BackendResult<u64> {
-        Ok(self.selected(id, None)?.summary.revision)
+        self.store()?.entry_revision(id)
     }
 
     fn mutate_sync(

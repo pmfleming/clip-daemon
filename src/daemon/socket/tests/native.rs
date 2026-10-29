@@ -45,6 +45,13 @@ impl LocalJsonlService for Probe {
                 .mutate("fixture", Some(1), crate::backend::BackendMutation::Remove)
                 .await?;
         }
+        // This field qualifies transport framing, not the strict public DTO.
+        // Never relax production query validation for a test-only payload.
+        let mut params = params;
+        params
+            .as_object_mut()
+            .context("query object")?
+            .remove("probe_padding");
         let response = self.service.call(session, method, params).await?;
         if (self.large && reads == 2) || (!self.large && reads == 8) {
             if !self.large {

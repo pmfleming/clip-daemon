@@ -41,5 +41,9 @@ native-quickshell-socket = []
 [dev-dependencies]
 wayland-server = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["server"] }
-allocation-counter = "0.8.1"
 tempfile = "3"
+
+[patch.crates-io]
+# Turso's current Tantivy range still selects vulnerable zstd 0.13.
+# This upstream snapshot updates compression and drops an unused dev dependency.
+tantivy-sstable = { path = "vendor/tantivy-sstable" }

@@ -12,3 +12,6 @@ anyhow = "1"
 futures-lite = "2.6"
 turso = { version = "=0.8.3", default-features = false, features = ["fts"] }
 tempfile = "3"
+
+[patch.crates-io]
+tantivy-sstable = { path = "../../vendor/tantivy-sstable" }

@@ -308,7 +308,7 @@ impl Database {
             Ok(())
         })
     }
-    fn summary(&self, id: &str, expected: Option<u64>) -> BackendResult<EntrySummary> {
+    pub(super) fn summary(&self, id: &str, expected: Option<u64>) -> BackendResult<EntrySummary> {
         let rows = self.rows(
             &format!("SELECT {COLUMNS} FROM entries e WHERE e.id=?1"),
             [id],
@@ -341,17 +341,20 @@ impl Database {
         })
     }
     pub(super) fn query(&self, query: HistoryQuery) -> BackendResult<HistoryPage> {
-        let needle = query.query.to_lowercase();
+        let needle = query.query.trim().to_lowercase();
         let limit = query.limit.min(crate::backend::MAX_QUERY_LIMIT);
         let offset = i64::try_from(query.offset).unwrap_or(i64::MAX);
-        let current = self
+        let mut current = self
             .rows(
-                &format!("SELECT {COLUMNS} FROM entries e ORDER BY e.recency DESC,e.id LIMIT 1"),
-                (),
+                &format!("SELECT {COLUMNS} FROM entries e WHERE e.id=(SELECT CASE WHEN ?1=1 THEN coalesce(echo_source_id,id) ELSE id END FROM entries ORDER BY recency DESC,id LIMIT 1)"),
+                [i64::from(query.collapse_self_echoes)],
             )?
             .first()
             .map(decode_summary)
             .transpose()?;
+        if let Some(current) = &mut current {
+            current.current = true;
+        }
         // Native FTS trigrams narrow literal substring candidates. Very short /
         // punctuation-only queries and large unindexed documents retain exact
         // SQL instr semantics; token syntax is never interpreted from user input.
@@ -392,11 +395,16 @@ impl Database {
             ],
         )? as usize;
         let has_more = rows.len() > limit;
-        let entries = rows
+        let mut entries = rows
             .iter()
             .take(limit)
             .map(decode_summary)
             .collect::<BackendResult<Vec<_>>>()?;
+        for entry in &mut entries {
+            entry.current = current
+                .as_ref()
+                .is_some_and(|current| current.id == entry.id);
+        }
         let next_offset = if has_more && limit > 0 {
             query.offset.checked_add(entries.len())
         } else {
@@ -430,6 +438,13 @@ impl Database {
             let digest=Sha256::digest(bytes).to_vec();
             // Digest narrows indexed candidates; BLOB equality authorizes deduplication.
             let candidates=db.rows("SELECT e.id FROM entries e JOIN payloads p ON p.entry_id=e.id WHERE e.digest=?1 AND e.mime=?2 AND e.byte_size=?3 AND p.bytes=?4 ORDER BY e.recency DESC LIMIT 1",params![digest.clone(),mime,bytes.len() as i64,bytes])?;
+            if let Some(row)=candidates.first() {
+                let existing=db.summary(&text(row,0)?,None)?;
+                // Re-observing the already-current exact bytes changes nothing.
+                // In particular an explicit copy must not invalidate its own
+                // revision merely because our capture worker sees publication.
+                if existing.current { return Ok(existing); }
+            }
             let revision=db.bump()?;
             let recency=db.sequence()?;
             let id=if let Some(row)=candidates.first() {
@@ -694,21 +709,29 @@ impl Database {
     }
 }
 fn search_gram(needle: &str) -> Option<String> {
-    let mut gram = String::new();
-    let mut count = 0;
-    for c in needle.chars() {
-        if c.is_alphanumeric() {
-            gram.push(c);
-            count += 1;
-            if count == 3 {
-                return Some(gram);
+    // Every selected trigram is necessary for a literal match. Intersect a
+    // bounded set, rather than picking a common prefix that selects the entire
+    // catalog. Only generated, quoted alphanumeric terms reach the FTS parser.
+    let mut terms = std::collections::BTreeSet::new();
+    for word in needle.split(|c: char| !c.is_alphanumeric()) {
+        let chars: Vec<_> = word.chars().collect();
+        for gram in chars.windows(3) {
+            terms.insert(gram.iter().collect::<String>());
+            if terms.len() == 32 {
+                break;
             }
-        } else {
-            gram.clear();
-            count = 0;
+        }
+        if terms.len() == 32 {
+            break;
         }
     }
-    None
+    (!terms.is_empty()).then(|| {
+        terms
+            .into_iter()
+            .map(|term| format!("\"{term}\""))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    })
 }
 fn normalize_schema(sql: &str) -> String {
     let mut quoted = false;
@@ -734,6 +757,41 @@ fn text(row: &Row, index: usize) -> BackendResult<String> {
 fn integer(row: &Row, index: usize) -> BackendResult<i64> {
     row.get(index).map_err(operation_error)
 }
+fn decode_artifact(row: &Row) -> BackendResult<ArtifactRecord> {
+    Ok(ArtifactRecord {
+        path: PathBuf::from(text(row, 0)?),
+        source_entry_id: text(row, 1)?,
+        image_identity: text(row, 2)?,
+        created_at: integer(row, 3)? as u64,
+        device: integer(row, 4)? as u64,
+        inode: integer(row, 5)? as u64,
+        owner: integer(row, 6)? as u32,
+    })
+}
+fn decode_summary(row: &Row) -> BackendResult<EntrySummary> {
+    let kind = match text(row, 2)?.as_str() {
+        "Text" => EntryKind::Text,
+        "Link" => EntryKind::Link,
+        "Image" => EntryKind::Image,
+        "Files" => EntryKind::Files,
+        "Html" => EntryKind::Html,
+        "Json" => EntryKind::Json,
+        "Color" => EntryKind::Color,
+        "Binary" => EntryKind::Binary,
+        _ => return Err(invalid_data("Invalid stored entry kind")),
+    };
+    Ok(EntrySummary {
+        id: text(row, 0)?,
+        revision: integer(row, 1)? as u64,
+        kind,
+        mime: text(row, 3)?,
+        byte_size: integer(row, 4)? as u64,
+        favorite: integer(row, 5)? != 0,
+        preview: text(row, 6)?,
+        current: integer(row, 7)? != 0,
+    })
+}
+
 #[cfg(test)]
 mod failure_tests {
     use super::*;
@@ -842,38 +900,4 @@ mod failure_tests {
         );
         db.shutdown().unwrap();
     }
-}
-fn decode_artifact(row: &Row) -> BackendResult<ArtifactRecord> {
-    Ok(ArtifactRecord {
-        path: PathBuf::from(text(row, 0)?),
-        source_entry_id: text(row, 1)?,
-        image_identity: text(row, 2)?,
-        created_at: integer(row, 3)? as u64,
-        device: integer(row, 4)? as u64,
-        inode: integer(row, 5)? as u64,
-        owner: integer(row, 6)? as u32,
-    })
-}
-fn decode_summary(row: &Row) -> BackendResult<EntrySummary> {
-    let kind = match text(row, 2)?.as_str() {
-        "Text" => EntryKind::Text,
-        "Link" => EntryKind::Link,
-        "Image" => EntryKind::Image,
-        "Files" => EntryKind::Files,
-        "Html" => EntryKind::Html,
-        "Json" => EntryKind::Json,
-        "Color" => EntryKind::Color,
-        "Binary" => EntryKind::Binary,
-        _ => return Err(invalid_data("Invalid stored entry kind")),
-    };
-    Ok(EntrySummary {
-        id: text(row, 0)?,
-        revision: integer(row, 1)? as u64,
-        kind,
-        mime: text(row, 3)?,
-        byte_size: integer(row, 4)? as u64,
-        favorite: integer(row, 5)? != 0,
-        preview: text(row, 6)?,
-        current: integer(row, 7)? != 0,
-    })
 }

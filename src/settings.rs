@@ -169,7 +169,7 @@ const SETTINGS_SAVED: &str = "Clipboard settings were saved";
 const CAPTURE_SAVED: &str = "Capture preference was saved";
 
 impl SettingsManager {
-    #[cfg(test)]
+    /// API-only instances have no persistence path or implicit desktop intent.
     pub(crate) fn isolated() -> Self {
         Self {
             state: StdMutex::new(SettingsState {

@@ -64,7 +64,7 @@ pub struct ApiService {
 
 impl ApiService {
     pub fn new(backend: actions::Backend) -> Self {
-        Self::with_capture(backend, Arc::new(crate::capture::Unavailable))
+        Self::with_settings(backend, SettingsManager::isolated())
     }
 
     pub(crate) fn with_settings(backend: actions::Backend, settings: SettingsManager) -> Self {
@@ -714,7 +714,12 @@ mod tests {
     #[tokio::test]
     async fn wipe_challenges_are_owner_scoped_single_use_and_released() {
         use serde_json::json;
-        let api = ApiService::new(Arc::new(crate::fake::FakeBackend::default()));
+        let settings = crate::settings::SettingsManager::isolated();
+        // Explicit unsatisfied active intent, without reading or writing host
+        // preferences. Fresh startup now correctly defaults to paused.
+        assert!(settings.set_paused(false, false).await.is_err());
+        let api =
+            ApiService::with_settings(Arc::new(crate::fake::FakeBackend::default()), settings);
         let owner = Some(":1.1".to_owned());
         let prepared = api
             .dispatch_owned("clipboard.history.wipe.prepare", json!({}), owner.clone())

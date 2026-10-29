@@ -76,6 +76,10 @@ fn exact_bytes_dedup_promotion_and_mime_identity() {
     let promoted = s.insert("application/octet-stream", bytes).unwrap();
     assert_eq!(first.id, promoted.id);
     assert!(promoted.revision > middle.revision);
+    let token = s.revision().unwrap();
+    let repeated = s.insert("application/octet-stream", bytes).unwrap();
+    assert_eq!(repeated.revision, promoted.revision);
+    assert_eq!(s.revision().unwrap(), token);
     assert_eq!(s.get(&first.id, None).unwrap().bytes, bytes);
     assert_eq!(
         s.get(&first.id, Some(first.revision)).unwrap_err().kind,
@@ -562,8 +566,13 @@ fn uri_echo_collapse_requires_owned_matching_file_and_unhides_on_source_edit() {
     assert_eq!(echo.kind, clip_daemon::model::EntryKind::Image);
     let mut collapsed = query("", 0, 10);
     collapsed.collapse_self_echoes = true;
-    assert_eq!(s.query(collapsed.clone()).unwrap().total, 1);
-    assert_eq!(s.query(query("", 0, 10)).unwrap().total, 2);
+    let page = s.query(collapsed.clone()).unwrap();
+    assert_eq!(page.total, 1);
+    assert_eq!(page.current.as_ref().unwrap().id, source.id);
+    assert!(page.entries[0].current);
+    let expanded = s.query(query("", 0, 10)).unwrap();
+    assert_eq!(expanded.total, 2);
+    assert_eq!(expanded.current.unwrap().id, echo.id);
     s.replace(&source.id, source.revision, "text/plain", b"different")
         .unwrap();
     assert_eq!(s.query(collapsed).unwrap().total, 2);

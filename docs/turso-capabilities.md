@@ -28,8 +28,10 @@ cargo run --locked --manifest-path tools/turso-contract/Cargo.toml
 
 Features: explicitly enable `fts`, not the default global mimalloc allocator;
 use `experimental_index_method(true)` for native FTS and
-`experimental_vacuum(true)` for controlled maintenance. Syscall I/O is the
-initial backend; no claim that io_uring is faster has been established.
+`experimental_vacuum(true)` in the capability probe for controlled maintenance.
+Production shutdown uses verified TRUNCATE checkpoint and page reuse, not an
+implicit VACUUM. Syscall I/O is the initial backend; no claim that io_uring is
+faster has been established.
 
 Initial debug-build measurements on this development machine:
 
@@ -51,3 +53,6 @@ and effective policy are verified.
 There is no old-store importer, upgrade ladder, backup/export/restore mechanism
 or Ringboard fallback. Schema identity mismatches fail closed; they do not
 implicitly authorize deleting a file.
+
+Final release reruns, native desktop/package evidence, benchmarks and the scoped
+zstd security dependency patch are recorded in [stage 5 qualification](turso-qualification.md).

@@ -258,6 +258,11 @@ impl HistoryStore {
         let id = id.to_owned();
         self.call(move |db| db.get(&id, expected))
     }
+    /// Revision-only action validation never materializes a potentially large BLOB.
+    pub fn entry_revision(&self, id: &str) -> BackendResult<u64> {
+        let id = id.to_owned();
+        self.call(move |db| Ok(db.summary(&id, None)?.revision))
+    }
     pub fn revision(&self) -> BackendResult<u64> {
         self.call(|db| db.revision())
     }

@@ -1,89 +1,102 @@
 # clip-daemon
 
-Rust Wayland clipboard collector and `clip-api` facade for Shelllist. The daemon owns regular-selection capture, publication, paste targeting, and product policy. The policy-enabled Ringboard server owns persistent history, favorites, retention, and atomic mutations.
+Rust Wayland clipboard capture, embedded **Turso 0.8.3** history, and `clip-api`
+for Shelllist. One daemon owns capture, database transactions, privacy policy,
+publication, image/file actions and paste targeting. **No Ringboard server, SDK,
+policy IPC, fallback backend or Rust bootstrap exception remains.**
 
-The package ships two services: daemon and server. The external watcher is retired.
-See [ADR 0003](docs/adr-0003-daemon-wayland-capture.md), the
-[migration record](docs/capture-migration-progress.md), and
-[qualification results and remaining gates](docs/capture-qualification.md).
-Production cutover remains a deliberate, separate operation.
+This release deliberately starts a new history at
+`${XDG_DATA_HOME:-$HOME/.local/share}/clip-daemon/history/history.db`.
+Old history and favorites are not imported. Production activation is separate:
+read [installation and cutover](docs/installation.md).
 
-## Installation
+## Build and test
 
-See [`docs/installation.md`](docs/installation.md) for a standalone Nix build,
-packaged daemon/server units, first-start privacy ordering, and isolated package
-verification. Keep `daemon-framework` beside this checkout: all five daemons
-consume that current worktree, never a private framework pin or vendored copy.
+Requires Rust 1.95 and the sibling `../daemon-framework` checkout. Use the shared
+workspace build tool so local Nix inputs never become persistent revision pins:
 
-## Local Rust environment
-
-```sh
-direnv allow
-# or
+```
 ../daemon-framework/tools/local-build develop .
-just check                 # locked tests, Clippy, unused dependencies, RustSec
-just quality               # full RQLens evidence and verification
-just live-acceptance       # disposable nested desktop; never wipes normal history
-just backend-regressions   # real-server storage/concurrency/admission regressions
-just capture-acceptance    # collector privacy/recovery, edits, and 64 MiB boundary
-just benchmark-history     # synthetic release projection comparison
-just hardware-acceptance   # remaining manual hardware gates
+cargo build --locked
+just check
+just storage-contract
+just backend-regressions
+just benchmark-history
+just live-acceptance
 ```
 
-The tested minimum toolchain is Rust **1.95.0**, pinned in `rust-toolchain.toml` and supplied by the development flake. The SDK/core are locked to **0.16.2** to match the reviewed Ringboard protocol. Safe history mutations require the patched `.#ringboard` package (included in the development shell); stock servers are detected before mutation and rejected without changing history. See `packaging/ringboard-policy/README.md` for the negotiated extension and its limits. These upstream crates still require `core_io_borrowed_buf`; the Nix environment scopes `RUSTC_BOOTSTRAP` to `clipboard_history_core,clipboard_history_client_sdk`, not the daemon or all dependencies. Outside Nix, use the same scoped environment when building on 1.95.0. This is an explicit upstream compatibility exception, not a claim of an exception-free stable dependency graph.
+The implementation and new acceptance/benchmark tools are Rust. Shelllist remains
+QML; clipboard search, filtering, pagination, retention and policy stay in Rust/SQL.
+The native acceptance harness creates a private HOME, bus, database and nested
+compositor; it never changes production services or opens normal clipboard history.
+`just package-acceptance /nix/store/...-clip-daemon` additionally checks installed
+single-service wiring and D-Bus activation.
 
-The default live suite has 15 checks. Supplying the real Shelllist package paths
-adds two layer-shell paste checks (17 total); see
-[`docs/qualification-results.md`](docs/qualification-results.md). Physical
-keyboard/login qualification remains a separate manual gate.
+`just check` includes formatting, strict Clippy, tests, unused dependencies and
+RustSec. Advisory refresh requires network access. Native desktop checks require
+Hyprland, D-Bus, wl-clipboard and the development shell. A nested test is not a
+physical-device power-loss or real-login test.
 
-`just check` requires network access to refresh RustSec advisories (or an already usable local database). The known unmaintained transitive `paste` advisory is reported, not suppressed. Do not blindly update Ringboard's broad internal core range to 0.17; it is protocol/API-incompatible. See `docs/follow-up-validation.md` for gate results and `docs/history-benchmark.md` for benchmark scope and results.
+## Storage and privacy
 
-## Commands
+- One exclusively locked storage-owner thread, 32 queued commands and a 128 MiB
+  admitted-input budget. Reads select bounded metadata pages, not full payload catalogs.
+- STRICT tables, foreign keys, indexed lookup/order, exact-byte deduplication,
+  revision predicates and atomic retention/edit/favorite/delete/wipe transactions.
+- FULL synchronous commits; acknowledgements follow COMMIT. Ambiguous commits or
+  rollback failures fence storage. Shutdown drains accepted work and verifies a
+  WAL checkpoint before releasing ownership.
+- Default retention: 1,000 regular entries, 100 favorites, 16 MiB per entry,
+  256 MiB total payload. Hard per-entry ceiling: 64 MiB, including capture and
+  settings. Byte pressure can evict favorites after regular entries.
+- Fresh/missing preferences default to **paused**. Invalid preferences fail closed.
+  Explicitly resume capture through Shelllist. Existing valid pause/private intent
+  is respected; no native Ringboard settings are adopted.
+- Pause/private acknowledgement fences in-flight submissions. Resume skips the
+  existing selection, so private-interval content is not replayed. Explicit copy,
+  publication and edits remain independent of automatic capture.
+- Sensitive publication advertises exclusion markers and never writes history.
+  Capture rejects entire sensitive offers, including markers after MIME overflow.
 
-```sh
-clip-daemon configure-engine # before starting Ringboard; validate/apply native configuration
+Unknown schemas, foreign files, unsafe paths and corruption fail closed. There is
+no automatic destructive reset, schema upgrader, import/export/restore or lossless
+rollback path. Newly committed history must still survive ordinary restarts.
+
+## Search and API
+
+Search is a **Unicode-lowercased literal substring**, not fuzzy matching or a query
+language. SQL verifies matches against separate full-text content; native FTS
+trigrams narrow eligible candidates. Short/punctuation-only queries and oversized
+unindexed text fall back to SQL verification, not application-side payload scans.
+Ordering is recency-based. Quotes, wildcards and punctuation are literal input.
+There is no accent stripping or canonical Unicode normalization.
+
+`clipboard.history.query` accepts `cursor_mode: true` for authenticated,
+owner/query/generation/revision-bound cursors (120-second expiry), or offsets for
+simple queries. Pages contain at most 200 entries and queries at most 4096 bytes.
+Mutations invalidate outstanding cursors. The old `fuzzy` flag and 5,000-row
+application-ranking cap are removed; rebuild Shelllist with this daemon.
+
+Useful commands:
+
+```
 clip-daemon daemon
-clip-daemon client
-clip-daemon publish --mime image/png < image.png
-clip-daemon probe-ringboard
+clip-daemon store-status
 clip-daemon debug protocol-registry
-clip-daemon debug contract-fixture
-nix run .#qualify
+clip-daemon client
 ```
 
-`client` accepts JSONL calls such as:
+The checked API registry is `test_support/clip-api-v1.json`. Publication preserves
+exact bytes and useful text aliases. Supported actions include copy/paste,
+file copy/cut, thumbnails, favorites, bulk delete, inline edits, screenshots,
+annotation cancellation, image-as-file, safe URL/file opening and confirmed wipe.
+A committed edit with failed external publication is reported as partial success.
 
-```json
-{"op":"call","id":"q1","method":"clipboard.history.query","params":{"query":"","generation":1,"limit":100}}
-```
+Generated artifact ownership/references live in SQL. Cleanup checks the private
+root, inode, device and owner before unlinking; arbitrary clipboard URI targets
+are never cleanup candidates. Old JSON artifact records are not imported.
 
-The daemon supports bounded history queries with complete-text search (Unicode lowercase matching, queries up to 4096 bytes), semantic details, private image thumbnails, exact-MIME restoration through Ringboard, opaque entry IDs, structured errors, D-Bus/JSONL transport, and the checked `clip-api` v1 registry. History metadata is polled only while a frontend subscription exists. `clipboard.settings.get` separates desired/effective capture and retention state; unverified privacy is never asserted. Existing native retention counts are adopted on first use, while a fresh setup receives the documented defaults.
-
-Phase 3 adds copy and compositor-aware paste sessions, terminal/GUI shortcuts after the picker is hidden, image-as-file materialization, external image annotation with validated PNG return, and two-phase history wipe. Phase 4 adds delete, favorite/current pinning, pause/private mode, native Ringboard retention settings, cancellation, and cache cleanup. Phase 5 adds bounded inline editing, explicit validated URL/file launch actions, a daemon-enforced type/action matrix, and position-preserving text/image replacement. Generated files use collision-safe names, private permissions, and a persistent ownership registry; unreferenced daemon-owned files are pruned without touching unrelated files. Equivalent Ringboard echoes of generated file URIs and completed annotations are collapsed by default in the API projection and can be retained with the `collapse_self_echoes` setting. Raw clipboard images and single safe local image-file entries use the same `ResolvedContent` policy: MIME aliases, summaries, details, thumbnails, normal image publication, and file-URI publication all resolve through one abstraction. `clip-daemon` captures and publishes Wayland selections independently; pausing automatic capture does not disable explicit publication or edits. Resuming discards the current-selection bootstrap snapshot, so content copied during a private interval is not replayed. Copy again to capture it.
-
-`publish` reads bounded content from stdin and sends it over D-Bus to the running daemon. The daemon enforces the configured entry-size limit, validates the MIME type, and remains the Wayland selection owner. Valid UTF-8 plain text retains its exact offer and also exposes standard text aliases for GTK and other desktop consumers; binary/image/file-list offers do not gain text aliases. This supports short-lived producers without `wl-copy`; for example, standalone Satty can use `copy-command = "clip-daemon publish --mime image/png"`.
-
-The default image-editor adapter uses Satty. The Nix package and development shell use a patched Satty (`.#imageEditor`) with toolbars above and below the canvas rather than overlaid on the image, so fit-to-window keeps the entire image visible. This changes only the editor layout, not the saved image dimensions. The annotation pipeline itself is editor-neutral: an editor receives private `{input}` and `{output}` paths, blocks until it finishes, and either writes a PNG to `{output}` or leaves it absent to cancel. A different editor can be selected with a shell-free JSON argv template:
-
-```sh
-export CLIP_DAEMON_IMAGE_EDITOR_COMMAND='["image-tool","--input","{input}","--output","{output}"]'
-```
-
-Both placeholders must be separate arguments. The custom editor must not publish the Wayland clipboard itself; `clip-daemon` validates and publishes the returned image.
-
-## Yazi copied files
-
-Yazi keeps its normal file yank state internally. The bundled `yank-to-clip-daemon.yazi` plugin mirrors each non-empty yank to `clipboard.selection.publishFiles`, preserving copy/cut mode and multi-file selections. The daemon validates up to 100 absolute local paths, encodes them as file URIs, and publishes both `x-special/gnome-copied-files` and `text/uri-list` in one Wayland selection. No `wl-copy` process or additional runtime dependency is required.
-
-When packaged, the plugin is available at `$out/share/yazi/plugins/yank-to-clip-daemon.yazi`. Configure it through Yazi or Home Manager and call its `setup` function. Empty unyank events intentionally leave the current system clipboard unchanged.
-
-See [`docs/phase4-safety.md`](docs/phase4-safety.md) for enforced privacy behavior and explicit Ringboard/Wayland limitations, and [`docs/phase5-actions.md`](docs/phase5-actions.md) for intelligent-action policy.
-
-Run the local quality review with:
-
-```sh
-../daemon-framework/tools/local-build develop . --command ../rust-quality-lens/target/debug/rqlens measure all --config rqlens.toml
-```
-
-See [`docs/adr-0001-ringboard-facade.md`](docs/adr-0001-ringboard-facade.md), [`docs/adr-0002-wayland-selection-ownership.md`](docs/adr-0002-wayland-selection-ownership.md), and [`docs/quality-review.md`](docs/quality-review.md).
+See [engine evidence](docs/turso-capabilities.md),
+[architecture](docs/adr-0004-turso-history.md), and
+[qualification](docs/turso-qualification.md). Earlier Ringboard-era documents are
+historical records, not current installation or release instructions.

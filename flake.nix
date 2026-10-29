@@ -23,12 +23,19 @@
             src = pkgs.lib.fileset.toSource {
               root = ./.;
               fileset = pkgs.lib.fileset.unions [
-                ./Cargo.toml ./Cargo.lock ./src ./tests ./test_support ./examples
-                ./packaging/systemd ./packaging/dbus
+                ./Cargo.toml ./Cargo.lock ./flake.nix ./src ./tests ./test_support ./examples
+                ./packaging/systemd ./packaging/dbus ./vendor/tantivy-sstable
               ];
             };
             postUnpack = ''
               cp -R --no-preserve=mode ${daemonFramework.lib.daemonSource pkgs} "$(dirname "$sourceRoot")/daemon-framework"
+            '';
+            # Crane's dependency skeleton replaces path crates with empty libs.
+            # This patched third-party crate is consumed by registry dependencies,
+            # so its real public API is needed in the dependency build as well.
+            postPatch = ''
+              rm -rf vendor/tantivy-sstable
+              cp -R --no-preserve=mode ${./vendor/tantivy-sstable} vendor/tantivy-sstable
             '';
             cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = [ pkgs.makeWrapper pkgs.pkg-config pkgs.clang ];
@@ -36,8 +43,9 @@
             nativeCheckInputs = [ pkgs.dbus ];
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             strictDeps = true;
-            # Live desktop probes require an explicit isolated compositor; default
-            # Rust tests include storage, private-bus and package-source contracts.
+            # Include private large-frame tests; the native Quickshell probe is
+            # excluded by its non-default feature and runs separately.
+            checkFlags = [ "--include-ignored" "--test-threads=1" ];
             postInstall = ''
               install -Dm644 ${./packaging/systemd/clip-daemon.service} \
                 $out/share/systemd/user/clip-daemon.service
