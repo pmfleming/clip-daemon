@@ -1,12 +1,9 @@
-use clipboard_history_client_sdk::watcher_utils::best_target::BestMimeTypeFinder;
-use clipboard_history_core::protocol::MimeType;
-
 pub(super) const MAX_OFFERS: usize = 64;
 pub(super) const MAX_SEATS: usize = 16;
 
 #[derive(Default)]
 pub(super) struct OfferedMimes {
-    finder: BestMimeTypeFinder<String>,
+    choices: [Option<String>; 6],
     count: usize,
     bytes: usize,
     rejected: bool,
@@ -34,9 +31,26 @@ impl OfferedMimes {
             self.rejected = true;
             return;
         }
-        match MimeType::from(&value) {
-            Ok(mime) => self.finder.add_mime(&mime, value),
-            Err(_) => self.rejected = true,
+        // Preserve the established preference/fallback contract without an SDK.
+        let essence = value.split(';').next().unwrap_or(&value);
+        let rank = match essence {
+            "text/plain" | "UTF8_STRING" | "STRING" | "TEXT" => 0,
+            value if value.starts_with("image/") => 1,
+            value if value.starts_with("x-special/") => 2,
+            "application/x-gnome-copied-files" => 2,
+            "chromium/x-web-custom-data" => 3,
+            value if value.starts_with("chromium/x-internal") => return,
+            value if value.starts_with("text/") => 4,
+            value if value.contains('/') && value.starts_with(|c: char| c.is_ascii_lowercase()) => {
+                5
+            }
+            _ => return,
+        };
+        let replace = self.choices[rank]
+            .as_ref()
+            .is_none_or(|previous| previous.contains(';') && !value.contains(';'));
+        if replace {
+            self.choices[rank] = Some(value);
         }
     }
 
@@ -44,7 +58,7 @@ impl OfferedMimes {
         if self.rejected {
             None
         } else {
-            self.finder.pop_best()
+            self.choices.iter_mut().find_map(Option::take)
         }
     }
 }
@@ -74,6 +88,31 @@ mod tests {
             mimes.add(bad);
             assert!(mimes.next().is_none());
         }
+    }
+
+    #[test]
+    fn representation_groups_preserve_priority_and_prefer_parameterless() {
+        let mut mimes = OfferedMimes::default();
+        for mime in [
+            "text/html;charset=utf-8",
+            "text/uri-list",
+            "image/png;profile=sRGB",
+            "image/jpeg",
+            "text/plain",
+            "x-special/gnome-copied-files",
+            "chromium/x-internal-other",
+        ] {
+            mimes.add(mime.into());
+        }
+        assert_eq!(
+            std::iter::from_fn(|| mimes.next()).collect::<Vec<_>>(),
+            [
+                "text/plain",
+                "image/jpeg",
+                "x-special/gnome-copied-files",
+                "text/uri-list"
+            ]
+        );
     }
 
     #[test]

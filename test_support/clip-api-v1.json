@@ -8,6 +8,7 @@
     "unknown": "missing, expired, foreign or lost-before-ack identities never imply success"
   },
   "history_example": {
+    "total": 1,
     "revision": 1,
     "generation": 0,
     "current": null,
@@ -51,7 +52,7 @@
         "name": "clipboard.history.query",
         "params_example": {
           "generation": 1,
-          "fuzzy": true,
+          "cursor_mode": true,
           "cursor": null,
           "limit": 100,
           "query": ""
@@ -64,8 +65,8 @@
           "stale_error": "stale-cursor",
           "expires_seconds": 120,
           "max_page_entries": 200,
-          "max_search_entries": 5000,
-          "legacy_offset_mode": "fuzzy=false"
+          "search_engine": "turso-fts",
+          "offset_mode": "cursor_mode=false"
         },
         "response_key": "history",
         "stream": "clipboard.history.changed"
@@ -210,7 +211,7 @@
         "name": "clipboard.settings.update",
         "params_example": {
           "collapse_self_echoes": true,
-          "max_entries": 750,
+          "max_entries": 1000,
           "max_entry_bytes": 16777216
         },
         "response_key": "settings",

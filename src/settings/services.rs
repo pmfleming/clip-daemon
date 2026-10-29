@@ -1,38 +1,52 @@
-use std::time::Duration;
-
+//! Direct policy access to the embedded store; no external service control.
 use async_trait::async_trait;
-use tokio::process::Command;
 
-/// Engine lifecycle only. Capture is controlled and verified in-process.
+use crate::history_store::{HistoryStore, StorePolicy};
+
 #[async_trait]
-pub(super) trait ServiceControl: Send + Sync {
-    async fn control(&self, action: &str, units: &[&str]) -> Result<(), String>;
-    async fn limits(&self) -> Result<crate::ringboard::ipc::EngineLimits, String> {
-        tokio::task::spawn_blocking(crate::ringboard::ipc::limits)
-            .await
-            .map_err(|_| "Engine status task failed".to_owned())?
-            .map_err(|error| error.to_string())
+pub(super) trait PolicyControl: Send + Sync {
+    async fn policy(&self) -> Result<StorePolicy, String>;
+    async fn apply(&self, policy: StorePolicy) -> Result<(), String>;
+    async fn close(&self) -> Result<(), String> {
+        let mut policy = self.policy().await?;
+        policy.admission = false;
+        self.apply(policy).await
     }
 }
 
-pub(super) struct Systemd;
+#[async_trait]
+impl PolicyControl for HistoryStore {
+    async fn policy(&self) -> Result<StorePolicy, String> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.policy().map_err(|error| error.to_string()))
+            .await
+            .map_err(|_| "Store policy task failed".to_owned())?
+    }
+
+    async fn apply(&self, policy: StorePolicy) -> Result<(), String> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            store
+                .apply_policy(policy)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|_| "Store policy task failed".to_owned())?
+    }
+}
+
+pub(super) struct Unavailable;
 
 #[async_trait]
-impl ServiceControl for Systemd {
-    async fn control(&self, action: &str, units: &[&str]) -> Result<(), String> {
-        let mut command = Command::new("systemctl");
-        command
-            .arg("--user")
-            .arg(action)
-            .args(units)
-            .kill_on_drop(true);
-        tokio::time::timeout(Duration::from_secs(15), command.output())
-            .await
-            .map_err(|_| "Ringboard service control timed out")?
-            .map_err(|_| "Could not control Ringboard server")?
-            .status
-            .success()
-            .then_some(())
-            .ok_or_else(|| "Ringboard service rejected the request".into())
+impl PolicyControl for Unavailable {
+    async fn policy(&self) -> Result<StorePolicy, String> {
+        Err("History store is unavailable".into())
+    }
+    async fn apply(&self, _: StorePolicy) -> Result<(), String> {
+        Err("History store is unavailable".into())
+    }
+    async fn close(&self) -> Result<(), String> {
+        // API-only fixtures have no attached store to admit writes.
+        Ok(())
     }
 }

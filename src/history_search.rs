@@ -1,6 +1,6 @@
 //! Bounded native catalog search with authenticated, revision-bound cursors.
 //! Cursors retain no server-side rows or leases: a changed store invalidates them.
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant};
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -11,10 +11,9 @@ use uuid::Uuid;
 
 use crate::{
     actions::{ApiError, Backend},
-    model::{EntrySummary, HistoryQuery, paginate},
+    model::{HistoryPage, HistoryQuery},
 };
 
-const MAX_ENTRIES: usize = 5000;
 const CURSOR_SECONDS: u64 = 120;
 
 pub(crate) struct HistorySearch {
@@ -62,12 +61,6 @@ impl<'a> CursorScope<'a> {
     }
 }
 
-struct Catalog {
-    entries: Vec<EntrySummary>,
-    current: Option<EntrySummary>,
-    limited: bool,
-}
-
 impl Cursor {
     fn check(&self, token: u64) -> Result<(), ApiError> {
         (self.token == token).then_some(()).ok_or_else(stale)
@@ -98,7 +91,7 @@ impl HistorySearch {
             .verify_slice(&hex::decode(tag).map_err(|_| stale())?)
             .map_err(|_| stale())?;
         let cursor: Cursor = serde_json::from_str(body).map_err(|_| stale())?;
-        if cursor.expires <= self.started.elapsed().as_secs() || cursor.offset >= MAX_ENTRIES {
+        if cursor.expires <= self.started.elapsed().as_secs() {
             return Err(stale());
         }
         Ok(cursor)
@@ -115,12 +108,7 @@ impl HistorySearch {
         owner: Option<&str>,
         collapse: bool,
     ) -> Result<Value, ApiError> {
-        if params.query.chars().count() > 256 {
-            return Err(ApiError::validation(
-                "Fuzzy search query exceeds 256 characters",
-            ));
-        }
-        let permit = self
+        let _permit = self
             .admission
             .clone()
             .try_acquire_owned()
@@ -135,23 +123,24 @@ impl HistorySearch {
             },
         };
         cursor.check(token)?;
-        let mut catalog = catalog(backend, params.generation, collapse).await?;
+        let page = backend
+            .query(HistoryQuery {
+                query: params.query.clone(),
+                generation: params.generation,
+                offset: cursor.offset,
+                limit: params.limit,
+                collapse_self_echoes: collapse,
+            })
+            .await?;
+        // The query engine selects only this page; no full-catalog reconstruction
+        // or frontend-specific Rust ranking can bypass database search/limits.
         cursor.check(backend.change_token().await?)?;
-        let (catalog, params) = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            catalog.entries = rank_entries(catalog.entries, &params.query);
-            (catalog, params)
-        })
-        .await
-        .map_err(search_failed)?;
-        // Never return a stale page after expensive ranking, either.
-        cursor.check(backend.change_token().await?)?;
-        self.page(catalog, cursor, params, owner, collapse)
+        self.page(page, cursor, params, owner, collapse)
     }
 
     fn page(
         &self,
-        catalog: Catalog,
+        page: HistoryPage,
         cursor: Cursor,
         params: crate::actions::QueryParams,
         owner: Option<&str>,
@@ -159,9 +148,8 @@ impl HistorySearch {
     ) -> Result<Value, ApiError> {
         let offset = cursor.offset;
         let token = cursor.token;
-        let (page, total) = paginate(catalog.entries.into_iter(), offset, params.limit);
-        let consumed = offset + page.len();
-        let has_more = consumed < total;
+        let consumed = offset.saturating_add(page.entries.len());
+        let has_more = page.has_more;
         let next = has_more
             .then(|| {
                 self.encode(
@@ -176,8 +164,8 @@ impl HistorySearch {
             .transpose()?;
         Ok(
             json!({ "history": { "revision": token, "snapshot_revision": token.to_string(), "generation": params.generation,
-            "current": catalog.current, "entries": page, "has_more": has_more, "next_cursor": next,
-            "total": total, "search_limited": catalog.limited, "offset": offset } }),
+            "current": page.current, "entries": page.entries, "has_more": has_more, "next_cursor": next,
+            "total": page.total, "search_limited": false, "offset": offset } }),
         )
     }
 }
@@ -188,74 +176,8 @@ fn stale() -> ApiError {
     )
 }
 
-async fn catalog(backend: &Backend, generation: u64, collapse: bool) -> Result<Catalog, ApiError> {
-    let mut entries = Vec::new();
-    let mut current = None;
-    loop {
-        let page = backend
-            .query(HistoryQuery {
-                query: String::new(),
-                generation,
-                offset: entries.len(),
-                limit: 200,
-                collapse_self_echoes: collapse,
-            })
-            .await?;
-        current = current.or(page.current);
-        if page.has_more && page.entries.is_empty() {
-            return Err(stale());
-        }
-        entries.extend(page.entries);
-        if !page.has_more || entries.len() >= MAX_ENTRIES {
-            return Ok(Catalog {
-                entries,
-                current,
-                limited: page.has_more,
-            });
-        }
-    }
-}
-
 fn search_failed(_: impl std::fmt::Display) -> ApiError {
     ApiError::new("search-failed", "Clipboard search failed")
-}
-
-fn rank_entries(entries: Vec<EntrySummary>, query: &str) -> Vec<EntrySummary> {
-    // Blank queries rank solely by the distinct recency scores: keep the catalog as-is.
-    if query.trim().is_empty() {
-        return entries;
-    }
-    let count = entries.len();
-    let items = entries
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            let label = entry.kind.label();
-            let title = if entry.preview.is_empty() {
-                format!("{label} clipboard entry")
-            } else {
-                entry.preview.clone()
-            };
-            shelllist_search::SearchItem {
-                key: entry.id.clone(),
-                title,
-                subtitle: format!("{label} · {} · {} bytes", entry.mime, entry.byte_size),
-                // The matcher always gives title matches a higher weight than keywords.
-                keywords: vec![entry.mime.clone(), label.to_ascii_lowercase()],
-                score: (count - index) as f64,
-                provider_priority: 100.0,
-            }
-        })
-        .collect::<Vec<_>>();
-    let keys = shelllist_search::rank(String::new(), 0, query, &items).keys;
-    let mut by_id: HashMap<_, _> = items
-        .into_iter()
-        .zip(entries)
-        .map(|(item, entry)| (item.key, entry))
-        .collect();
-    keys.into_iter()
-        .filter_map(|key| by_id.remove(&key))
-        .collect()
 }
 
 #[cfg(test)]

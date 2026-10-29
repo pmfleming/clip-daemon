@@ -90,11 +90,15 @@ impl ApiService {
 
     pub(crate) async fn initialize(&self) {
         if let Err(error) = self.settings.initialize_retention().await {
-            tracing::warn!(%error, "Saved retention is not verified against the running engine");
+            tracing::warn!(%error, "Saved retention is not verified against the history store");
         }
         if let Err(error) = self.settings.reconcile_capture().await {
             tracing::warn!(%error, "Capture preference could not be verified; privacy is not asserted");
         }
+    }
+
+    pub(crate) async fn stop_capture(&self) -> Result<(), String> {
+        self.settings.stop_capture().await
     }
 
     pub(crate) async fn history_observation(&self) -> Result<Value, EnvelopeError> {
@@ -703,7 +707,7 @@ pub fn error(code: &str, message: String) -> Value {
 #[cfg(test)]
 mod tests {
     use super::ApiService;
-    use crate::{backend::ClipboardBackend, ringboard::RingboardBackend};
+    use crate::{backend::ClipboardBackend, history::HistoryBackend};
     use std::{sync::Arc, time::Duration};
     use tokio::sync::oneshot;
 
@@ -782,7 +786,7 @@ mod tests {
 
     #[tokio::test]
     async fn asynchronous_receipts_and_release_are_owned_even_after_early_completion() {
-        let backend = Arc::new(RingboardBackend::default());
+        let backend = Arc::new(HistoryBackend::default());
         let api = Arc::new(ApiService::new(backend.clone()));
         let mut receipts = api.lifecycle_events();
         let raw = api.operation_events();
@@ -830,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn ownership_tracks_live_jobs_without_relying_on_event_delivery() {
-        let backend = Arc::new(RingboardBackend::default());
+        let backend = Arc::new(HistoryBackend::default());
         let api = ApiService::new(backend.clone());
         for early in [false, true] {
             for success in [false, true] {

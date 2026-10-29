@@ -424,6 +424,27 @@ fn multi_megabyte_payload_is_exact_and_searchable_beyond_preview() {
 }
 
 #[test]
+fn maximum_supported_payload_round_trips_and_one_byte_over_is_rejected() {
+    let (_dir, s) = store();
+    s.apply_policy(StorePolicy {
+        admission: true,
+        max_entry_bytes: MAX_ENTRY_BYTES,
+        max_total_bytes: MAX_ENTRY_BYTES,
+        ..StorePolicy::default()
+    })
+    .unwrap();
+    let mut bytes = vec![0xff; MAX_ENTRY_BYTES as usize];
+    bytes[0] = 0;
+    bytes[MAX_ENTRY_BYTES as usize - 1] = 42;
+    let entry = s.insert("application/octet-stream", &bytes).unwrap();
+    assert_eq!(s.get(&entry.id, Some(entry.revision)).unwrap().bytes, bytes);
+    bytes.push(1);
+    let revision = s.revision().unwrap();
+    assert!(s.insert("application/octet-stream", &bytes).is_err());
+    assert_eq!(s.revision().unwrap(), revision);
+}
+
+#[test]
 fn committed_wal_process_helper() {
     let Some(path) = std::env::var_os("CLIP_STORAGE_CRASH_HELPER_PATH") else {
         return;
@@ -495,7 +516,7 @@ fn literal_search_uses_native_trigram_candidates_without_token_semantic_changes(
         )
         .unwrap();
     s.insert("text/plain", b"need les unrelated").unwrap();
-    for text in ["needle", "eed", "café", "straße", "αλφα", "汉字搜", "!@#"] {
+    for text in ["needle", "edl", "café", "straße", "αλφα", "汉字搜", "!@#"] {
         let page = s.query(query(text, 0, 10)).unwrap();
         assert_eq!(page.total, 1, "{text}");
         assert_eq!(page.entries[0].id, a.id);

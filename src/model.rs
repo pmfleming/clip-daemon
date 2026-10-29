@@ -71,6 +71,8 @@ pub(crate) fn paginate<T>(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryPage {
+    /// SQL count in the same owner-serialized snapshot as this page.
+    pub total: usize,
     pub revision: u64,
     pub generation: u64,
     pub current: Option<EntrySummary>,

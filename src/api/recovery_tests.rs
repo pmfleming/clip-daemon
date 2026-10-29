@@ -2,12 +2,12 @@ use super::*;
 use crate::{
     backend::{BackendMutation, ClipboardBackend},
     fake::{DetailsGate, FakeBackend},
-    ringboard::RingboardBackend,
+    history::HistoryBackend,
 };
 
 #[tokio::test]
 async fn quiet_terminal_loss_recovers_by_owned_read_without_restarting_work() {
-    let backend = Arc::new(RingboardBackend::default());
+    let backend = Arc::new(HistoryBackend::default());
     let api = ApiService::new(backend.clone());
     let (finish, finished) = tokio::sync::oneshot::channel();
     let operation = backend.test_operation(finished).unwrap();

@@ -12,7 +12,7 @@ use super::content::{MAX_THUMBNAIL_BYTES, valid_edited_image};
 use super::operation::{
     OperationCompletion, OperationControl, private_file, runtime_directory, unique_path,
 };
-use super::{RingboardBackend, run_blocking};
+use super::{HistoryBackend, run_blocking};
 use crate::{
     backend::{
         BackendResult, InteractiveScreenshot, ScreenshotMode, ScreenshotRegion, operation_error,
@@ -28,7 +28,7 @@ impl Drop for StagedCapture {
     }
 }
 
-impl RingboardBackend {
+impl HistoryBackend {
     pub(super) async fn capture_region(
         &self,
         region: ScreenshotRegion,
@@ -67,7 +67,7 @@ impl RingboardBackend {
     }
 }
 
-fn publish_capture(backend: &RingboardBackend, path: &Path, max_bytes: u64) -> BackendResult<()> {
+fn publish_capture(backend: &HistoryBackend, path: &Path, max_bytes: u64) -> BackendResult<()> {
     if !valid_edited_image(path, max_bytes) {
         return Err(operation_error("Screenshot is not a valid bounded PNG"));
     }
@@ -99,7 +99,7 @@ async fn capture_command(command: &mut Command, timeout: Duration) -> BackendRes
 }
 
 pub(super) fn launch(
-    backend: &RingboardBackend,
+    backend: &HistoryBackend,
     request: InteractiveScreenshot,
     max_bytes: u64,
 ) -> BackendResult<OperationResult> {
@@ -134,7 +134,7 @@ async fn notify(event: OperationResult) {
 }
 
 async fn capture(
-    backend: &RingboardBackend,
+    backend: &HistoryBackend,
     request: InteractiveScreenshot,
     input: &Path,
     output: &Path,
@@ -186,7 +186,7 @@ async fn grab(mode: ScreenshotMode, input: &Path) -> BackendResult<bool> {
 }
 
 async fn edit_capture(
-    backend: &RingboardBackend,
+    backend: &HistoryBackend,
     input: &Path,
     output: &Path,
     max_bytes: u64,

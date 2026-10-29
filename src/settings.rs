@@ -1,23 +1,43 @@
 use std::{
     fs, io,
-    num::NonZeroU32,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex, MutexGuard},
+    sync::{
+        Arc, Mutex as StdMutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
-use clipboard_history_client_sdk::config;
-use clipboard_history_core::dirs::data_dir;
 use serde::{Deserialize, Serialize};
-use shelllist_daemon_core::{AtomicFilePolicy, StagedFile, XdgRoot, resolve_xdg_path, sync_parent};
-use tokio::{
-    sync::Mutex as AsyncMutex,
-    task::spawn_blocking,
-    time::{Duration, sleep},
-};
+use shelllist_daemon_core::{AtomicFilePolicy, XdgRoot, resolve_xdg_path};
+use tokio::{sync::Mutex as AsyncMutex, task::spawn_blocking};
 
 mod services;
-use crate::capture::CaptureControl;
-use services::{ServiceControl, Systemd};
+use crate::{
+    capture::CaptureControl,
+    history_store::{HistoryStore, StorePolicy},
+};
+use services::PolicyControl;
+
+const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
+
+#[derive(Debug, Serialize)]
+pub(crate) struct RetentionLimits {
+    max_entries: u32,
+    max_favorites: u32,
+    max_entry_bytes: u64,
+    max_total_bytes: u64,
+}
+
+impl From<StorePolicy> for RetentionLimits {
+    fn from(policy: StorePolicy) -> Self {
+        Self {
+            max_entries: policy.max_entries,
+            max_favorites: policy.max_favorites,
+            max_entry_bytes: policy.max_entry_bytes,
+            max_total_bytes: policy.max_total_bytes,
+        }
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub struct CaptureState {
@@ -33,7 +53,9 @@ pub struct CaptureState {
 pub(crate) struct RetentionState {
     pub desired_max_entries: u32,
     pub desired_max_favorites: u32,
-    pub effective: Option<crate::ringboard::ipc::EngineLimits>,
+    pub desired_max_entry_bytes: u64,
+    pub desired_max_total_bytes: u64,
+    pub effective: Option<RetentionLimits>,
     pub synchronized: bool,
     pub error: Option<String>,
 }
@@ -52,10 +74,10 @@ pub struct ClipboardSettings {
 impl Default for ClipboardSettings {
     fn default() -> Self {
         Self {
-            max_entries: 750,
+            max_entries: 1000,
             max_favorites: 100,
             max_entry_bytes: 16 * 1024 * 1024,
-            capture_paused: false,
+            capture_paused: true,
             private_mode: false,
             collapse_self_echoes: true,
         }
@@ -73,12 +95,12 @@ pub struct SettingsUpdate {
 impl SettingsUpdate {
     fn apply(self, value: &ClipboardSettings) -> Result<ClipboardSettings, String> {
         Ok(ClipboardSettings {
-            max_entries: validated_update(self.max_entries, value.max_entries, 1..=131_070)?,
-            max_favorites: validated_update(self.max_favorites, value.max_favorites, 1..=1_022)?,
+            max_entries: validated_update(self.max_entries, value.max_entries, 1..=100_000)?,
+            max_favorites: validated_update(self.max_favorites, value.max_favorites, 1..=10_000)?,
             max_entry_bytes: validated_update(
                 self.max_entry_bytes,
                 value.max_entry_bytes,
-                64 * 1024..=512 * 1024 * 1024,
+                64 * 1024..=64 * 1024 * 1024,
             )?,
             collapse_self_echoes: self
                 .collapse_self_echoes
@@ -92,7 +114,8 @@ pub struct SettingsManager {
     state: StdMutex<SettingsState>,
     path: Option<PathBuf>,
     transaction: AsyncMutex<()>,
-    services: Arc<dyn ServiceControl>,
+    stopping: AtomicBool,
+    policy: Arc<dyn PolicyControl>,
     capture: Arc<dyn CaptureControl>,
 }
 
@@ -119,7 +142,8 @@ impl Default for SettingsManager {
             }),
             path,
             transaction: AsyncMutex::new(()),
-            services: Arc::new(Systemd),
+            stopping: AtomicBool::new(false),
+            policy: Arc::new(services::Unavailable),
             capture: Arc::new(crate::capture::Unavailable),
         }
     }
@@ -147,16 +171,6 @@ const CAPTURE_SAVED: &str = "Capture preference was saved";
 impl SettingsManager {
     #[cfg(test)]
     pub(crate) fn isolated() -> Self {
-        struct NoServices;
-        #[async_trait::async_trait]
-        impl ServiceControl for NoServices {
-            async fn control(&self, _: &str, _: &[&str]) -> Result<(), String> {
-                Err("Private fixture has no services".into())
-            }
-            async fn limits(&self) -> Result<crate::ringboard::ipc::EngineLimits, String> {
-                Err("Private fixture has no engine".into())
-            }
-        }
         Self {
             state: StdMutex::new(SettingsState {
                 value: ClipboardSettings::default(),
@@ -166,7 +180,8 @@ impl SettingsManager {
             }),
             path: None,
             transaction: AsyncMutex::new(()),
-            services: Arc::new(NoServices),
+            stopping: AtomicBool::new(false),
+            policy: Arc::new(services::Unavailable),
             capture: Arc::new(crate::capture::Unavailable),
         }
     }
@@ -178,7 +193,15 @@ impl SettingsManager {
         }
     }
 
-    /// Legacy booleans never assert privacy unless service state is verified.
+    pub(crate) fn with_store(capture: Arc<dyn CaptureControl>, store: HistoryStore) -> Self {
+        Self {
+            capture,
+            policy: Arc::new(store),
+            ..Self::default()
+        }
+    }
+
+    /// Legacy booleans never assert privacy unless capture state is verified.
     pub fn get(&self) -> Result<ClipboardSettings, String> {
         let state = self.validated_state()?;
         let mut settings = state.value;
@@ -198,6 +221,9 @@ impl SettingsManager {
     }
 
     fn validated_state(&self) -> Result<MutexGuard<'_, SettingsState>, String> {
+        if self.stopping.load(Ordering::Acquire) {
+            return Err("Clipboard service is shutting down".into());
+        }
         let state = self.lock_state("Clipboard settings are unavailable")?;
         if let Some(error) = &state.load_error {
             return Err(error.clone());
@@ -213,12 +239,10 @@ impl SettingsManager {
             self.quiesce_locked().await?;
         }
         if updated != current {
-            updated = self
-                .save(updated, persist_config_pair, SETTINGS_SAVED)
-                .await?;
+            updated = self.save(updated, persist, SETTINGS_SAVED).await?;
         }
-        // Compare effective engine state even on a no-op retry after a failed
-        // restart. Saved preferences alone are not evidence of applied limits.
+        // A saved preference is not evidence of applied SQL policy. Retry even
+        // when the requested value is unchanged after a previous failure.
         self.apply_retention(&updated)
             .await
             .map_err(|error| format!("{SETTINGS_SAVED}, but {error}"))?;
@@ -228,36 +252,32 @@ impl SettingsManager {
         self.get()
     }
 
-    /// Run before starting Ringboard (also used by the packaged service).
-    pub fn prepare_engine(&self) -> Result<(), String> {
-        persist_config_pair(self.path.as_deref(), &self.preferences()?)
-    }
-
     pub(crate) async fn initialize_retention(&self) -> Result<(), String> {
         let _transaction = self.transaction.lock().await;
-        let desired = self
-            .save(self.preferences()?, persist_config_pair, SETTINGS_SAVED)
-            .await?;
-        self.apply_retention(&desired).await
+        // Store admission starts closed. Do not pause the untouched controller:
+        // a valid active preference must retain its first-start bootstrap.
+        self.policy.apply(store_policy(&self.preferences()?)).await
     }
 
     pub(crate) async fn retention_state(&self) -> Result<RetentionState, String> {
         let desired = self.preferences()?;
-        let result = self.services.limits().await;
+        let result = self.policy.policy().await;
         Ok(RetentionState {
             desired_max_entries: desired.max_entries,
             desired_max_favorites: desired.max_favorites,
+            desired_max_entry_bytes: desired.max_entry_bytes,
+            desired_max_total_bytes: MAX_TOTAL_BYTES,
             synchronized: result
                 .as_ref()
                 .is_ok_and(|limits| limits_match(limits, &desired)),
             error: result.as_ref().err().cloned(),
-            effective: result.ok(),
+            effective: result.ok().map(Into::into),
         })
     }
 
     async fn retention_matches(&self, desired: &ClipboardSettings) -> bool {
-        self.services
-            .limits()
+        self.policy
+            .policy()
             .await
             .is_ok_and(|limits| limits_match(&limits, desired))
     }
@@ -267,24 +287,17 @@ impl SettingsManager {
             return Ok(());
         }
         self.quiesce_locked().await?;
-        self.services
-            .control("restart", &["ringboard-server.service"])
-            .await?;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if self.retention_matches(desired).await {
-                    return Ok(());
-                }
-                sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .map_err(|_| "Running Ringboard has not applied the saved retention limits".to_owned())?
+        self.policy.apply(store_policy(desired)).await
     }
 
     async fn quiesce_locked(&self) -> Result<(), String> {
         let _ = self.record_capture(Err("Capture is quiesced for a policy transition".into()));
-        self.capture.set_paused(true, 0).await
+        self.capture.set_paused(true, 0).await?;
+        self.close_admission().await
+    }
+
+    async fn close_admission(&self) -> Result<(), String> {
+        self.policy.close().await
     }
 
     pub(crate) async fn quiesce(&self) -> Result<CaptureGuard<'_>, String> {
@@ -341,6 +354,7 @@ impl SettingsManager {
                 // that this pause survives restart or matches saved settings.
                 if paused {
                     let _ = self.capture.set_paused(true, 0).await;
+                    let _ = self.close_admission().await;
                     let _ = self.record_capture(Err(error.clone()));
                 }
                 return Err(error);
@@ -382,18 +396,29 @@ impl SettingsManager {
         let _ = self.record_capture(Err("Capture transition is not yet verified".into()));
         let result = async {
             if !updated.capture_paused && !self.retention_matches(updated).await {
-                self.capture.set_paused(true, 0).await?;
+                self.quiesce_locked().await?;
                 return Err(
-                    "Capture is disabled until engine retention/limits are synchronized".into(),
+                    "Capture is disabled until store retention/limits are synchronized".into(),
                 );
             }
             self.capture
                 .set_paused(updated.capture_paused, updated.max_entry_bytes)
                 .await?;
+            if updated.capture_paused {
+                self.close_admission().await?;
+            }
             self.verify_capture(updated.capture_paused).await
         }
         .await;
         self.record_capture(result)
+    }
+
+    pub(crate) async fn stop_capture(&self) -> Result<(), String> {
+        // Serialize with policy/wipe/resume transitions and prevent a request
+        // already accepted by a transport from reopening capture at shutdown.
+        let _transaction = self.transaction.lock().await;
+        self.stopping.store(true, Ordering::Release);
+        self.quiesce_locked().await
     }
 
     pub async fn reconcile_capture(&self) -> Result<(), String> {
@@ -426,25 +451,21 @@ fn retention_changed(a: &ClipboardSettings, b: &ClipboardSettings) -> bool {
         != (b.max_entries, b.max_favorites, b.max_entry_bytes)
 }
 
-fn limits_match(limits: &crate::ringboard::ipc::EngineLimits, desired: &ClipboardSettings) -> bool {
+fn limits_match(limits: &StorePolicy, desired: &ClipboardSettings) -> bool {
     limits.max_entries == desired.max_entries
         && limits.max_favorites == desired.max_favorites
-        && limits.max_entry_bytes
-            == Some(crate::selection::effective_limit(desired.max_entry_bytes))
+        && limits.max_entry_bytes == desired.max_entry_bytes
+        && limits.max_total_bytes == MAX_TOTAL_BYTES
 }
 
-fn encoded_ringboard_config(value: &ClipboardSettings) -> Result<(PathBuf, Vec<u8>), String> {
-    let config = config::server::Config {
-        max_entries: config::server::MaxEntries {
-            main: NonZeroU32::new(value.max_entries).ok_or("max_entries cannot be zero")?,
-            favorites: NonZeroU32::new(value.max_favorites)
-                .ok_or("max_favorites cannot be zero")?,
-        },
-    };
-    let encoded = toml::to_string_pretty(&config::server::Stable::from(config))
-        .map_err(|_| "Ringboard settings could not be encoded")?;
-    let path = data_dir().join(config::server::file_name());
-    Ok((path, encoded.into_bytes()))
+fn store_policy(value: &ClipboardSettings) -> StorePolicy {
+    StorePolicy {
+        admission: false,
+        max_entries: value.max_entries,
+        max_favorites: value.max_favorites,
+        max_entry_bytes: value.max_entry_bytes,
+        max_total_bytes: MAX_TOTAL_BYTES,
+    }
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -458,7 +479,7 @@ fn load_settings(path: Option<&Path>) -> Result<ClipboardSettings, String> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return import_native_settings();
+            return Ok(ClipboardSettings::default());
         }
         Err(_) => return Err("Clipboard settings could not be read".into()),
     };
@@ -481,129 +502,14 @@ fn validate_loaded_settings(value: ClipboardSettings) -> Result<ClipboardSetting
     Ok(value)
 }
 
-fn import_native_settings() -> Result<ClipboardSettings, String> {
-    let path = data_dir().join(config::server::file_name());
-    let mut value = ClipboardSettings::default();
-    if path
-        .try_exists()
-        .map_err(|_| "Native Ringboard configuration is unreadable")?
-    {
-        let native =
-            config::server::load(path).map_err(|_| "Native Ringboard configuration is invalid")?;
-        value.max_entries = native.max_entries.main.get();
-        value.max_favorites = native.max_entries.favorites.get();
-    }
-    let limit_path = data_dir().join("clip-daemon-max-bytes");
-    if limit_path
-        .try_exists()
-        .map_err(|_| "Native capture limit is unreadable")?
-    {
-        let bytes = fs::read(limit_path).map_err(|_| "Native capture limit is unreadable")?;
-        if bytes.len() > 32 {
-            return Err("Native capture limit is invalid".into());
-        }
-        value.max_entry_bytes = std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(|value| value.trim().parse().ok())
-            .ok_or("Native capture limit is invalid")?;
-    }
-    validate_loaded_settings(value)
-}
-
-const CLIPBOARD: &str = "Clipboard settings";
-const RINGBOARD: &str = "Ringboard settings";
-
-fn persist_config_pair(path: Option<&Path>, value: &ClipboardSettings) -> Result<(), String> {
-    let (ringboard_path, ringboard_bytes) = encoded_ringboard_config(value)?;
-    let limit_path = data_dir().join("clip-daemon-max-bytes");
-    let limit = format!("{}\n", value.max_entry_bytes);
-    let mut writes = vec![
-        stage_config(&ringboard_path, &ringboard_bytes, RINGBOARD)?,
-        stage_config(&limit_path, limit.as_bytes(), "Ringboard capture limit")?,
-    ];
-    if let Some(path) = path {
-        let bytes = serde_json::to_vec_pretty(value)
-            .map_err(|_| "Clipboard settings could not be encoded")?;
-        writes.push(stage_config(path, &bytes, CLIPBOARD)?);
-    }
-    commit_all(writes)
-}
-
 fn persist(path: Option<&Path>, value: &ClipboardSettings) -> Result<(), String> {
     let Some(path) = path else {
         return Ok(());
     };
     let bytes =
         serde_json::to_vec_pretty(value).map_err(|_| "Clipboard settings could not be encoded")?;
-    commit_all(vec![stage_config(path, &bytes, CLIPBOARD)?])
-}
-
-struct StagedWrite {
-    path: PathBuf,
-    file: StagedFile,
-    previous: Option<Vec<u8>>,
-    label: &'static str,
-}
-
-fn stage_config(path: &Path, bytes: &[u8], label: &'static str) -> Result<StagedWrite, String> {
-    Ok(StagedWrite {
-        path: path.to_owned(),
-        previous: read_existing(path)?,
-        file: StagedFile::new(path, bytes, AtomicFilePolicy::PRIVATE)
-            .map_err(|error| format!("{label} could not be staged: {error}"))?,
-        label,
-    })
-}
-
-// Best-effort coordinated updates, not a crash-atomic multi-file transaction.
-fn commit_all(mut writes: Vec<StagedWrite>) -> Result<(), String> {
-    for write in &mut writes {
-        if let Err(error) = write.file.commit() {
-            let error = format!("{} could not be committed: {error}", write.label);
-            return Err(rollback_writes(&writes, error));
-        }
-    }
-    Ok(())
-}
-
-fn rollback_writes(writes: &[StagedWrite], error: String) -> String {
-    let failures = writes
-        .iter()
-        .rev()
-        .filter_map(|write| restore_previous(&write.path, write.previous.as_deref()).err())
-        .collect::<Vec<_>>();
-    if failures.is_empty() {
-        error
-    } else {
-        format!("{error}; rollback failed: {}", failures.join("; "))
-    }
-}
-
-fn atomic_write(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
-    shelllist_daemon_core::write_bytes_atomic(path, bytes, AtomicFilePolicy::PRIVATE)
-        .map_err(|error| format!("{label} could not be written: {error}"))
-}
-
-fn read_existing(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err("Existing settings could not be read".into()),
-    }
-}
-
-fn restore_previous(path: &Path, bytes: Option<&[u8]>) -> Result<(), String> {
-    match bytes {
-        Some(bytes) => atomic_write(path, bytes, "Ringboard settings rollback"),
-        None => {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-                Err(_) => return Err("New settings file could not be removed".to_owned()),
-            }
-            sync_parent(path).map_err(|_| "Settings directory could not be synced".to_owned())
-        }
-    }
+    shelllist_daemon_core::write_bytes_atomic(path, &bytes, AtomicFilePolicy::PRIVATE)
+        .map_err(|error| format!("Clipboard settings could not be written: {error}"))
 }
 
 #[cfg(test)]
@@ -621,14 +527,18 @@ mod tests {
         let services = Arc::new(MockServices::default());
         let manager = SettingsManager {
             state: std::sync::Mutex::new(SettingsState {
-                value: ClipboardSettings::default(),
+                value: ClipboardSettings {
+                    capture_paused: false,
+                    ..Default::default()
+                },
                 load_error: None,
                 capture_verified: false,
                 capture_error: None,
             }),
             path,
             transaction: Default::default(),
-            services: services.clone(),
+            stopping: Default::default(),
+            policy: services.clone(),
             capture: services.clone(),
         };
         (manager, services)
@@ -639,32 +549,34 @@ mod tests {
         attempts: std::sync::atomic::AtomicUsize,
         fail: std::sync::atomic::AtomicBool,
         paused: std::sync::atomic::AtomicBool,
+        policy: std::sync::Mutex<super::StorePolicy>,
+        fail_policy: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
-    impl super::ServiceControl for MockServices {
-        async fn control(&self, action: &str, _: &[&str]) -> Result<(), String> {
-            self.attempts.fetch_add(1, SeqCst);
-            if self.fail.load(SeqCst) {
-                return Err("injected failure".into());
-            }
-            self.paused.store(action == "stop", SeqCst);
-            Ok(())
+    impl super::PolicyControl for MockServices {
+        async fn policy(&self) -> Result<super::StorePolicy, String> {
+            Ok(self.policy.lock().unwrap().clone())
         }
-        async fn limits(&self) -> Result<crate::ringboard::ipc::EngineLimits, String> {
-            let defaults = ClipboardSettings::default();
-            Ok(crate::ringboard::ipc::EngineLimits {
-                max_entries: defaults.max_entries,
-                max_favorites: defaults.max_favorites,
-                max_entry_bytes: Some(defaults.max_entry_bytes),
-            })
+        async fn apply(&self, policy: super::StorePolicy) -> Result<(), String> {
+            if self.fail_policy.load(SeqCst) {
+                return Err("injected policy failure".into());
+            }
+            *self.policy.lock().unwrap() = policy;
+            Ok(())
         }
     }
 
     #[async_trait::async_trait]
     impl crate::capture::CaptureControl for MockServices {
         async fn set_paused(&self, paused: bool, _: u64) -> Result<(), String> {
-            super::ServiceControl::control(self, if paused { "stop" } else { "start" }, &[]).await
+            self.attempts.fetch_add(1, SeqCst);
+            if self.fail.load(SeqCst) {
+                return Err("injected failure".into());
+            }
+            self.paused.store(paused, SeqCst);
+            self.policy.lock().unwrap().admission = !paused;
+            Ok(())
         }
         async fn is_paused(&self) -> Result<bool, String> {
             Ok(self.paused.load(SeqCst))
@@ -725,6 +637,138 @@ mod tests {
         assert!(!state.verified);
         assert!(!state.private_mode);
         assert!(!state.desired_paused);
+    }
+
+    #[tokio::test]
+    async fn paused_settings_apply_to_the_real_sql_store() {
+        let directory = tempdir().unwrap();
+        let store = super::HistoryStore::open(&directory.path().join("history.db")).unwrap();
+        let (mut manager, _) = manager(None);
+        manager.state.lock().unwrap().value.capture_paused = true;
+        manager.policy = Arc::new(store.clone());
+        manager.initialize_retention().await.unwrap();
+        manager
+            .update(super::SettingsUpdate {
+                max_entries: Some(25),
+                max_favorites: Some(10),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let effective = store.policy().unwrap();
+        assert_eq!(effective.max_entries, 25);
+        assert_eq!(effective.max_favorites, 10);
+        assert!(!effective.admission);
+        assert!(store.insert("text/plain", b"must not be captured").is_err());
+        assert!(manager.retention_state().await.unwrap().synchronized);
+        store.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_fences_capture_and_rejects_late_resume() {
+        let (manager, services) = manager(None);
+        manager.reconcile_capture().await.unwrap();
+        assert!(!services.paused.load(SeqCst));
+        manager.stop_capture().await.unwrap();
+        assert!(services.paused.load(SeqCst));
+        assert!(!services.policy.lock().unwrap().admission);
+        assert!(manager.set_paused(false, false).await.is_err());
+        assert!(manager.reconcile_capture().await.is_err());
+        assert!(services.paused.load(SeqCst));
+    }
+
+    #[tokio::test]
+    async fn startup_policy_is_closed_without_consuming_capture_bootstrap() {
+        let (manager, services) = manager(None);
+        manager.initialize_retention().await.unwrap();
+        assert!(!services.policy.lock().unwrap().admission);
+        assert_eq!(services.attempts.load(SeqCst), 0);
+        manager.reconcile_capture().await.unwrap();
+        assert!(!services.paused.load(SeqCst));
+        assert!(services.policy.lock().unwrap().admission);
+    }
+
+    #[tokio::test]
+    async fn retention_is_applied_directly_and_failure_stays_paused() {
+        let (manager, services) = manager(None);
+        manager
+            .update(super::SettingsUpdate {
+                max_entries: Some(42),
+                max_entry_bytes: Some(64 * 1024 * 1024),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let policy = services.policy.lock().unwrap().clone();
+        assert_eq!(policy.max_entries, 42);
+        assert_eq!(policy.max_entry_bytes, 64 * 1024 * 1024);
+        assert_eq!(policy.max_total_bytes, super::MAX_TOTAL_BYTES);
+        assert!(manager.retention_state().await.unwrap().synchronized);
+        services.fail_policy.store(true, SeqCst);
+        assert!(
+            manager
+                .update(super::SettingsUpdate {
+                    max_entries: Some(43),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+        assert!(services.paused.load(SeqCst));
+        assert!(!services.policy.lock().unwrap().admission);
+        assert!(!manager.capture_state().unwrap().verified);
+        services.fail_policy.store(false, SeqCst);
+        manager
+            .update(super::SettingsUpdate {
+                max_entries: Some(43),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(!services.paused.load(SeqCst));
+        assert_eq!(services.policy.lock().unwrap().max_entries, 43);
+    }
+
+    #[test]
+    fn missing_capture_intent_and_missing_file_default_to_paused() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("settings.json");
+        for value in [
+            load_settings(None).unwrap(),
+            load_settings(Some(&path)).unwrap(),
+        ] {
+            assert!(value.capture_paused);
+            assert_eq!(value.max_entries, 1000);
+            assert_eq!(value.max_favorites, 100);
+            assert_eq!(value.max_entry_bytes, 16 * 1024 * 1024);
+        }
+        fs::write(&path, b"{}").unwrap();
+        assert!(load_settings(Some(&path)).unwrap().capture_paused);
+        fs::write(&path, br#"{"max_entries":2}"#).unwrap();
+        assert!(load_settings(Some(&path)).unwrap().capture_paused);
+        fs::write(&path, br#"{"capture_paused":false}"#).unwrap();
+        assert!(!load_settings(Some(&path)).unwrap().capture_paused);
+    }
+
+    #[test]
+    fn oversized_and_inconsistent_privacy_preferences_are_rejected() {
+        let defaults = ClipboardSettings::default();
+        assert!(
+            super::SettingsUpdate {
+                max_entry_bytes: Some(64 * 1024 * 1024 + 1),
+                ..Default::default()
+            }
+            .apply(&defaults)
+            .is_err()
+        );
+        assert!(
+            super::validate_loaded_settings(ClipboardSettings {
+                private_mode: true,
+                capture_paused: false,
+                ..defaults
+            })
+            .is_err()
+        );
     }
 
     #[test]

@@ -36,7 +36,7 @@ pub struct FakeBackend {
 
 #[cfg(test)]
 struct TestOperations {
-    backend: crate::ringboard::RingboardBackend,
+    backend: crate::history::HistoryBackend,
     finishes: std::sync::Mutex<std::collections::VecDeque<tokio::sync::oneshot::Receiver<bool>>>,
 }
 
@@ -217,7 +217,7 @@ impl ClipboardBackend for FakeBackend {
             gate.entered.notify_one();
             gate.release.acquire().await.unwrap().forget();
         }
-        let needle = query.query.to_lowercase();
+        let needle = query.query.trim().to_lowercase();
         let entries = self.entries()?;
         let current = entries
             .iter()
@@ -231,6 +231,7 @@ impl ClipboardBackend for FakeBackend {
         let consumed = query.offset.saturating_add(page.len());
         let has_more = matched > consumed;
         Ok(HistoryPage {
+            total: matched,
             revision: 1,
             generation: query.generation,
             current,

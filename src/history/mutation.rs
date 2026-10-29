@@ -1,32 +1,26 @@
-use std::{
-    borrow::Cow,
-    env,
-    fs::{self, File},
-    io::Write,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
-
-use url::Url;
-
-use crate::{
-    backend::{BackendResult, EntryTarget, invalid_data as invalid_entry, operation_error},
-    model::{EntryKind, OperationResult},
-    selection::{effective_limit, read_path},
-};
-
 use super::{
-    RingboardBackend,
-    content::{
-        MAX_THUMBNAIL_BYTES, ResolvedContent, ResolvedImage, read_entry, valid_edited_image,
-    },
+    HistoryBackend,
+    content::{MAX_THUMBNAIL_BYTES, ResolvedContent, ResolvedImage, valid_edited_image},
     operation::{
         OperationCompletion, OperationControl, private_directory, private_file, runtime_directory,
         unique_path,
     },
     run_blocking,
 };
+use crate::{
+    backend::{BackendResult, EntryTarget, invalid_data as invalid_entry, operation_error},
+    model::{EntryKind, OperationResult},
+    selection::{effective_limit, read_path, read_selection},
+};
+use std::{
+    borrow::Cow,
+    env, fs,
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+use url::Url;
 
 pub(super) struct AnnotationStage {
     input: PathBuf,
@@ -35,8 +29,7 @@ pub(super) struct AnnotationStage {
     revision: u64,
     max_bytes: u64,
 }
-
-impl RingboardBackend {
+impl HistoryBackend {
     fn track_image_file(
         &self,
         path: &Path,
@@ -46,31 +39,27 @@ impl RingboardBackend {
         bytes: &[u8],
     ) -> BackendResult<()> {
         if !created {
-            self.artifact_registry()?.activate_if_generated(path);
             return Ok(());
         }
-        self.artifact_registry()
-            .and_then(|mut registry| registry.register(path, source_id, mime, bytes))
+        self.artifact_registry()?
+            .register(path, source_id, mime, bytes)
             .inspect_err(|_| {
                 let _ = fs::remove_file(path);
             })
     }
-
     fn rollback_image_file(&self, path: &Path, created: bool) -> BackendResult<()> {
         if created {
-            self.artifact_registry()?.forget(path);
-            let _ = fs::remove_file(path);
+            self.artifact_registry()?.remove_registered(path)?;
         }
         Ok(())
     }
-
     pub(super) fn restore_entry(
         &self,
-        opaque_id: &str,
-        expected_revision: Option<u64>,
+        id: &str,
+        expected: Option<u64>,
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
-        let (summary, bytes) = selected_bytes(self, opaque_id, expected_revision, max_bytes)?;
+        let (summary, bytes) = selected_bytes(self, id, expected, max_bytes)?;
         publish_entry(self, &summary, bytes, max_bytes)?;
         self.selection_changed()?;
         Ok(OperationResult::completed(
@@ -78,19 +67,16 @@ impl RingboardBackend {
             "Entry published to the Wayland clipboard",
         ))
     }
-
     pub(super) fn selection_changed(&self) -> BackendResult<()> {
-        self.artifact_registry()?.clear_active_selection();
-        self.clear_identity_state()
+        self.artifact_registry()?.clear_active_selection()
     }
-
     pub(super) fn save_image_file(
         &self,
-        opaque_id: &str,
-        expected_revision: Option<u64>,
+        id: &str,
+        expected: Option<u64>,
         max_bytes: u64,
     ) -> BackendResult<OperationResult> {
-        let (summary, bytes) = selected_image(self, opaque_id, expected_revision, max_bytes)?;
+        let (summary, bytes) = selected_image(self, id, expected, max_bytes)?;
         let content = resolved_content(&summary.mime, &bytes, max_bytes);
         let path = prepare_image_file(&content, &bytes)?;
         let created = matches!(path, Cow::Owned(_));
@@ -99,13 +85,18 @@ impl RingboardBackend {
             self.rollback_image_file(&path, created)?;
             return Err(error);
         }
-        self.clear_identity_state()?;
-        let message = ["Image file link copied", "Image file copied"][usize::from(created)];
-        let mut result = OperationResult::completed("image-as-file", message);
+        self.artifact_registry()?.activate_if_generated(&path)?;
+        let mut result = OperationResult::completed(
+            "image-as-file",
+            if created {
+                "Image file copied"
+            } else {
+                "Image file link copied"
+            },
+        );
         result.path = Some(path.to_string_lossy().into_owned());
         Ok(result)
     }
-
     pub(super) fn launch_annotation(
         &self,
         staged: AnnotationStage,
@@ -119,16 +110,14 @@ impl RingboardBackend {
             |_| async {},
         )
     }
-
     pub(super) fn stage_annotation(
         &self,
-        opaque_id: &str,
-        expected_revision: Option<u64>,
+        id: &str,
+        expected: Option<u64>,
         max_bytes: u64,
     ) -> BackendResult<AnnotationStage> {
         let limit = max_bytes.min(MAX_THUMBNAIL_BYTES);
-        let (summary, bytes) = selected_image(self, opaque_id, expected_revision, limit)?;
-        let revision = summary.revision;
+        let (summary, bytes) = selected_image(self, id, expected, limit)?;
         let content = resolved_content(&summary.mime, &bytes, limit);
         let (mime, image_bytes) = match content.image() {
             Some(ResolvedImage::Inline { mime, .. }) => (*mime, bytes),
@@ -144,74 +133,29 @@ impl RingboardBackend {
         Ok(AnnotationStage {
             input,
             output,
-            opaque_id: opaque_id.to_owned(),
-            revision,
+            opaque_id: id.to_owned(),
+            revision: summary.revision,
             max_bytes: limit,
         })
     }
-
-    fn replace_file_entry(
-        &self,
-        opaque_id: &str,
-        expected_revision: Option<u64>,
-        path: &Path,
-        mime: &str,
-    ) -> BackendResult<u64> {
-        let (entry, _, resolved) = self.selected_proven(opaque_id, expected_revision)?;
-        let file = File::open(path).map_err(operation_error)?;
-        // Mirror Ringboard Add normalization. Otherwise publishing a text edit
-        // creates a second, MIME-distinct capture instead of deduplicating it.
-        super::ipc::replace(
-            entry.id(),
-            &resolved.proof,
-            super::storage_mime(mime),
-            &file,
-        )?;
-        self.clear_identity_state()?;
-        Ok(entry.id())
-    }
-
-    pub(super) fn replace_entry(
-        &self,
-        opaque_id: &str,
-        expected_revision: Option<u64>,
-        mime: &str,
-        bytes: &[u8],
-    ) -> BackendResult<u64> {
-        let directory = runtime_directory("clip-daemon/transfers")?;
-        let path = unique_path(&directory, "edit");
-        write_private(&path, bytes)?;
-        let result = self.replace_file_entry(opaque_id, expected_revision, &path, mime);
-        let _ = fs::remove_file(path);
-        result
-    }
-
     pub(super) fn remove_entry(
         &self,
-        opaque_id: &str,
-        expected_revision: Option<u64>,
+        id: &str,
+        expected: Option<u64>,
     ) -> BackendResult<OperationResult> {
-        let (entry, _, resolved) = self.selected_proven(opaque_id, expected_revision)?;
-        super::ipc::remove(entry.id(), &resolved.proof)?;
-        self.clear_identity_state()?;
+        let selected = self.selected(id, expected)?;
+        self.store()?.remove_many(&[EntryTarget {
+            opaque_id: id.to_owned(),
+            expected_revision: selected.summary.revision,
+        }])?;
         Ok(OperationResult::completed(
             "delete",
             "Clipboard entry deleted",
         ))
     }
-
     pub(super) fn remove_entries(&self, targets: &[EntryTarget]) -> BackendResult<OperationResult> {
-        // Resolve and validate the complete selection before mutating history so
-        // a stale row cannot turn a bulk request into an avoidable partial delete.
-        let proven = targets
-            .iter()
-            .map(|target| {
-                self.selected_proven(&target.opaque_id, Some(target.expected_revision))
-                    .map(|(entry, _, resolved)| (entry.id(), resolved.proof))
-            })
-            .collect::<BackendResult<Vec<_>>>()?;
-        super::ipc::remove_many(&proven)?;
-        self.clear_identity_state()?;
+        // The worker validates every target and deletes in one SQL transaction.
+        self.store()?.remove_many(targets)?;
         let count = targets.len();
         Ok(OperationResult::completed(
             "delete-many",
@@ -221,20 +165,20 @@ impl RingboardBackend {
             ),
         ))
     }
-
     pub(super) fn move_entry(
         &self,
-        opaque_id: &str,
-        expected_revision: Option<u64>,
+        id: &str,
+        expected: Option<u64>,
         favorite: bool,
     ) -> BackendResult<OperationResult> {
-        let (entry, _, resolved) = self.selected_proven(opaque_id, expected_revision)?;
-        super::ipc::favorite(entry.id(), &resolved.proof, favorite)?;
-        self.clear_identity_state()?;
-        let action = if favorite { "favorite" } else { "unfavorite" };
-        Ok(OperationResult::completed(action, "Favorite state updated"))
+        let selected = self.selected(id, expected)?;
+        self.store()?
+            .favorite(id, selected.summary.revision, favorite)?;
+        Ok(OperationResult::completed(
+            if favorite { "favorite" } else { "unfavorite" },
+            "Favorite state updated",
+        ))
     }
-
     pub(super) fn cleanup_artifacts(&self) -> BackendResult<OperationResult> {
         let removed = cleanup_backend(self)?;
         Ok(OperationResult::completed(
@@ -242,29 +186,27 @@ impl RingboardBackend {
             &format!("Clipboard caches cleared; {removed} unreferenced generated files removed"),
         ))
     }
-
     pub(super) fn wipe_entries(&self) -> BackendResult<OperationResult> {
-        super::ipc::wipe()?;
-        cleanup_backend(self)?;
-        self.artifact_registry()?.clear_all()?;
-        self.clear_identity_state()?;
+        self.store()?.wipe()?;
+        // History is committed even if optional filesystem cleanup fails.
+        if let Err(error) =
+            cleanup_backend(self).and_then(|_| self.artifact_registry()?.clear_all())
+        {
+            tracing::warn!(%error, "History wiped; artifact cleanup deferred");
+        }
         Ok(OperationResult::completed(
             "wipe",
             "Clipboard history cleared",
         ))
     }
 }
-
-fn cleanup_backend(backend: &RingboardBackend) -> BackendResult<usize> {
+fn cleanup_backend(backend: &HistoryBackend) -> BackendResult<usize> {
     super::content::clear_cache()?;
-    let runtime = runtime_directory("clip-daemon")?;
-    fs::remove_dir_all(runtime).map_err(operation_error)?;
-    let references = backend.generated_artifact_references()?;
-    backend.artifact_registry()?.reconcile(&references)
+    fs::remove_dir_all(runtime_directory("clip-daemon")?).map_err(operation_error)?;
+    backend.artifact_registry()?.reconcile()
 }
-
 async fn run_annotation(
-    backend: RingboardBackend,
+    backend: HistoryBackend,
     staged: AnnotationStage,
     control: Arc<OperationControl>,
 ) -> BackendResult<OperationCompletion> {
@@ -275,7 +217,6 @@ async fn run_annotation(
         revision,
         max_bytes,
     } = staged;
-    // Give the picker time to hide so the editor becomes focused when it maps.
     tokio::time::sleep(Duration::from_millis(150)).await;
     backend.operations.edit(&input, &output).await?;
     if !output.is_file() {
@@ -293,10 +234,9 @@ async fn run_annotation(
     })
     .await
 }
-
 fn apply_annotation(
-    backend: &RingboardBackend,
-    opaque_id: &str,
+    backend: &HistoryBackend,
+    id: &str,
     revision: u64,
     output: &Path,
     max_bytes: u64,
@@ -304,65 +244,55 @@ fn apply_annotation(
     if !valid_edited_image(output, max_bytes) {
         return Err(operation_error("Annotation returned an invalid image"));
     }
-    let raw_id = backend.replace_file_entry(opaque_id, Some(revision), output, "image/png")?;
+    let bytes = read_path(output, max_bytes)?;
+    backend
+        .store()?
+        .replace(id, revision, "image/png", &bytes)?;
     let mut completion = OperationCompletion {
         status: "completed",
         message: "Image edit completed",
         warning: None,
     };
-    if let Err(error) = publish_annotation(backend, raw_id, output, max_bytes) {
+    // Capture deduplicates against the committed image using SQL MIME/content identity.
+    if let Err(error) = backend
+        .selection
+        .publish("image/png", bytes, max_bytes)
+        .and_then(|_| backend.selection_changed())
+    {
         completion.message = "Image edit committed";
         completion.warning = Some(format!("Clipboard publication failed: {error}"));
     }
     Ok(completion)
 }
-
-fn publish_annotation(
-    backend: &RingboardBackend,
-    raw_id: u64,
-    output: &Path,
-    max_bytes: u64,
-) -> BackendResult<()> {
-    let source = backend.details_raw_sync(raw_id, super::MAX_DETAILS_BYTES)?;
-    let bytes = read_path(output, max_bytes)?;
-    backend
-        .artifact_registry()?
-        .register_inline_echo(&source.entry.id, "image/png", &bytes)?;
-    backend.clear_identity_state()?;
-    backend.selection.publish("image/png", bytes, max_bytes)?;
-    backend.artifact_registry()?.clear_active_selection();
-    Ok(())
-}
-
 fn selected_bytes(
-    backend: &RingboardBackend,
-    opaque_id: &str,
-    expected_revision: Option<u64>,
+    backend: &HistoryBackend,
+    id: &str,
+    expected: Option<u64>,
     max_bytes: u64,
 ) -> BackendResult<(crate::model::EntrySummary, Vec<u8>)> {
-    let (entry, mut reader, summary) = backend.selected(opaque_id, expected_revision)?;
-    let bytes = read_entry(entry, &mut reader, max_bytes)?;
-    Ok((summary, bytes))
+    let mut stored = backend.selected(id, expected)?;
+    let bytes = read_selection(&mut &stored.bytes[..], stored.bytes.len() as u64, max_bytes)?;
+    // Internal content resolution needs the captured MIME, not the semantic UI
+    // label (a file URI can have an image/png summary but still contain a URI).
+    stored.summary.mime = stored.mime;
+    Ok((stored.summary, bytes))
 }
-
 fn selected_image(
-    backend: &RingboardBackend,
-    opaque_id: &str,
-    expected_revision: Option<u64>,
+    backend: &HistoryBackend,
+    id: &str,
+    expected: Option<u64>,
     max_bytes: u64,
 ) -> BackendResult<(crate::model::EntrySummary, Vec<u8>)> {
-    let selected = selected_bytes(backend, opaque_id, expected_revision, max_bytes)?;
+    let selected = selected_bytes(backend, id, expected, max_bytes)?;
     (selected.0.kind == EntryKind::Image)
         .then_some(selected)
         .ok_or_else(|| invalid_entry("Only image entries support this action"))
 }
-
 fn resolved_content<'a>(mime: &'a str, bytes: &[u8], max_bytes: u64) -> ResolvedContent<'a> {
     ResolvedContent::resolve(mime, bytes, effective_limit(max_bytes))
 }
-
 fn publish_entry(
-    backend: &RingboardBackend,
+    backend: &HistoryBackend,
     summary: &crate::model::EntrySummary,
     bytes: Vec<u8>,
     max_bytes: u64,
@@ -380,7 +310,6 @@ fn publish_entry(
         None => backend.selection.publish(content.mime(), bytes, max_bytes),
     }
 }
-
 fn prepare_image_file<'a>(
     content: &'a ResolvedContent<'_>,
     bytes: &[u8],
@@ -395,29 +324,26 @@ fn prepare_image_file<'a>(
         None => Err(invalid_entry("Only image entries support this action")),
     }
 }
-
-fn publish_image_uri(backend: &RingboardBackend, path: &Path, max_bytes: u64) -> BackendResult<()> {
+fn publish_image_uri(backend: &HistoryBackend, path: &Path, max_bytes: u64) -> BackendResult<()> {
     let uri = Url::from_file_path(path)
         .map_err(|_| operation_error("Could not create image file URI"))?;
     backend
         .selection
         .publish_file_link(format!("{uri}\r\n").into_bytes(), max_bytes)
 }
-
 fn image_directory() -> BackendResult<PathBuf> {
     let home = env::var_os("HOME").ok_or_else(|| operation_error("HOME is unavailable"))?;
     private_directory(PathBuf::from(home).join("Pictures/Screenshots/clipboard-history"))
 }
-
 fn write_private(path: &Path, bytes: &[u8]) -> BackendResult<()> {
     let mut file = private_file(path)?;
     file.write_all(bytes)
+        .and_then(|()| file.sync_all())
         .map_err(operation_error)
         .inspect_err(|_| {
             let _ = fs::remove_file(path);
         })
 }
-
 fn image_extension(mime: &str) -> &'static str {
     match mime.split(';').next().unwrap_or(mime) {
         "image/jpeg" => "jpg",
@@ -429,9 +355,40 @@ fn image_extension(mime: &str) -> &'static str {
         _ => "png",
     }
 }
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_image_actions_use_captured_mime_not_the_semantic_label() {
+        use crate::history_store::{HistoryStore, StorePolicy};
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("image.png");
+        image::RgbaImage::new(2, 3).save(&image).unwrap();
+        let uri = format!("{}\r\n", url::Url::from_file_path(&image).unwrap());
+        let store = HistoryStore::open(&directory.path().join("store/history.db")).unwrap();
+        store
+            .apply_policy(StorePolicy {
+                admission: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let entry = store.insert("text/uri-list", uri.as_bytes()).unwrap();
+        assert_eq!(entry.mime, "image/png");
+        let backend = super::HistoryBackend::from_store(store.clone());
+        let (internal, bytes) =
+            super::selected_image(&backend, &entry.id, Some(entry.revision), 1024).unwrap();
+        assert_eq!(internal.mime, "text/uri-list");
+        assert_eq!(bytes, uri.as_bytes());
+        let content = super::resolved_content(&internal.mime, &bytes, 1024);
+        assert_eq!(content.local_image().unwrap().path, image);
+        let details =
+            crate::history::content::entry_details(store.get(&entry.id, None).unwrap(), 1024)
+                .unwrap();
+        assert_eq!(details.image.unwrap().height, 3);
+        assert_eq!(details.files.len(), 1);
+        assert_eq!(details.entry.mime, "image/png");
+        store.shutdown().unwrap();
+    }
+
     #[test]
     fn staging_never_overwrites_or_removes_an_existing_file() {
         let directory = tempfile::tempdir().unwrap();

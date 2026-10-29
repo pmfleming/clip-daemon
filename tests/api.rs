@@ -102,11 +102,11 @@ async fn native_search_uses_revision_bound_owner_scoped_cursors() {
     let plain = api.history(json!({"limit":3})).await;
     for query in ["", " \t\n", "\u{2003}"] {
         let blank = api
-            .history(json!({"query":query,"fuzzy":true,"limit":3}))
+            .history(json!({"query":query,"cursor_mode":true,"limit":3}))
             .await;
         assert_eq!(blank["entries"], plain["entries"]);
     }
-    let request = || json!({"query":"cafee","generation":9,"fuzzy":true,"limit":2});
+    let request = || json!({"query":"café","generation":9,"cursor_mode":true,"limit":2});
     let first = api
         .0
         .dispatch_owned("clipboard.history.query", request(), Some(":1.1".into()))
@@ -207,7 +207,7 @@ async fn bulk_delete_validates_the_selection_before_removing_entries() {
 #[tokio::test]
 async fn validation_publication_and_wipe_challenges_are_stable() {
     let api = TestApi::new(vec![]);
-    let empty = api.history(json!({"fuzzy":true})).await;
+    let empty = api.history(json!({"cursor_mode":true})).await;
     assert_eq!(empty["entries"], json!([]));
     assert_eq!(empty["total"], 0);
     for (method, params) in [
@@ -222,11 +222,11 @@ async fn validation_publication_and_wipe_challenges_are_stable() {
         ("history.query", json!({"limit":0})),
         ("history.query", json!({"limit":201})),
         ("history.query", json!({"query":"x".repeat(4097)})),
-        ("history.query", json!({"fuzzy":true,"offset":1})),
+        ("history.query", json!({"cursor_mode":true,"offset":1})),
         ("history.query", json!({"cursor":"unused"})),
         (
             "history.query",
-            json!({"fuzzy":true,"query":"é".repeat(257)}),
+            json!({"cursor_mode":true,"query":"é".repeat(2049)}),
         ),
     ] {
         api.rejects(method, params, "validation-error").await;
@@ -242,7 +242,7 @@ async fn validation_publication_and_wipe_challenges_are_stable() {
     .await;
     api.rejects(
         "history.query",
-        json!({"fuzzy":true,"cursor":"invalid"}),
+        json!({"cursor_mode":true,"cursor":"invalid"}),
         "stale-cursor",
     )
     .await;

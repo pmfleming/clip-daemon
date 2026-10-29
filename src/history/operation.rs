@@ -371,7 +371,7 @@ impl OperationControl {
 }
 
 #[cfg(test)]
-impl super::RingboardBackend {
+impl super::HistoryBackend {
     pub(crate) fn test_operation(
         &self,
         finish: oneshot::Receiver<bool>,

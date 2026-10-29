@@ -41,6 +41,8 @@ impl Default for StorePolicy {
 #[derive(Debug, Clone)]
 pub struct StoredEntry {
     pub summary: EntrySummary,
+    /// Captured MIME, distinct from the UI's resolved semantic image/file MIME.
+    pub mime: String,
     pub bytes: Vec<u8>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +254,7 @@ impl HistoryStore {
         self.call(move |db| db.query(query))
     }
     pub fn get(&self, id: &str, expected: Option<u64>) -> BackendResult<StoredEntry> {
+        validate_id(id)?;
         let id = id.to_owned();
         self.call(move |db| db.get(&id, expected))
     }
@@ -271,6 +274,7 @@ impl HistoryStore {
         mime: &str,
         bytes: &[u8],
     ) -> BackendResult<EntrySummary> {
+        validate_id(id)?;
         validate_input(mime, bytes)?;
         let reservation = self.reserve(bytes.len())?;
         let (id, mime, bytes) = (id.to_owned(), mime.to_owned(), bytes.to_vec());
@@ -279,6 +283,7 @@ impl HistoryStore {
         })
     }
     pub fn favorite(&self, id: &str, expected: u64, value: bool) -> BackendResult<()> {
+        validate_id(id)?;
         let id = id.to_owned();
         self.call(move |db| db.favorite(&id, expected, value))
     }
@@ -286,8 +291,17 @@ impl HistoryStore {
         if targets.len() > 10_000 {
             return Err(crate::backend::invalid_data("Too many delete targets"));
         }
+        for target in targets {
+            validate_id(&target.opaque_id)?;
+        }
+        let reservation = self.reserve(
+            targets
+                .iter()
+                .map(|target| target.opaque_id.len() + std::mem::size_of::<EntryTarget>())
+                .sum(),
+        )?;
         let targets = targets.to_vec();
-        self.call(move |db| db.remove_many(&targets))
+        self.submit(reservation, move |db| db.remove_many(&targets))
     }
     pub fn wipe(&self) -> BackendResult<()> {
         self.call(|db| db.wipe())
@@ -308,6 +322,7 @@ impl HistoryStore {
         self.forget_artifact(path.as_ref())
     }
     pub fn artifact_get(&self, path: impl AsRef<Path>) -> BackendResult<Option<ArtifactRecord>> {
+        validate_path(path.as_ref())?;
         let path = path
             .as_ref()
             .to_str()
@@ -326,9 +341,22 @@ impl HistoryStore {
         self.call(|db| db.artifacts())
     }
     pub fn register_artifact(&self, record: ArtifactRecord) -> BackendResult<()> {
-        self.call(move |db| db.register_artifact(record))
+        validate_path(&record.path)?;
+        validate_id(&record.source_entry_id)?;
+        if record.image_identity.len() > 256 {
+            return Err(crate::backend::invalid_data(
+                "Artifact identity is too long",
+            ));
+        }
+        let reservation = self.reserve(
+            record.path.as_os_str().len()
+                + record.source_entry_id.len()
+                + record.image_identity.len(),
+        )?;
+        self.submit(reservation, move |db| db.register_artifact(record))
     }
     pub fn forget_artifact(&self, path: &Path) -> BackendResult<()> {
+        validate_path(path)?;
         let path = path.to_owned();
         self.call(move |db| db.forget_artifact(&path))
     }
@@ -339,11 +367,31 @@ impl HistoryStore {
         self.call(|db| db.inline_echoes())
     }
     pub fn register_inline_echo(&self, record: InlineEchoRecord) -> BackendResult<()> {
+        validate_id(&record.source_entry_id)?;
+        if record.image_identity.len() > 256 {
+            return Err(crate::backend::invalid_data(
+                "Artifact identity is too long",
+            ));
+        }
         self.call(move |db| db.register_inline_echo(record))
     }
     pub fn clear_inline_echoes(&self) -> BackendResult<()> {
         self.call(|db| db.clear_inline_echoes())
     }
+}
+fn validate_id(id: &str) -> BackendResult<()> {
+    if id.len() > 128 {
+        return Err(crate::backend::invalid_data(
+            "Clipboard entry ID is too long",
+        ));
+    }
+    Ok(())
+}
+fn validate_path(path: &Path) -> BackendResult<()> {
+    if path.as_os_str().len() > 32768 {
+        return Err(crate::backend::invalid_data("Artifact path is too long"));
+    }
+    Ok(())
 }
 fn validate_input(mime: &str, bytes: &[u8]) -> BackendResult<()> {
     if mime.len() > 255 || mime.contains('\0') || bytes.len() as u64 > MAX_ENTRY_BYTES {

@@ -151,10 +151,10 @@ impl ClipboardService {
         if !(1..=MAX_QUERY_LIMIT).contains(&params.limit) {
             return Err(ApiError::validation("limit must be between 1 and 200"));
         }
-        if params.fuzzy {
+        if params.cursor_mode {
             if params.offset != 0 {
                 return Err(ApiError::validation(
-                    "Use next_cursor, not offsets, for fuzzy history queries",
+                    "Use next_cursor, not offsets, in cursor mode",
                 ));
             }
             return self
@@ -163,7 +163,7 @@ impl ClipboardService {
                 .await;
         }
         if params.cursor.is_some() {
-            return Err(ApiError::validation("A cursor requires fuzzy history mode"));
+            return Err(ApiError::validation("A cursor requires cursor mode"));
         }
         let history = self
             .backend
@@ -555,6 +555,7 @@ pub(crate) struct EntryParams {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct QueryParams {
     #[serde(default)]
     pub query: String,
@@ -565,7 +566,7 @@ pub(crate) struct QueryParams {
     #[serde(default = "default_query_limit")]
     pub limit: usize,
     #[serde(default)]
-    pub fuzzy: bool,
+    pub cursor_mode: bool,
     pub cursor: Option<String>,
 }
 

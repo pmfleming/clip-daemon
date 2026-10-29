@@ -260,10 +260,22 @@ async fn emit_event(
     }
 }
 
-pub async fn run(backend: crate::ringboard::RingboardBackend) -> Result<()> {
+pub async fn run(backend: crate::history::HistoryBackend) -> Result<()> {
     let backend = Arc::new(backend);
-    let capture = crate::capture::Controller::new(backend.clone());
-    run_with_capture(backend, Arc::new(capture)).await
+    // Opening/validating storage must finish before capture can be admitted.
+    let store_backend = backend.clone();
+    let store = tokio::task::spawn_blocking(move || store_backend.store()).await??;
+    let capture = Arc::new(crate::capture::Controller::new(backend.clone()));
+    let settings = crate::settings::SettingsManager::with_store(capture.clone(), store);
+    let api = Arc::new(ApiService::with_settings(backend.clone(), settings));
+    let result = serve(api).await;
+    let stopped = crate::capture::CaptureControl::shutdown(capture.as_ref())
+        .await
+        .map_err(anyhow::Error::msg);
+    // Backend shutdown fences operations, drains accepted work, checkpoints,
+    // and releases the database only after capture has stopped.
+    let drained = backend.shutdown().await.map_err(anyhow::Error::from);
+    result.and(stopped).and(drained)
 }
 pub async fn run_with_capture(
     backend: Arc<dyn ClipboardBackend>,
@@ -312,6 +324,9 @@ async fn serve(api: Arc<ApiService>) -> Result<()> {
         result = shelllist_daemon_tokio::wait_for_shutdown() => (result, false),
         result = &mut listener => (result.context("join clipboard socket listener").and_then(|r|r), true),
     };
+    // Invalidate capture before waiting for client/resource teardown. This
+    // barrier also settles clipboard submissions already accepted by capture.
+    let capture_result = api.stop_capture().await.map_err(anyhow::Error::msg);
     let _ = stop.send(());
     let socket_result = if ended {
         Ok(())
@@ -328,5 +343,5 @@ async fn serve(api: Arc<ApiService>) -> Result<()> {
         .context("close clip-daemon D-Bus service");
     subscriptions.shutdown().await;
     tasks.shutdown().await;
-    result.and(socket_result).and(closed)
+    result.and(capture_result).and(socket_result).and(closed)
 }

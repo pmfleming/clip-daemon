@@ -170,7 +170,7 @@ async fn direct_ingress_shares_validation_scopes_operations_and_preserves_peers(
     let mut b = fixture.peer().await;
     let mut events = Vec::new();
     for (method, params) in [
-        ("clipboard.history.query", json!({"fuzzy":true})),
+        ("clipboard.history.query", json!({"cursor_mode":true})),
         ("clipboard.history.revision", json!({})),
         ("clipboard.history.query", json!({"limit":201})),
         (

@@ -1,4 +1,4 @@
-//! Real SIGKILL/restart of a test-only exported daemon. No Ringboard, Wayland,
+//! Real SIGKILL/restart of a test-only exported daemon. No live history, Wayland,
 //! capture worker, real clipboard publication or live desktop helper is used.
 //! Target lookup/input injection use a private, builtin-only hyprctl script.
 use super::*;
@@ -77,7 +77,7 @@ impl Drop for PrivateBus {
 }
 
 // This backend deliberately does NOT use FakeBackend::with_operations: that
-// helper uses RingboardBackend internally. Only inert history/edit methods are
+// helper uses HistoryBackend internally. Only inert history/edit methods are
 // delegated to FakeBackend; asynchronous work is entirely in-memory here.
 struct Backend {
     fake: FakeBackend,

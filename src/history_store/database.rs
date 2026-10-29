@@ -324,7 +324,7 @@ impl Database {
     }
     pub(super) fn get(&self, id: &str, expected: Option<u64>) -> BackendResult<StoredEntry> {
         let summary = self.summary(id, expected)?;
-        let rows = self.rows("SELECT bytes FROM payloads WHERE entry_id=?1", [id])?;
+        let rows = self.rows("SELECT p.bytes,e.mime FROM payloads p JOIN entries e ON e.id=p.entry_id WHERE p.entry_id=?1", [id])?;
         let bytes = rows
             .first()
             .ok_or_else(|| invalid_data("Clipboard payload is missing"))?
@@ -333,7 +333,12 @@ impl Database {
         if bytes.len() as u64 != summary.byte_size {
             return Err(invalid_data("Clipboard payload length mismatch"));
         }
-        Ok(StoredEntry { summary, bytes })
+        let mime = text(&rows[0], 1)?;
+        Ok(StoredEntry {
+            summary,
+            mime,
+            bytes,
+        })
     }
     pub(super) fn query(&self, query: HistoryQuery) -> BackendResult<HistoryPage> {
         let needle = query.query.to_lowercase();
@@ -357,9 +362,14 @@ impl Database {
             "AND ?5=''"
         };
         let gram = gram.unwrap_or_default();
-        let filter = format!(
-            "FROM entries e JOIN search_content s ON s.entry_id=e.id WHERE instr(s.content,?1)>0 AND (?4=0 OR e.echo_source_id IS NULL) {candidates}"
-        );
+        let filter = if needle.is_empty() {
+            // Browsing never opens payload or searchable-text rows.
+            "FROM entries e WHERE (?4=0 OR e.echo_source_id IS NULL) AND ?1='' AND ?5=''".to_owned()
+        } else {
+            format!(
+                "FROM entries e JOIN search_content s ON s.entry_id=e.id WHERE instr(s.content,?1)>0 AND (?4=0 OR e.echo_source_id IS NULL) {candidates}"
+            )
+        };
         let parameters = params![
             needle.clone(),
             (limit + 1) as i64,
@@ -542,19 +552,30 @@ impl Database {
         })
     }
     pub(super) fn remove_many(&mut self, targets: &[EntryTarget]) -> BackendResult<()> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let values = (0..targets.len())
+            .map(|index| format!("(?{},?{})", index * 2 + 1, index * 2 + 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        let cte = format!("WITH targets(id,revision) AS (VALUES {values})");
+        let bindings = targets
+            .iter()
+            .flat_map(|target| {
+                [
+                    turso::Value::Text(target.opaque_id.clone()),
+                    turso::Value::Integer(target.expected_revision as i64),
+                ]
+            })
+            .collect::<Vec<_>>();
         self.transaction(|db| {
-            for target in targets {
-                db.summary(&target.opaque_id, Some(target.expected_revision))?;
+            let valid=db.scalar(&format!("{cte} SELECT count(*) FROM targets t JOIN entries e ON e.id=t.id AND e.revision=t.revision"),bindings.clone())?;
+            if valid!=targets.len() as i64 {
+                let present=db.scalar(&format!("{cte} SELECT count(*) FROM targets t JOIN entries e ON e.id=t.id"),bindings.clone())?;
+                return Err(if present!=targets.len() as i64 {BackendError::not_found("Clipboard entry does not exist")} else {BackendError::stale("Clipboard entry revision changed")});
             }
-            if targets.is_empty() {
-                return Ok(());
-            }
-            for target in targets {
-                db.exec(
-                    "DELETE FROM entries WHERE id=?1 AND revision=?2",
-                    params![target.opaque_id.clone(), target.expected_revision as i64],
-                )?;
-            }
+            db.exec(&format!("{cte} DELETE FROM entries WHERE id IN (SELECT id FROM targets)"),bindings)?;
             db.bump()?;
             Ok(())
         })
@@ -754,6 +775,43 @@ mod failure_tests {
         db.shutdown().unwrap();
     }
     #[test]
+    fn rollback_restores_payload_search_index_and_catalog_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Database::open(&dir.path().join("history.db")).unwrap();
+        db.apply_policy(StorePolicy {
+            admission: true,
+            ..StorePolicy::default()
+        })
+        .unwrap();
+        let entry = db
+            .insert("text/plain", b"searchable rollback needle")
+            .unwrap();
+        let revision = db.revision().unwrap();
+        let result: BackendResult<()> = db.transaction(|db| {
+            db.exec("DELETE FROM entries WHERE id=?1", [entry.id.as_str()])?;
+            db.bump()?;
+            Err(invalid_data("injected failure after indexed delete"))
+        });
+        assert!(result.is_err());
+        assert!(!db.blocked);
+        assert_eq!(db.revision().unwrap(), revision);
+        assert_eq!(
+            db.get(&entry.id, None).unwrap().bytes,
+            b"searchable rollback needle"
+        );
+        let page = db
+            .query(HistoryQuery {
+                query: "needle".into(),
+                generation: 0,
+                offset: 0,
+                limit: 10,
+                collapse_self_echoes: false,
+            })
+            .unwrap();
+        assert_eq!(page.total, 1);
+        db.shutdown().unwrap();
+    }
+    #[test]
     fn constraints_and_index_plans_are_enforced_by_real_engine() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.db");
@@ -777,9 +835,10 @@ mod failure_tests {
                 .any(|r| text(r, 3).unwrap().contains("entries_order"))
         );
         let plan=db.rows("EXPLAIN QUERY PLAN SELECT entry_id FROM search_content WHERE fts_match(indexed_content,'uni')",()).unwrap();
+        let details = plan.iter().map(|r| text(r, 3).unwrap()).collect::<Vec<_>>();
         assert!(
-            plan.iter()
-                .any(|r| text(r, 3).unwrap().contains("search_grams"))
+            details.iter().any(|p| p.contains("QUERY INDEX METHOD fts")),
+            "{details:?}"
         );
         db.shutdown().unwrap();
     }

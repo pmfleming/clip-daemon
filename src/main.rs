@@ -6,9 +6,10 @@ use tokio::io::AsyncReadExt;
 use tracing_subscriber::EnvFilter;
 
 use clip_daemon::{
-    backend::{ClipboardBackend, HistoryQuery, MAX_WAYLAND_SELECTION_BYTES},
-    client, daemon, protocol,
-    ringboard::RingboardBackend,
+    backend::{ClipboardBackend, MAX_WAYLAND_SELECTION_BYTES},
+    client, daemon,
+    history::HistoryBackend,
+    protocol,
 };
 
 #[derive(Debug, Parser)]
@@ -20,7 +21,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the clipboard capture and D-Bus service backed by Ringboard storage.
+    /// Run clipboard capture and D-Bus with embedded Turso history storage.
     Daemon,
     /// Bridge JSON Lines on stdin/stdout to the session service.
     Client,
@@ -37,10 +38,8 @@ enum Command {
         #[arg(long)]
         annotate: bool,
     },
-    /// Persist validated native settings before starting the Ringboard server.
-    ConfigureEngine,
-    /// Check whether the pinned Ringboard database is readable.
-    ProbeRingboard,
+    /// Open and verify the history store without enabling clipboard capture.
+    StoreStatus,
     /// Print stable protocol metadata and fixtures.
     Debug {
         #[command(subcommand)]
@@ -69,14 +68,14 @@ async fn run(command: Command) -> Result<()> {
         )
         .init();
     match command {
-        Command::Daemon => daemon::run(RingboardBackend::default()).await,
+        Command::Daemon => {
+            let backend = tokio::task::spawn_blocking(HistoryBackend::open).await??;
+            daemon::run(backend).await
+        }
         Command::Client => client::run().await,
         Command::Publish { mime } => publish_stdin(&mime).await,
         Command::Screenshot { screen, annotate } => client::screenshot(screen, annotate).await,
-        Command::ConfigureEngine => clip_daemon::settings::SettingsManager::default()
-            .prepare_engine()
-            .map_err(anyhow::Error::msg),
-        Command::ProbeRingboard => probe_ringboard().await,
+        Command::StoreStatus => store_status().await,
         Command::Debug { command } => print_debug(command),
     }
 }
@@ -103,31 +102,14 @@ async fn publish_stdin(mime: &str) -> Result<()> {
     client::publish(mime, bytes).await
 }
 
-async fn probe_ringboard() -> Result<()> {
-    let backend = RingboardBackend::default();
+async fn store_status() -> Result<()> {
+    let backend = tokio::task::spawn_blocking(HistoryBackend::open).await??;
     let status = backend.status().await;
-    if !status.available {
-        println!("{}", serde_json::to_string_pretty(&status)?);
-        anyhow::bail!("Ringboard is unavailable");
-    }
-    let history = backend
-        .query(HistoryQuery {
-            query: String::new(),
-            generation: 0,
-            offset: 0,
-            limit: 10,
-            collapse_self_echoes: true,
-        })
-        .await?;
-    // Never print clipboard IDs, previews, MIME values, or content from a probe.
-    let report = serde_json::json!({
-        "status": status,
-        "query": {
-            "entries_returned": history.entries.len(),
-            "has_more": history.has_more,
-            "revision": history.revision
-        }
-    });
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    // Never print clipboard IDs, previews, MIME values, or content.
+    let report = serde_json::to_string_pretty(&status);
+    let shutdown = backend.shutdown().await;
+    println!("{}", report?);
+    shutdown?;
+    anyhow::ensure!(status.available, "History store is unavailable");
     Ok(())
 }

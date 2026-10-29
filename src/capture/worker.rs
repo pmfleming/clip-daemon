@@ -20,6 +20,10 @@ use super::{
 /// Storage errors mean an uncertain outcome. Safe rejection returns success.
 pub trait CaptureSink: Send + Sync + 'static {
     fn ready(&self, max_bytes: u64) -> Result<(), String>;
+    /// Applied on the storage owner, not merely a local capture-state flag.
+    fn set_admission(&self, _enabled: bool) -> Result<(), String> {
+        Ok(())
+    }
     fn ingest(&self, mime: &str, file: &File) -> Result<(), String>;
 }
 
@@ -115,10 +119,14 @@ impl Session {
         while !self.control.stop.load(Ordering::SeqCst) {
             let result = sink
                 .ready(self.limit)
+                .and_then(|()| sink.set_admission(true))
                 .and_then(|()| self.control.gate.resume())
                 .and_then(|()| super::wayland::run(self.clone(), skip_initial));
             self.control.gate.close();
-            if let Err(error) = self.control.gate.fence() {
+            let fence = self.control.gate.fence();
+            let admission = sink.set_admission(false);
+            if let Err(error) = fence.and(admission) {
+                self.control.gate.uncertain.store(true, Ordering::SeqCst);
                 self.report(Err(error));
                 break;
             }
@@ -129,6 +137,11 @@ impl Session {
             // close() unparks this thread, including a stop racing with this wait.
             std::thread::park_timeout(backoff);
             backoff = (backoff * 2).min(Duration::from_secs(10));
+        }
+        // Also close SQL admission when stop raced with initial startup.
+        if let Err(error) = sink.set_admission(false) {
+            self.control.gate.uncertain.store(true, Ordering::SeqCst);
+            self.report(Err(error));
         }
     }
 }
