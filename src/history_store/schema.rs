@@ -1,0 +1,21 @@
+pub(super) const SCHEMA: &str = r#"
+CREATE TABLE store_meta(id INTEGER PRIMARY KEY CHECK(id=1), identity TEXT NOT NULL CHECK(identity='clip-daemon-history-v1'), revision INTEGER NOT NULL CHECK(revision>=0 AND revision<9007199254740991), sequence INTEGER NOT NULL CHECK(sequence>=0)) STRICT;
+INSERT INTO store_meta VALUES(1,'clip-daemon-history-v1',0,0);
+CREATE TABLE effective_policy(id INTEGER PRIMARY KEY CHECK(id=1), admission INTEGER NOT NULL CHECK(admission IN (0,1)), max_entries INTEGER NOT NULL CHECK(max_entries BETWEEN 0 AND 100000), max_favorites INTEGER NOT NULL CHECK(max_favorites BETWEEN 0 AND 10000), max_entry_bytes INTEGER NOT NULL CHECK(max_entry_bytes BETWEEN 1 AND 67108864), max_total_bytes INTEGER NOT NULL CHECK(max_total_bytes>0)) STRICT;
+INSERT INTO effective_policy VALUES(1,0,1000,100,16777216,268435456);
+CREATE TABLE entries(id TEXT PRIMARY KEY, revision INTEGER NOT NULL CHECK(revision>0), favorite INTEGER NOT NULL CHECK(favorite IN (0,1)), recency INTEGER NOT NULL CHECK(recency>0), mime TEXT NOT NULL CHECK(length(mime)<=255), resolved_mime TEXT NOT NULL CHECK(length(resolved_mime)<=255), echo_source_id TEXT REFERENCES entries(id) ON DELETE SET NULL, byte_size INTEGER NOT NULL CHECK(byte_size BETWEEN 0 AND 67108864), digest BLOB NOT NULL CHECK(length(digest)=32), preview TEXT NOT NULL, kind TEXT NOT NULL CHECK(kind IN ('Text','Link','Image','Files','Html','Json','Color','Binary'))) STRICT;
+CREATE INDEX entries_order ON entries(recency DESC,id);
+CREATE INDEX entries_favorite_order ON entries(favorite,recency DESC,id);
+CREATE INDEX entries_dedup ON entries(digest,mime,byte_size);
+CREATE INDEX entries_echo_source ON entries(echo_source_id);
+CREATE TABLE payloads(entry_id TEXT PRIMARY KEY REFERENCES entries(id) ON DELETE CASCADE, bytes BLOB NOT NULL CHECK(length(bytes)<=67108864)) STRICT;
+CREATE TABLE search_content(entry_id TEXT PRIMARY KEY REFERENCES entries(id) ON DELETE CASCADE, content TEXT NOT NULL, indexed_content TEXT NOT NULL, indexed_complete INTEGER NOT NULL CHECK(indexed_complete IN (0,1))) STRICT;
+CREATE INDEX search_grams ON search_content USING fts(indexed_content) WITH (tokenizer='ngram', min_gram=3, max_gram=3);
+CREATE INDEX search_unindexed ON search_content(indexed_complete,entry_id);
+CREATE TABLE artifacts(path TEXT PRIMARY KEY, source_entry_id TEXT NOT NULL, image_identity TEXT NOT NULL, created_at INTEGER NOT NULL CHECK(created_at>=0), device INTEGER NOT NULL, inode INTEGER NOT NULL, owner INTEGER NOT NULL CHECK(owner>=0)) STRICT;
+CREATE INDEX artifacts_source ON artifacts(source_entry_id);
+CREATE TABLE entry_artifacts(entry_id TEXT NOT NULL REFERENCES entries(id) ON DELETE CASCADE, path TEXT NOT NULL, PRIMARY KEY(entry_id,path)) STRICT;
+CREATE INDEX entry_artifacts_path ON entry_artifacts(path,entry_id);
+CREATE TABLE inline_echoes(image_identity TEXT PRIMARY KEY, source_entry_id TEXT NOT NULL, created_at INTEGER NOT NULL CHECK(created_at>=0)) STRICT;
+CREATE INDEX inline_echoes_source ON inline_echoes(source_entry_id);
+"#;
