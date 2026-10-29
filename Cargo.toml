@@ -16,6 +16,8 @@ clipboard-history-client-sdk = { version = "=0.16.2", features = ["watcher-utils
 # internal `version = "0"` range on 0.16.2; core 0.17 is incompatible.
 clipboard-history-core = "=0.16.2"
 futures-util = "0.3"
+futures-lite = "2.6"
+turso = { version = "=0.8.3", default-features = false, features = ["fts"] }
 hex = "0.4"
 hmac = "0.12"
 shelllist-search = { path = "vendor/shelllist-search" }
