@@ -22,37 +22,30 @@ deps:
 
 check: fmt-check lint test deps audit
 
-quality:
-    ../rust-quality-lens/target/debug/rqlens measure all --config rqlens.toml
-    ../rust-quality-lens/target/debug/rqlens verify --config rqlens.toml
-    ../rust-quality-lens/target/debug/rqlens check --config rqlens.toml --fail-on partial --fail-on test-failure --fail-on practice-failure
-
-live-acceptance:
-    cargo build --locked --examples
-    cargo build --locked
-    python3 scripts/isolated-acceptance.py
-
-capture-acceptance:
-    cargo build --locked --examples
-    cargo build --locked
-    python3 scripts/capture-acceptance.py
+storage-contract:
+    cargo run --locked --manifest-path tools/turso-contract/Cargo.toml
 
 backend-regressions:
-    cargo build --locked
-    RINGBOARD_SERVER="$(command -v ringboard-server)" python3 scripts/backend-regressions.py
+    cargo test --locked --test turso_storage --test turso_acceptance
+
+live-acceptance:
+    cargo build --locked --bin clip-daemon --examples
+    cargo run --locked --example turso_acceptance -- --nested
+
+capture-acceptance: live-acceptance
+
+package-acceptance package:
+    cargo build --locked --examples
+    cargo run --locked --example turso_acceptance -- --nested --package {{quote(package)}}
 
 benchmark-history:
-    python3 scripts/benchmark-history.py
+    cargo run --locked --release --example turso_benchmark
 
 contract:
-    cargo run -- debug protocol-registry
+    cargo run --locked -- debug protocol-registry
 
 probe:
-    cargo run -- probe-ringboard
-
-hardware-acceptance:
-    ./scripts/hardware-acceptance.sh check
+    cargo run --locked -- store-status
 
 nix-check:
-    # Always test the current shared framework, never a local deployment pin.
-    python3 ../daemon-framework/tools/local-build.py check . --show-trace
+    ../daemon-framework/tools/local-build check . --show-trace
