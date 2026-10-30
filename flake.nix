@@ -47,6 +47,12 @@
             # excluded by its non-default feature and runs separately.
             checkFlags = [ "--include-ignored" "--test-threads=1" ];
             postInstall = ''
+              install -Dm644 ${./integrations/yazi/yank-to-clip-daemon.yazi/main.lua} \
+                $out/share/yazi/plugins/yank-to-clip-daemon.yazi/main.lua
+              substituteInPlace $out/share/yazi/plugins/yank-to-clip-daemon.yazi/main.lua \
+                --replace-fail @out@ $out
+              ${pkgs.lua}/bin/lua ${./integrations/yazi/test.lua} \
+                $out/share/yazi/plugins/yank-to-clip-daemon.yazi/main.lua $out/bin/clip-daemon
               install -Dm644 ${./packaging/systemd/clip-daemon.service} \
                 $out/share/systemd/user/clip-daemon.service
               install -Dm644 ${./packaging/dbus/org.laufan.ClipDaemon.service} \

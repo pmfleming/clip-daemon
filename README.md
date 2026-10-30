@@ -92,6 +92,13 @@ file copy/cut, thumbnails, favorites, bulk delete, inline edits, screenshots,
 annotation cancellation, image-as-file, safe URL/file opening and confirmed wipe.
 A committed edit with failed external publication is reported as partial success.
 
+The package includes `share/yazi/plugins/yank-to-clip-daemon.yazi/main.lua`.
+Its `setup()` handler mirrors Yazi copy/cut selections through
+`clipboard.selection.publishFiles` using the packaged daemon's JSONL client.
+This integration does not depend on the removed Ringboard backend. Package tests
+exercise copy/cut, empty selections and error reporting without touching a live
+clipboard.
+
 Generated artifact ownership/references live in SQL. Cleanup checks the private
 root, inode, device and owner before unlinking; arbitrary clipboard URI targets
 are never cleanup candidates. Old JSON artifact records are not imported.
