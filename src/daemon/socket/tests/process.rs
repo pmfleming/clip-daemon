@@ -319,7 +319,12 @@ async fn private_daemon_child() {
                     phase: std::env::var("CLIP_CRASH_PHASE").unwrap(),
                 }),
                 crate::client::ClipCorrelation,
-                config(),
+                JsonlSocketConfig {
+                    // Four operation owners plus a replacement/observer. Domain
+                    // cancellation does not acknowledge socket-slot release.
+                    max_connections: 5,
+                    ..config()
+                },
                 std::future::pending(),
             )
             .await
@@ -513,9 +518,7 @@ fn audit(directory: &Path) -> Vec<Value> {
 }
 async fn complete(directory: &Path, ids: &[String]) {
     let _ = std::fs::remove_file(directory.join("finished"));
-    let temporary = directory.join("finish.tmp");
-    std::fs::write(&temporary, ids.join("\n")).unwrap();
-    std::fs::rename(temporary, directory.join("finish")).unwrap();
+    publish_marker(directory, "finish", ids.join("\n").as_bytes());
     marker(directory, "finished").await;
 }
 async fn capture(peer: &mut Peer) -> String {
@@ -931,6 +934,11 @@ async fn real_process_owner_cleanup_retains_committing_admission_and_healthy_pee
         let directory = fixture.runtime.clone();
         let mut peers = Vec::new();
         let mut ids = Vec::new();
+        let busy = call(
+            "busy",
+            "clipboard.capture.interactive",
+            json!({"mode":"region"}),
+        );
         for _ in 0..4 {
             let mut connection = peer(&directory).await;
             let mut owned = Vec::new();
@@ -938,16 +946,7 @@ async fn real_process_owner_cleanup_retains_committing_admission_and_healthy_pee
                 owned.push(capture(&mut connection).await);
             }
             assert_eq!(
-                request(
-                    &mut connection,
-                    call(
-                        "busy",
-                        "clipboard.capture.interactive",
-                        json!({"mode":"region"})
-                    ),
-                    &mut Vec::new()
-                )
-                .await["error"]["code"],
+                request(&mut connection, busy.clone(), &mut Vec::new()).await["error"]["code"],
                 "busy"
             );
             peers.push(connection);
@@ -968,16 +967,7 @@ async fn real_process_owner_cleanup_retains_committing_admission_and_healthy_pee
         .unwrap();
         let mut replacement = peer(&directory).await;
         assert_eq!(
-            request(
-                &mut replacement,
-                call(
-                    "global-busy",
-                    "clipboard.capture.interactive",
-                    json!({"mode":"region"})
-                ),
-                &mut Vec::new()
-            )
-            .await["error"]["code"],
+            request(&mut replacement, busy, &mut Vec::new()).await["error"]["code"],
             "busy",
             "disconnect is cancellation, not rollback or released admission"
         );
