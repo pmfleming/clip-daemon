@@ -2,6 +2,7 @@ use super::{ArtifactRecord, InlineEchoRecord, MAX_ENTRY_BYTES, StorePolicy, Stor
 use crate::{
     backend::{BackendError, BackendResult, EntryTarget, invalid_data, operation_error},
     classification::{INSPECTION_LIMIT, bounded_preview},
+    history::content::ResolvedContent,
     model::{EntryKind, EntrySummary, HistoryPage, HistoryQuery},
 };
 use futures_lite::future::block_on;
@@ -454,16 +455,22 @@ impl Database {
             } else {
                 if policy.max_entries==0 { return Err(invalid_data("Clipboard main history capacity is zero")); }
                 let id=format!("entry-{}",uuid::Uuid::new_v4());
-                let content=crate::history::content::ResolvedContent::resolve(mime,bytes,MAX_ENTRY_BYTES);
+                let content=ResolvedContent::resolve(mime,bytes,MAX_ENTRY_BYTES);
                 db.exec("INSERT INTO entries(id,revision,favorite,recency,mime,byte_size,digest,preview,kind,resolved_mime) VALUES(?1,?2,0,?3,?4,?5,?6,?7,?8,?9)",params![id.clone(),revision as i64,recency,mime,bytes.len() as i64,digest,bounded_preview(bytes,INSPECTION_LIMIT),content.kind().label(),content.mime()])?;
-                db.write_content(&id,mime,bytes)?;
+                db.write_content(&id,mime,bytes,&content)?;
                 id
             };
             db.retain(&policy,Some(&id))?;
             db.summary(&id,None)
         })
     }
-    fn write_content(&self, id: &str, mime: &str, bytes: &[u8]) -> BackendResult<()> {
+    fn write_content(
+        &self,
+        id: &str,
+        mime: &str,
+        bytes: &[u8],
+        resolved: &ResolvedContent<'_>,
+    ) -> BackendResult<()> {
         self.exec(
             "INSERT INTO payloads(entry_id,bytes) VALUES(?1,?2)",
             params![id, bytes],
@@ -499,9 +506,7 @@ impl Database {
         }
         // A URI echo is hidden only after checking registered file ownership and
         // exact image identity; arbitrary user paths never become echo aliases.
-        let content =
-            crate::history::content::ResolvedContent::resolve(mime, bytes, MAX_ENTRY_BYTES);
-        if let Some(source) = content.local_image()
+        if let Some(source) = resolved.local_image()
             && let Some(path) = source.path.to_str()
             && let Some(record) = self.artifact_get(path)?
             && record.source_entry_id != id
@@ -536,13 +541,13 @@ impl Database {
             let policy=db.policy()?;
             Self::allowed_payload(&policy,bytes)?;
             let revision=db.bump()?;
-            let content=crate::history::content::ResolvedContent::resolve(mime,bytes,MAX_ENTRY_BYTES);
+            let content=ResolvedContent::resolve(mime,bytes,MAX_ENTRY_BYTES);
             db.exec("UPDATE entries SET revision=?1,mime=?2,byte_size=?3,digest=?4,preview=?5,kind=?6,resolved_mime=?9,echo_source_id=NULL WHERE id=?7 AND revision=?8",params![revision as i64,mime,bytes.len() as i64,Sha256::digest(bytes).to_vec(),bounded_preview(bytes,INSPECTION_LIMIT),content.kind().label(),id,expected as i64,content.mime()])?;
             db.exec("UPDATE entries SET echo_source_id=NULL WHERE echo_source_id=?1",[id])?;
             db.exec("DELETE FROM payloads WHERE entry_id=?1",[id])?;
             db.exec("DELETE FROM search_content WHERE entry_id=?1",[id])?;
             db.exec("DELETE FROM entry_artifacts WHERE entry_id=?1",[id])?;
-            db.write_content(id,mime,bytes)?;
+            db.write_content(id,mime,bytes,&content)?;
             db.retain(&policy,Some(id))?;
             db.summary(id,None)
         })
