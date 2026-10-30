@@ -138,12 +138,12 @@ impl SelectionService {
                 "File selection operation must be copy or cut",
             ));
         }
-        let mut gnome_payload = Vec::with_capacity(operation.len() + 1 + uri_list.len());
-        gnome_payload.extend_from_slice(operation.as_bytes());
-        gnome_payload.push(b'\n');
-        gnome_payload.extend_from_slice(&uri_list);
         // This payload includes the entire URI list plus its operation header.
-        validate_size(gnome_payload.len() as u64, configured_limit)?;
+        validate_size(
+            uri_list.len() as u64 + operation.len() as u64 + 1,
+            configured_limit,
+        )?;
+        let gnome_payload = [operation.as_bytes(), b"\n", uri_list.as_slice()].concat();
         self.publisher.publish_files(gnome_payload, uri_list)
     }
 
@@ -302,11 +302,15 @@ mod tests {
         }
         let uri = b"file:///tmp/file\r\n";
         let size = (uri.len() + b"cut\n".len()) as u64;
-        assert!(
-            service
-                .publish_files("cut", uri.to_vec(), size - 1)
-                .is_err()
-        );
+        for (operation, limit) in [("copy", size), ("cut", size - 1), ("move", size)] {
+            assert_eq!(
+                service
+                    .publish_files(operation, uri.to_vec(), limit)
+                    .unwrap_err()
+                    .kind,
+                crate::backend::BackendErrorKind::InvalidData
+            );
+        }
         let directory = tempfile::tempdir().unwrap();
         assert_eq!(
             service
@@ -316,11 +320,23 @@ mod tests {
             crate::backend::BackendErrorKind::OperationFailed
         );
         assert!(publisher.values.lock().unwrap().is_empty());
-        service.publish_files("cut", uri.to_vec(), size).unwrap();
-        assert_eq!(
-            publisher.values.lock().unwrap()[0].1,
-            [b"cut\n".as_slice(), uri].concat()
-        );
+        for (operation, header) in [("copy", b"copy\n".as_slice()), ("cut", b"cut\n")] {
+            let limit = (uri.len() + header.len()) as u64;
+            service
+                .publish_files(operation, uri.to_vec(), limit)
+                .unwrap();
+            let values = std::mem::take(&mut *publisher.values.lock().unwrap());
+            assert_eq!(
+                values,
+                [
+                    (
+                        "x-special/gnome-copied-files".into(),
+                        [header, uri].concat()
+                    ),
+                    ("text/uri-list".into(), uri.to_vec()),
+                ]
+            );
+        }
         assert_eq!(effective_limit(u64::MAX), MAX_WAYLAND_SELECTION_BYTES);
     }
 }
