@@ -1,6 +1,6 @@
 use super::{
     HistoryBackend,
-    content::{MAX_THUMBNAIL_BYTES, ResolvedContent, ResolvedImage, valid_edited_image},
+    content::{MAX_THUMBNAIL_BYTES, ResolvedContent, ResolvedImage, read_edited_image},
     operation::{
         OperationCompletion, OperationControl, private_directory, private_file, runtime_directory,
         unique_path,
@@ -241,10 +241,8 @@ fn apply_annotation(
     output: &Path,
     max_bytes: u64,
 ) -> BackendResult<OperationCompletion> {
-    if !valid_edited_image(output, max_bytes) {
-        return Err(operation_error("Annotation returned an invalid image"));
-    }
-    let bytes = read_path(output, max_bytes)?;
+    let bytes = read_edited_image(output, max_bytes)
+        .ok_or_else(|| operation_error("Annotation returned an invalid image"))?;
     backend
         .store()?
         .replace(id, revision, "image/png", &bytes)?;

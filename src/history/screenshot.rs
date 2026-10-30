@@ -8,7 +8,7 @@ use std::{
 
 use tokio::{io::AsyncReadExt, process::Command};
 
-use super::content::{MAX_THUMBNAIL_BYTES, valid_edited_image};
+use super::content::{MAX_THUMBNAIL_BYTES, read_edited_image};
 use super::operation::{
     OperationCompletion, OperationControl, private_file, runtime_directory, unique_path,
 };
@@ -68,12 +68,11 @@ impl HistoryBackend {
 }
 
 fn publish_capture(backend: &HistoryBackend, path: &Path, max_bytes: u64) -> BackendResult<()> {
-    if !valid_edited_image(path, max_bytes) {
-        return Err(operation_error("Screenshot is not a valid bounded PNG"));
-    }
+    let bytes = read_edited_image(path, max_bytes)
+        .ok_or_else(|| operation_error("Screenshot is not a valid bounded PNG"))?;
     backend
         .selection
-        .publish_file("image/png", path, max_bytes.min(MAX_THUMBNAIL_BYTES))?;
+        .publish("image/png", bytes, max_bytes.min(MAX_THUMBNAIL_BYTES))?;
     backend.selection_changed()
 }
 
@@ -192,7 +191,7 @@ async fn edit_capture(
     max_bytes: u64,
 ) -> BackendResult<bool> {
     let path = input.to_owned();
-    if !run_blocking(move || Ok(valid_edited_image(&path, max_bytes))).await? {
+    if !run_blocking(move || Ok(read_edited_image(&path, max_bytes).is_some())).await? {
         return Err(operation_error("Screenshot is not a valid bounded PNG"));
     }
     tokio::time::timeout(

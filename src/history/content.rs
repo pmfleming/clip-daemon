@@ -205,18 +205,15 @@ fn decode_image<R: BufRead + Seek>(source: R) -> BackendResult<DynamicImage> {
         .map_err(|_| invalid_entry("Clipboard image could not be decoded"))
 }
 /// Edited output must be a regular, bounded PNG that fully decodes.
-pub(super) fn valid_edited_image(path: &Path, max_bytes: u64) -> bool {
+pub(super) fn read_edited_image(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
     if !path.symlink_metadata().is_ok_and(|metadata| {
         metadata.is_file() && metadata.len() <= max_bytes.min(MAX_THUMBNAIL_BYTES)
     }) {
-        return false;
+        return None;
     }
-    let Ok(bytes) = read_path(path, max_bytes.min(MAX_THUMBNAIL_BYTES)) else {
-        return false;
-    };
-    image_reader(ImageReader::new(io::Cursor::new(bytes))).is_ok_and(|reader| {
-        reader.format() == Some(image::ImageFormat::Png) && reader.decode().is_ok()
-    })
+    let bytes = read_path(path, max_bytes.min(MAX_THUMBNAIL_BYTES)).ok()?;
+    let reader = image_reader(ImageReader::new(io::Cursor::new(&bytes))).ok()?;
+    (reader.format() == Some(image::ImageFormat::Png) && reader.decode().is_ok()).then_some(bytes)
 }
 fn image_reader<R: BufRead + Seek>(reader: ImageReader<R>) -> io::Result<ImageReader<R>> {
     let mut reader = reader.with_guessed_format()?;
@@ -401,14 +398,21 @@ mod tests {
             image::RgbImage::new(width, 2)
                 .save_with_format(&path, format)
                 .unwrap();
-            assert_eq!(valid_edited_image(&path, MAX_THUMBNAIL_BYTES), valid);
+            let bytes = read_edited_image(&path, MAX_THUMBNAIL_BYTES);
+            assert_eq!(bytes.is_some(), valid);
+            if let Some(bytes) = bytes {
+                assert_eq!(bytes, fs::read(&path).unwrap());
+                fs::write(&path, b"changed after validation").unwrap();
+                assert!(image::load_from_memory(&bytes).is_ok());
+                fs::write(&path, &bytes).unwrap();
+            }
         }
-        assert!(!valid_edited_image(&path, 1));
+        assert!(read_edited_image(&path, 1).is_none());
         let link = directory.path().join("link.png");
         std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert!(!valid_edited_image(&link, MAX_THUMBNAIL_BYTES));
+        assert!(read_edited_image(&link, MAX_THUMBNAIL_BYTES).is_none());
         fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
-        assert!(!valid_edited_image(&path, MAX_THUMBNAIL_BYTES));
+        assert!(read_edited_image(&path, MAX_THUMBNAIL_BYTES).is_none());
     }
     #[test]
     fn thumbnail_cache_pruning_is_bounded_and_name_scoped() {
