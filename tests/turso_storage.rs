@@ -247,10 +247,19 @@ fn owner_lock_private_modes_and_symlinks_fail_closed() {
     let other = root.join("other.db");
     symlink(&path, &other).unwrap();
     assert!(HistoryStore::open(&other).is_err());
-    let evil = root.join("evil.db");
-    symlink(&path, root.join("evil.db.lock")).unwrap();
-    assert!(HistoryStore::open(&evil).is_err());
-    assert!(!evil.exists());
+    let missing = root.join("missing");
+    for suffix in [".lock", "-wal", "-shm"] {
+        for target in [&path, &missing] {
+            let evil = root.join(format!("evil-{suffix}-{}.db", target.exists()));
+            let sidecar = evil.with_extension(format!("db{suffix}"));
+            symlink(target, &sidecar).unwrap();
+            assert!(HistoryStore::open(&evil).is_err(), "{suffix}: {target:?}");
+            if suffix == ".lock" {
+                assert!(!evil.exists());
+            }
+            assert!(sidecar.symlink_metadata().unwrap().file_type().is_symlink());
+        }
+    }
 }
 
 #[test]

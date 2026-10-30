@@ -56,6 +56,19 @@ fn open_private(path: &Path) -> BackendResult<(File, bool)> {
         Err(e) => Err(operation_error(e)),
     }
 }
+fn protect_sidecars(path: &Path) -> BackendResult<()> {
+    for suffix in ["-wal", "-shm"] {
+        let side = sidecar(path, suffix);
+        match fs::symlink_metadata(&side) {
+            Ok(_) => {
+                private_file(&side, false)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(operation_error(error)),
+        }
+    }
+    Ok(())
+}
 impl Database {
     pub(super) fn open(path: &Path) -> BackendResult<Self> {
         let root = path
@@ -97,16 +110,7 @@ impl Database {
                 "Existing empty history database without recovery WAL is not a fresh store",
             ));
         }
-        for suffix in ["-wal", "-shm"] {
-            let side = sidecar(path, suffix);
-            match fs::symlink_metadata(&side) {
-                Ok(_) => {
-                    private_file(&side, false)?;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(operation_error(e)),
-            }
-        }
+        protect_sidecars(path)?;
         let database = block_on(
             turso::Builder::new_local(
                 path.to_str()
@@ -163,7 +167,7 @@ impl Database {
         })?;
         db.policy()?;
         db.revision()?;
-        db.protect_sidecars()?;
+        protect_sidecars(path)?;
         Ok(db)
     }
     fn validate_schema(&self) -> BackendResult<()> {
@@ -198,15 +202,6 @@ impl Database {
             return Err(invalid_data(
                 "History database referential integrity check failed",
             ));
-        }
-        Ok(())
-    }
-    fn protect_sidecars(&self) -> BackendResult<()> {
-        for suffix in ["-wal", "-shm"] {
-            let path = sidecar(&self.path, suffix);
-            if path.try_exists().map_err(operation_error)? {
-                private_file(&path, false)?;
-            }
         }
         Ok(())
     }
@@ -248,7 +243,7 @@ impl Database {
                         "History commit outcome is uncertain; restart required",
                     ));
                 }
-                if self.protect_sidecars().is_err() {
+                if protect_sidecars(&self.path).is_err() {
                     self.blocked = true;
                     return Err(BackendError::unavailable(
                         "History sidecar protection failed; restart required",
@@ -710,7 +705,7 @@ impl Database {
                 "History checkpoint was incomplete",
             ));
         }
-        self.protect_sidecars()
+        protect_sidecars(&self.path)
     }
 }
 fn search_gram(needle: &str) -> Option<String> {
@@ -800,6 +795,15 @@ fn decode_summary(row: &Row) -> BackendResult<EntrySummary> {
 #[cfg(test)]
 mod failure_tests {
     use super::*;
+    #[test]
+    fn dangling_sidecar_after_commit_fences_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.db");
+        let mut db = Database::open(&path).unwrap();
+        std::os::unix::fs::symlink("missing", sidecar(&path, "-shm")).unwrap();
+        assert!(db.transaction(|_| Ok(())).is_err());
+        assert!(db.blocked);
+    }
     #[test]
     fn ambiguous_commit_fences_but_recovery_observes_durable_revision() {
         let dir = tempfile::tempdir().unwrap();
