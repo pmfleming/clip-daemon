@@ -196,7 +196,7 @@ pub fn effective_limit(configured_limit: u64) -> u64 {
     configured_limit.min(MAX_WAYLAND_SELECTION_BYTES)
 }
 
-fn validate_size(size: u64, configured_limit: u64) -> BackendResult<()> {
+pub(crate) fn validate_size(size: u64, configured_limit: u64) -> BackendResult<()> {
     let limit = effective_limit(configured_limit);
     if size > limit {
         return Err(BackendError::new(

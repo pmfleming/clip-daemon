@@ -10,7 +10,7 @@ use super::{
 use crate::{
     backend::{BackendResult, EntryTarget, invalid_data as invalid_entry, operation_error},
     model::{EntryKind, OperationResult},
-    selection::{effective_limit, read_path, read_selection},
+    selection::{effective_limit, read_path, validate_size},
 };
 use std::{
     borrow::Cow,
@@ -271,11 +271,11 @@ fn selected_bytes(
     max_bytes: u64,
 ) -> BackendResult<(crate::model::EntrySummary, Vec<u8>)> {
     let mut stored = backend.selected(id, expected)?;
-    let bytes = read_selection(&mut &stored.bytes[..], stored.bytes.len() as u64, max_bytes)?;
+    validate_size(stored.bytes.len() as u64, max_bytes)?;
     // Internal content resolution needs the captured MIME, not the semantic UI
     // label (a file URI can have an image/png summary but still contain a URI).
     stored.summary.mime = stored.mime;
-    Ok((stored.summary, bytes))
+    Ok((stored.summary, stored.bytes))
 }
 fn selected_image(
     backend: &HistoryBackend,
@@ -378,6 +378,9 @@ mod tests {
             super::selected_image(&backend, &entry.id, Some(entry.revision), 1024).unwrap();
         assert_eq!(internal.mime, "text/uri-list");
         assert_eq!(bytes, uri.as_bytes());
+        let error =
+            super::selected_image(&backend, &entry.id, Some(entry.revision), 1).unwrap_err();
+        assert_eq!(error.kind, crate::backend::BackendErrorKind::InvalidData);
         let content = super::resolved_content(&internal.mime, &bytes, 1024);
         assert_eq!(content.local_image().unwrap().path, image);
         let details =
