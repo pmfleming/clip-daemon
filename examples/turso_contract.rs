@@ -30,6 +30,7 @@ fn main() -> Result<()> {
 async fn open(path: &Path) -> Result<(turso::Database, turso::Connection)> {
     let db = turso::Builder::new_local(path.to_str().unwrap())
         .with_io(turso::IoBackend::Syscall)
+        .experimental_multiprocess_wal(true)
         .experimental_index_method(true)
         .experimental_vacuum(true)
         .build()

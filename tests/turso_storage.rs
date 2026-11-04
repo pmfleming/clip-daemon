@@ -276,6 +276,7 @@ fn corrupt_empty_and_wrong_identity_files_are_never_reinitialized() {
     futures_lite::future::block_on(async {
         let db = turso::Builder::new_local(path.to_str().unwrap())
             .with_io(turso::IoBackend::Syscall)
+            .experimental_multiprocess_wal(true)
             .build()
             .await
             .unwrap();
@@ -291,6 +292,7 @@ fn corrupt_empty_and_wrong_identity_files_are_never_reinitialized() {
     futures_lite::future::block_on(async {
         let db = turso::Builder::new_local(path.to_str().unwrap())
             .with_io(turso::IoBackend::Syscall)
+            .experimental_multiprocess_wal(true)
             .build()
             .await
             .unwrap();
@@ -505,6 +507,7 @@ fn same_version_tampered_schema_is_rejected_without_deleting_data() {
     futures_lite::future::block_on(async {
         let db = turso::Builder::new_local(path.to_str().unwrap())
             .with_io(turso::IoBackend::Syscall)
+            .experimental_multiprocess_wal(true)
             .experimental_index_method(true)
             .build()
             .await

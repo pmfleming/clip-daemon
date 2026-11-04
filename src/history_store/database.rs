@@ -117,6 +117,7 @@ impl Database {
                     .ok_or_else(|| invalid_data("History path must be UTF-8"))?,
             )
             .with_io(turso::IoBackend::Syscall)
+            .experimental_multiprocess_wal(true)
             .experimental_index_method(true)
             .build(),
         )

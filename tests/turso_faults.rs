@@ -390,6 +390,7 @@ fn fault_subprocess() {
         "uncommitted" => block_on(async {
             let database = turso::Builder::new_local(path.to_str().unwrap())
                 .with_io(turso::IoBackend::Syscall)
+                .experimental_multiprocess_wal(true)
                 .experimental_index_method(true)
                 .build()
                 .await
