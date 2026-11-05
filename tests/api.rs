@@ -93,10 +93,12 @@ async fn wipe_requires_a_verified_capture_fence_before_deleting_anything() {
 
 #[tokio::test]
 async fn native_search_uses_revision_bound_owner_scoped_cursors() {
+    let mut pinned = entry("three", EntryKind::Text, Some("Café three"));
+    pinned.entry.favorite = true;
     let backend = Arc::new(FakeBackend::with_entries(vec![
         entry("one", EntryKind::Text, Some("Café one")),
         entry("two", EntryKind::Text, Some("Café two")),
-        entry("three", EntryKind::Text, Some("Café three")),
+        pinned,
     ]));
     let api = TestApi(ApiService::new(backend.clone()));
     let plain = api.history(json!({"limit":3})).await;
@@ -114,7 +116,8 @@ async fn native_search_uses_revision_bound_owner_scoped_cursors() {
     assert_eq!(first["ok"], true, "{first}");
     let first = &first["data"]["history"];
     assert_eq!(first["total"], 3);
-    assert_eq!(first["entries"][0]["id"], "one");
+    assert_eq!(first["entries"][0]["id"], "three");
+    assert_eq!(first["entries"][1]["id"], "one");
     let next = || {
         let mut value = request();
         value["cursor"] = first["next_cursor"].clone();
@@ -125,7 +128,7 @@ async fn native_search_uses_revision_bound_owner_scoped_cursors() {
         .dispatch_owned("clipboard.history.query", next(), Some(":1.1".into()))
         .await;
     assert_eq!(second["ok"], true, "{second}");
-    assert_eq!(second["data"]["history"]["entries"][0]["id"], "three");
+    assert_eq!(second["data"]["history"]["entries"][0]["id"], "two");
     assert!(second["data"]["history"]["next_cursor"].is_null());
     for owner in [None, Some(":1.2".into())] {
         let denied = api

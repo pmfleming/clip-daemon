@@ -225,6 +225,8 @@ impl ClipboardBackend for FakeBackend {
             .map(|item| item.entry.clone());
         let matches = entries
             .iter()
+            .filter(|item| item.entry.favorite)
+            .chain(entries.iter().filter(|item| !item.entry.favorite))
             .map(|item| &item.entry)
             .filter(|item| needle.is_empty() || item.preview.to_lowercase().contains(&needle));
         let (page, matched) = paginate(matches, query.offset, query.limit);

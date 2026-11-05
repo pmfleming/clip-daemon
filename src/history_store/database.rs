@@ -378,7 +378,7 @@ impl Database {
             gram.clone()
         ];
         let rows = self.rows(
-            &format!("SELECT {COLUMNS} {filter} ORDER BY e.recency DESC,e.id LIMIT ?2 OFFSET ?3"),
+            &format!("SELECT {COLUMNS} {filter} ORDER BY e.favorite DESC,e.recency DESC,e.id LIMIT ?2 OFFSET ?3"),
             parameters,
         )?;
         let total = self.scalar(

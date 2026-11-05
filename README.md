@@ -68,7 +68,9 @@ Search is a **Unicode-lowercased literal substring**, not fuzzy matching or a qu
 language. SQL verifies matches against separate full-text content; native FTS
 trigrams narrow eligible candidates. Short/punctuation-only queries and oversized
 unindexed text fall back to SQL verification, not application-side payload scans.
-Ordering is recency-based. Quotes, wildcards and punctuation are literal input.
+Pinned entries come first, then ordinary history; each group is ordered by
+recency. This ordering applies before pagination to both browsing and matching
+search results. Quotes, wildcards and punctuation are literal input.
 There is no accent stripping or canonical Unicode normalization.
 
 `clipboard.history.query` accepts `cursor_mode: true` for authenticated,

@@ -41,7 +41,8 @@ Search is **Unicode lowercase literal substring**, not fuzzy matching, stemming,
 regex, query syntax, or Unicode full case folding. For example, `Straße` matches
 `straße` but not `STRASSE`. Searchable content comprises raw MIME, a newline, and the
 complete payload when valid UTF-8. Invalid UTF-8 payloads remain restorable but only
-their MIME is searchable. Results always retain recency order.
+their MIME is searchable. Results put favorites first, then ordinary history,
+retaining recency order within each group before applying offsets and limits.
 
 A native FTS trigram index narrows candidates by intersecting up to 32 generated,
 quoted alphanumeric trigrams from the lowercased query. Final SQL `instr` verification
@@ -50,7 +51,7 @@ The FTS index covers complete searchable documents no larger than 64 KiB. Larger
 documents are explicitly marked unindexed and always included for SQL verification,
 preventing false negatives while bounding native-index amplification for 64 MiB
 entries. Short/punctuation-only searches use SQL verification directly. Empty-query
-browsing touches metadata only, using the recency index. The worker never scans
+browsing touches metadata only. The worker never scans
 history payloads in Rust or retains a full-history cache. Page, total, current entry,
 and revision are read under the same serialized owner snapshot.
 

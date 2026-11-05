@@ -95,6 +95,52 @@ fn exact_bytes_dedup_promotion_and_mime_identity() {
 }
 
 #[test]
+fn pins_precede_recent_history_across_pages_search_and_restart() {
+    let (dir, s) = store();
+    let oldest = s.insert("text/plain", b"match oldest pin").unwrap();
+    let newer_pin = s.insert("text/plain", b"match newer pin").unwrap();
+    let ordinary = s.insert("text/plain", b"match ordinary").unwrap();
+    let newest = s.insert("text/plain", b"match newest").unwrap();
+    // Pinning does not change recency within either group or the current item.
+    s.favorite(&newer_pin.id, newer_pin.revision, true).unwrap();
+    s.favorite(&oldest.id, oldest.revision, true).unwrap();
+    let expected = [&newer_pin.id, &oldest.id, &newest.id, &ordinary.id];
+    for needle in ["", "match"] {
+        let mut ids = Vec::new();
+        for offset in 0..4 {
+            let page = s.query(query(needle, offset, 1)).unwrap();
+            assert_eq!(page.total, 4);
+            assert_eq!(page.current.unwrap().id, newest.id);
+            assert_eq!(page.has_more, offset < 3);
+            assert_eq!(page.next_offset, (offset < 3).then_some(offset + 1));
+            ids.push(page.entries[0].id.clone());
+        }
+        assert_eq!(ids.iter().collect::<Vec<_>>(), expected);
+    }
+    assert_eq!(
+        s.query(query("ordinary", 0, 10)).unwrap().entries[0].id,
+        ordinary.id
+    );
+    s.shutdown().unwrap();
+    let s = HistoryStore::open(&dir.path().join("history.db")).unwrap();
+    assert_eq!(
+        s.query(query("", 0, 1)).unwrap().entries[0].id,
+        newer_pin.id
+    );
+    let pinned = s.get(&newer_pin.id, None).unwrap().summary;
+    s.favorite(&pinned.id, pinned.revision, false).unwrap();
+    let page = s.query(query("", 0, 10)).unwrap();
+    assert_eq!(
+        page.entries
+            .iter()
+            .map(|entry| &entry.id)
+            .collect::<Vec<_>>(),
+        [&oldest.id, &newest.id, &ordinary.id, &newer_pin.id]
+    );
+    s.shutdown().unwrap();
+}
+
+#[test]
 fn unicode_literal_search_pagination_and_search_replacement_are_sql_consistent() {
     let (_dir, s) = store();
     let a = s
