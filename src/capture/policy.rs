@@ -16,19 +16,15 @@ impl OfferedMimes {
         }
         self.count += 1;
         self.bytes += value.len();
-        if value == "application/x-shelllist-sensitive" || value == "x-kde-passwordManagerHint" {
-            self.rejected = true;
-            return;
-        }
-        if value.is_empty()
-            || self.count > 64
+        self.rejected = matches!(
+            value.as_str(),
+            "application/x-shelllist-sensitive" | "x-kde-passwordManagerHint"
+        ) || value.is_empty()
+            || self.count > MAX_OFFERS
             || self.bytes > 8192
             || value.len() > 96
-            || value
-                .bytes()
-                .any(|byte| byte.is_ascii_control() || !byte.is_ascii())
-        {
-            self.rejected = true;
+            || value.bytes().any(|byte| !(b' '..=b'~').contains(&byte));
+        if self.rejected {
             return;
         }
         // Preserve the established preference/fallback contract without an SDK.
@@ -69,16 +65,25 @@ mod tests {
 
     #[test]
     fn overflow_never_truncates_away_sensitive_markers() {
-        for count in [1, 63, 64, 65] {
-            let mut mimes = OfferedMimes::default();
-            for _ in 0..count {
+        for marker in [
+            "x-kde-passwordManagerHint",
+            "application/x-shelllist-sensitive",
+        ] {
+            for count in [0, 1, 63, 64, 65] {
+                let mut mimes = OfferedMimes::default();
+                for _ in 0..count {
+                    mimes.add("text/plain".into());
+                }
+                assert_eq!(mimes.next().is_some(), (1..=64).contains(&count));
                 mimes.add("text/plain".into());
+                mimes.add(marker.into());
+                assert!(mimes.next().is_none());
             }
-            mimes.add("x-kde-passwordManagerHint".into());
-            assert!(mimes.next().is_none());
         }
         for bad in [
+            String::new(),
             "a".repeat(97),
+            "text/\u{7f}".into(),
             "text/plain\n".into(),
             "text/é".into(),
             "application/x-shelllist-sensitive".into(),
@@ -88,31 +93,6 @@ mod tests {
             mimes.add(bad);
             assert!(mimes.next().is_none());
         }
-    }
-
-    #[test]
-    fn representation_groups_preserve_priority_and_prefer_parameterless() {
-        let mut mimes = OfferedMimes::default();
-        for mime in [
-            "text/html;charset=utf-8",
-            "text/uri-list",
-            "image/png;profile=sRGB",
-            "image/jpeg",
-            "text/plain",
-            "x-special/gnome-copied-files",
-            "chromium/x-internal-other",
-        ] {
-            mimes.add(mime.into());
-        }
-        assert_eq!(
-            std::iter::from_fn(|| mimes.next()).collect::<Vec<_>>(),
-            [
-                "text/plain",
-                "image/jpeg",
-                "x-special/gnome-copied-files",
-                "text/uri-list"
-            ]
-        );
     }
 
     #[test]

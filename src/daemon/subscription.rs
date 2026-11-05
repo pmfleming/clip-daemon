@@ -107,22 +107,22 @@ where
 impl HistoryState {
     fn update(&mut self, result: Result<Value, ApiError>) -> Option<HistoryUpdate> {
         match result {
-            Ok(observation) => self
-                .changed(observation.clone())
-                .then_some(HistoryUpdate::Changed(observation)),
+            Ok(observation) =>
+            // Repeated polls need no owned copy; recovery still emits even
+            // when the content token matches the last healthy observation.
+            {
+                (std::mem::replace(&mut self.unavailable, false)
+                    || self.previous.as_ref() != Some(&observation))
+                .then(|| {
+                    self.previous = Some(observation.clone());
+                    HistoryUpdate::Changed(observation)
+                })
+            }
             Err(error) if !std::mem::replace(&mut self.unavailable, true) => {
                 Some(HistoryUpdate::Unavailable(error))
             }
             Err(_) => None,
         }
-    }
-
-    fn changed(&mut self, token: Value) -> bool {
-        // An initial reset closes the race between a frontend's first query and
-        // establishing this subscription's history baseline.
-        let previous = self.previous.replace(token.clone());
-        std::mem::replace(&mut self.unavailable, false)
-            || previous.is_none_or(|previous| previous != token)
     }
 }
 
@@ -330,27 +330,27 @@ mod tests {
     #[test]
     fn history_state_emits_initial_changes_outages_and_recovery_once() {
         let mut state = HistoryState::default();
-        assert!(matches!(
-            state.update(Ok(serde_json::json!(1))),
-            Some(HistoryUpdate::Changed(_))
-        ));
-        assert!(state.update(Ok(serde_json::json!(1))).is_none());
-        assert!(matches!(
-            state.update(Ok(serde_json::json!(2))),
-            Some(HistoryUpdate::Changed(_))
-        ));
-        assert!(matches!(
-            state.update(Err(ApiError::new("offline", "History unavailable"))),
-            Some(HistoryUpdate::Unavailable(_))
-        ));
-        assert!(
-            state
-                .update(Err(ApiError::new("offline", "History unavailable")))
-                .is_none()
-        );
-        assert!(matches!(
-            state.update(Ok(serde_json::json!(2))),
-            Some(HistoryUpdate::Changed(_))
-        ));
+        for (token, expected) in [
+            (Some(1), "changed:1"),
+            (Some(1), "quiet"),
+            (None, "offline"),
+            (None, "quiet"),
+            (Some(1), "changed:1"),
+            (Some(1), "quiet"),
+            (Some(2), "changed:2"),
+            (None, "offline"),
+            (None, "quiet"),
+            (Some(2), "changed:2"),
+            (Some(2), "quiet"),
+        ] {
+            let input = token
+                .map(serde_json::Value::from)
+                .ok_or_else(|| ApiError::new("offline", "History unavailable"));
+            let actual = state.update(input).map(|update| match update {
+                HistoryUpdate::Changed(value) => format!("changed:{value}"),
+                HistoryUpdate::Unavailable(error) => error.code,
+            });
+            assert_eq!(actual.as_deref().unwrap_or("quiet"), expected);
+        }
     }
 }

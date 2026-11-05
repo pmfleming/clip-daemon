@@ -575,18 +575,14 @@ impl ApiService {
         }
         let challenge = {
             let mut challenges = self.wipe_challenges.lock().await;
-            if challenges
-                .get(&params.challenge_id)
-                .is_none_or(|challenge| challenge.owner.as_deref() != owner)
-            {
-                return Err(ApiError::new(
-                    "stale-action",
-                    "wipe challenge is unknown or already used",
-                ));
-            }
             challenges
-                .remove(&params.challenge_id)
-                .expect("checked under the same lock")
+                .get(&params.challenge_id)
+                .is_some_and(|challenge| challenge.owner.as_deref() == owner)
+                .then(|| challenges.remove(&params.challenge_id))
+                .flatten()
+                .ok_or_else(|| {
+                    ApiError::new("stale-action", "wipe challenge is unknown or already used")
+                })?
         };
         if challenge.expires <= Instant::now() {
             return Err(ApiError::new("stale-action", "wipe challenge expired"));

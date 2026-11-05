@@ -12,5 +12,7 @@
   {"name":"sensitive marker last", "offers":["text/plain","image/png","x-kde-passwordManagerHint"], "expected":[]},
   {"name":"sensitive marker first", "offers":["x-kde-passwordManagerHint","text/plain"], "expected":[]},
   {"name":"sensitive marker middle", "offers":["text/html","x-kde-passwordManagerHint","text/plain"], "expected":[]},
+  {"name":"all groups prefer parameterless without changing fallback priority", "offers":["text/html;charset=utf-8","text/uri-list","image/png;profile=sRGB","image/jpeg","text/plain","x-special/gnome-copied-files","chromium/x-internal-other"], "expected":["text/plain","image/jpeg","x-special/gnome-copied-files","text/uri-list"]},
+  {"name":"parameterless choices cannot be downgraded", "offers":["text/plain","text/plain;charset=utf-8","image/png","image/jpeg;profile=sRGB"], "expected":["text/plain","image/png"]},
   {"name":"no usable MIME", "offers":["TARGETS","TIMESTAMP"], "expected":[]}
 ]

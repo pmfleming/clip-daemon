@@ -1,0 +1,158 @@
+Clip-daemon RQLens refactor review, 2026-11-05
+
+Scope and provenance
+Repository: /home/laufan/Projects/clip-daemon. Clean starting HEAD:
+398e0c0e6349850678c42ec6c650ca19712193d1. No preexisting changes.
+Reviewed README, rqlens.toml, justfile, flake.nix, BUILD-CACHE.md, storage
+README, qualification evidence, and contracts. Inventoried all 49 configured
+Rust source files and reviewed repository-wide hotspot/duplication findings.
+No framework, QML, manifest, lockfile, protocol registry, service or deployment
+changes. No commits or pushes. New evidence belongs here, outside ignored docs/.
+
+Frozen current-source RQLens: target/rqlens-refactor-20261105/rqlens,
+source revision d137d8d8f219b4ee788935aff27115374626d2f8, version 0.1.0,
+SHA256 8f9a8852860c8e63c1f23e479e90f1ced9e711224e3c57299fca6a523f0afb9f.
+Rust/Cargo 1.95.0, LLVM 21.1.8, cargo-llvm-cov 0.8.5,
+rust-analyzer 2026-04-27. Analyzer was copied, never rebuilt or edited here.
+Original rqlens.toml SHA256:
+c257d486c0189d972498d00ebd7562bca70ff42a5466f83a0ecc3f79a6e16d77.
+Cargo.lock SHA256, unchanged:
+a71ca86a147492f4f878acb795444629ff61983774953f8c64c2f09d701ebaa0.
+
+Ignored raw evidence: target/rqlens-refactor-20261105/{before,after}/.
+Before reports/logs were captured before source edits and made read-only.
+The two generated TOML configs preserve repository options and source_roots=src;
+only output_dir differs, and project_root/helper_manifest use absolute paths.
+Vendor/build/generated files remain excluded. No measure-all invocation.
+Direct framework core/tokio source fingerprints stayed unchanged. Concurrent
+framework edits changed shelllist-hyprland/src/{address,events}.rs, which are
+outside this daemon's dependency graph. Full per-file hashes are preserved in
+before/framework-inputs.json and after/framework-inputs.json.
+
+Ranked findings and implementation
+1. Avoidable allocation in repeated history observations and search preparation.
+   HistoryState now compares borrowed observations, cloning only on emission:
+   two deep Value copies per poll become zero unchanged / one changed. Initial
+   reset, deduplicated outages and same-token recovery remain covered. Search
+   trigrams borrow Unicode-safe slices and retain only 32 distinct terms, removing
+   the per-word character vector and per-occurrence String allocations. SQL
+   page/count share parameter construction; bulk deletion constructs bindings
+   on demand instead of retaining and cloning a complete extra binding vector.
+   SQL still owns its required values: fewer clone calls do not mean those
+   parameter copies disappeared. Literal matching and atomic revision checks stay.
+2. Duplicated owner-check/remove/expect sequences in edit and wipe consumption.
+   Conditional Option removal holds the same lock and preserves foreign leases,
+   while reporting missing identities as ordinary errors instead of panicking.
+   Paste authority is still checked before consuming an edit; expiry, size,
+   revision, wipe confirmation and capture fencing remain intact.
+3. MIME admission (cognitive 14, cyclomatic 27). One rejection expression shares
+   the existing offer-count constant and uses the equivalent printable-ASCII
+   range. Both sensitive markers and every count/byte/length guard remain.
+4. Test duplication and admission allocation. Operation admission counts active
+   records without collecting a Vec, retaining global/per-owner pending bounds.
+   Edit ownership/publication/single-use cases share one matrix; MIME priority
+   cases use the existing fixture runner; delayed-paste tests share task setup.
+   Added expiry, configured/hard edit limits, non-consuming invalid paste,
+   Unicode/short/punctuation/repeated/bounded trigrams, active+pending admission,
+   terminal expiry, initial/reset/recovery payload and MIME downgrade cases.
+5. Remaining large hotspots: Database::open (17/48 cognitive/cyclomatic), secret
+   run_on (15/14), write_content (13/24), and CLI screenshot effort 142165.50.
+   Splitting their safety/lifecycle logic solely to change scores was rejected.
+   No preexisting dead code was proven removable. The single-caller private
+   HistoryState::changed forwarding helper was absorbed into its data owner;
+   search and compiler/Clippy verification confirm no remaining caller.
+
+Comparable measurements                     Before          After       Delta
+Non-test-named source functions                  607            606          -1
+Cognitive complexity, function sum               659            651          -8
+Cyclomatic complexity, function sum             2054           2050          -4
+Halstead effort, function sum             4264861.10     4260603.13    -4257.97
+Cognitive / cyclomatic maxima                  17/48          17/48           0
+Mean locality, 49 modules                  98.683673      98.683673           0
+Mean leverage, 49 modules                  25.306122      25.306122           0
+Token duplicate-code groups                       41             39          -2
+Duplicated nonblank source lines                 704            670         -34
+Explicit production .clone() sites               141            136          -5
+Static production panic findings                   6              4          -2
+Unsafe blocks / lint suppressions                0/0            0/0           0
+Glob imports                                      15             15           0
+Production physical Rust LOC                   10468          10449         -19
+Test physical Rust LOC                          6119           6120          +1
+Example/tool physical Rust LOC                  1665           1665           0
+Total authored Rust LOC, excluding vendor      18252          18234         -18
+Test attributes                                  112            111          -1
+
+LOC includes blank/comment lines; the preserved loc.py partitions cfg(test)
+items and dedicated test files, using Git objects for before and the working
+source for after. metrics.py excludes test-named functions/files consistently.
+These are authored syntax observations, not expanded/compiled inventories.
+Token duplicates are repeated code, separate from .clone() allocation sites;
+many remaining clones are cheap Arc/handle clones. The four remaining static
+production unwrap findings are in cfg(test) FakeBackend helpers. No panic-free
+whole-program claim. Test-quality advisories remain 8 (5 indirect-assertion
+bodies, 3 normally ignored tests); this heuristic is not executed coverage.
+
+Tradeoffs: test LOC did not decrease; it grew one line despite consolidation and
+34 fewer duplicated lines, because distinct edge/authority assertions expanded.
+Locality/leverage did not improve numerically. Query effort falls 74822.92 to
+66636.93; bulk-delete effort falls 35787.97 to 33174.68. Trigram cognitive/
+cyclomatic fall 8/5 to 3/3, but its iterator plumbing raises effort 13388.86 to
+17179.76. Admission's explicit counting loop rises 2/3 to 3/4; wipe and merged
+notification effort also increase locally. Aggregate reductions are modest;
+allocation removal and preserved authority are the main benefits.
+
+Both semantic runs resolve every reference: 553/553 before and 555/555 after.
+An intermediate 513/555 timeout was replaced by the final complete run. Syntax
+confidence still reports unexpanded macros/derives; no strict complete-evidence
+policy pass is claimed. RQLens helper digest stays ef0da1f9173833d6.
+
+Executed comparable coverage, src/ only (37 files, including inline tests)
+Lines:     6843/9041 = 75.68853% -> 6911/9102 = 75.92837% (+0.23984 pp).
+Functions: 902/1298  = 69.49153% -> 914/1309  = 69.82429%.
+Regions:   10684/14463 = 73.87126% -> 10767/14533 = 74.08656%.
+Scope is identical: --lib --all-features --locked, default ignored-test policy.
+Before executes 73 passed / 3 ignored; after 72 passed / 3 ignored following
+consolidation. Final coverage was exported in an isolated serial invocation,
+separate from broader runs. No branch coverage or pure production-only line
+percentage is claimed; inline test code affects numerator and denominator.
+
+Commands and verification (cwd is this repository)
+Environment bootstrap:
+  local-build develop . --command bash -c 'export -p > target/rqlens-refactor-20261105/environment.sh'
+Every following Cargo/analyzer invocation sources that environment and exports
+CARGO_BUILD_JOBS=2. Targets remain within this repository.
+For phase=before and phase=after, p iterates hotspots, clones, escape-hatches,
+reliability, test-quality, locality, leverage:
+  target/rqlens-refactor-20261105/rqlens measure "$p" --config "target/rqlens-refactor-20261105/$phase.toml"
+All seven final producers exit 0. Exact TOML inputs and per-producer logs retained.
+  cargo llvm-cov --lib --all-features --locked --json --output-path target/rqlens-refactor-20261105/before/llvm-cov.json
+  cargo llvm-cov --lib --all-features --locked --json --output-path target/rqlens-refactor-20261105/after/llvm-cov.json
+  cargo fmt --all -- --check
+  cargo clippy --all-targets --all-features --locked -- -D warnings
+Formatting and strict Clippy pass without warnings.
+  cargo llvm-cov --no-report --all-targets --all-features --locked -- --include-ignored --skip native_quickshell_clip_socket_acceptance --test-threads=1
+Pass: 110 tests, zero failed/ignored, one native test filtered; both private
+large-frame tests execute. Log: after/full-tests-final.log.
+With SHELLLIST_SOURCE=/home/laufan/Projects/shelllist and SHELLLIST_QUICKSHELL=
+/nix/store/nm6wrf4gprrxlri8nr16kcmixpkk8hrf-quickshell-0.3.0/bin/quickshell:
+  cargo llvm-cov --no-report --all-features --locked --lib -- native_quickshell_clip_socket_acceptance --ignored
+Pass: one actual private Quickshell test (normal and large-frame scenarios).
+Thus all 111 current test cases execute across the final runs.
+  python3 target/rqlens-refactor-20261105/loc.py HEAD
+  python3 target/rqlens-refactor-20261105/loc.py
+  python3 target/rqlens-refactor-20261105/metrics.py after
+Python is /nix/store/1rv1khgjp7li75h8vjlna14p7pgx6gva-python3-3.13.13-env/bin/python3.
+  git diff --check
+Pass. Final diff reviewed; manifests, locks, API registry and shared sources have
+no worker edits. Before/after raw roots are separate; only after was refreshed.
+
+Failed attempts, limitations and remaining work
+An initial broad run passed domain/integration tests but could not launch an
+example executable: overlapping cargo-llvm-cov commands cleaned its target.
+Discarded that attempt and reran serially; the final broad run passes. A native
+filter initially placed before '--' was rejected by cargo-llvm-cov before any
+test executed; the corrected command above passes. Neither is passing evidence.
+No missing verification tool or remaining execution blocker. No audit/machete,
+installed-package rebuild, nested full-desktop qualification, benchmark,
+physical power-loss or real-login test was rerun. Remaining large state machines,
+unchanged architecture scores and the +1 test LOC tradeoff remain explicit.

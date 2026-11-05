@@ -354,6 +354,25 @@ mod tests {
         id
     }
 
+    // Observe cancellation of a production-owned task without invoking hardware.
+    async fn hidden_pending(
+        manager: &SessionManager,
+        id: &str,
+        owner: Option<&str>,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        let (cancelled, cancellation) = tokio::sync::oneshot::channel();
+        manager
+            .hide_with(id, owner, |_| {
+                tokio::spawn(async move {
+                    let _sender = cancelled;
+                    std::future::pending::<()>().await;
+                })
+            })
+            .await
+            .unwrap();
+        cancellation
+    }
+
     #[tokio::test]
     async fn foreign_owners_cannot_consume_sessions_and_release_cancels_delayed_paste() {
         let manager = SessionManager::default();
@@ -368,17 +387,7 @@ mod tests {
             assert!(manager.validate_paste(&id, owner).await.unwrap());
         }
         assert!(manager.arm_paste(&id, owner).await);
-        let (cancelled, cancellation) = tokio::sync::oneshot::channel::<()>();
-        // Test the production task ownership without invoking any hardware helper.
-        manager
-            .hide_with(&id, owner, |_| {
-                tokio::spawn(async move {
-                    let _sender = cancelled;
-                    std::future::pending::<()>().await;
-                })
-            })
-            .await
-            .unwrap();
+        let cancellation = hidden_pending(&manager, &id, owner).await;
         assert!(
             manager.hidden(&id, owner).await.is_err(),
             "hidden must be single-use"
@@ -435,16 +444,7 @@ mod tests {
 
         let id = manager.test_target_owned(owner).await;
         assert!(manager.arm_paste(&id, owner).await);
-        let (cancelled, cancellation) = tokio::sync::oneshot::channel::<()>();
-        manager
-            .hide_with(&id, owner, |_| {
-                tokio::spawn(async move {
-                    let _sender = cancelled;
-                    std::future::pending::<()>().await;
-                })
-            })
-            .await
-            .unwrap();
+        let cancellation = hidden_pending(&manager, &id, owner).await;
         let (waited, ()) = tokio::join!(manager.wait(&id, owner), async {
             tokio::task::yield_now().await;
             manager.release_owner(":1.1").await;

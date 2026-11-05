@@ -53,21 +53,17 @@ impl Book {
     pub fn reserve(book: &Arc<Mutex<Self>>, owner: Option<&str>) -> Result<Reservation, ApiError> {
         let mut state = book.lock().unwrap_or_else(|p| p.into_inner());
         state.prune();
-        let active: Vec<_> = state
-            .records
+        let mut active = state.pending.len();
+        let mut own = state
+            .pending
             .values()
-            .filter(|record| record.active())
-            .collect();
-        let own = active
-            .iter()
-            .filter(|record| record.owner.as_deref() == owner)
-            .count()
-            + state
-                .pending
-                .values()
-                .filter(|value| value.as_deref() == owner)
-                .count();
-        if active.len() + state.pending.len() >= MAX_ACTIVE || own >= MAX_OWNER_ACTIVE {
+            .filter(|value| value.as_deref() == owner)
+            .count();
+        for record in state.records.values().filter(|record| record.active()) {
+            active += 1;
+            own += usize::from(record.owner.as_deref() == owner);
+        }
+        if active >= MAX_ACTIVE || own >= MAX_OWNER_ACTIVE {
             return Err(ApiError::new(
                 "busy",
                 "Too many active clipboard operations",
@@ -116,11 +112,14 @@ mod tests {
     #[test]
     fn admission_retention_and_abandoned_reservations_are_bounded() {
         let book = Arc::new(Mutex::new(Book::default()));
-        let reservations: Vec<_> = (0..MAX_OWNER_ACTIVE)
-            .map(|_| Book::reserve(&book, Some("a")).unwrap())
-            .collect();
-        assert!(Book::reserve(&book, Some("a")).is_err());
-        assert!(Book::reserve(&book, Some("b")).is_ok());
+        let mut reservations = Vec::new();
+        for owner in ["a", "b", "c", "d"] {
+            reservations
+                .extend((0..MAX_OWNER_ACTIVE).map(|_| Book::reserve(&book, Some(owner)).unwrap()));
+            assert!(Book::reserve(&book, Some(owner)).is_err());
+        }
+        assert!(Book::reserve(&book, Some("e")).is_err());
+        assert!(Book::reserve(&book, None).is_err());
         drop(reservations);
         assert!(book.lock().unwrap().pending.is_empty());
         let mut state = book.lock().unwrap();
@@ -131,10 +130,19 @@ mod tests {
             );
         }
         assert_eq!(state.records.len(), MAX_RECORDS);
+        let active = state.records.values_mut().next().unwrap();
+        active.operation.status = "started".into();
         for record in state.records.values_mut() {
             record.updated = Instant::now() - RETENTION;
         }
         state.prune();
-        assert!(state.records.is_empty());
+        assert_eq!(state.records.len(), 1);
+        assert!(state.records.values().all(Record::active));
+        drop(state);
+        let _pending: Vec<_> = (1..MAX_OWNER_ACTIVE)
+            .map(|_| Book::reserve(&book, Some("a")).unwrap())
+            .collect();
+        assert!(Book::reserve(&book, Some("a")).is_err());
+        assert!(Book::reserve(&book, Some("b")).is_ok());
     }
 }

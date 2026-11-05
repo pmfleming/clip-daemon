@@ -370,26 +370,22 @@ impl Database {
                 "FROM entries e JOIN search_content s ON s.entry_id=e.id WHERE instr(s.content,?1)>0 AND (?4=0 OR e.echo_source_id IS NULL) {candidates}"
             )
         };
-        let parameters = params![
-            needle.clone(),
-            (limit + 1) as i64,
-            offset,
-            i64::from(query.collapse_self_echoes),
-            gram.clone()
-        ];
-        let rows = self.rows(
-            &format!("SELECT {COLUMNS} {filter} ORDER BY e.favorite DESC,e.recency DESC,e.id LIMIT ?2 OFFSET ?3"),
-            parameters,
-        )?;
-        let total = self.scalar(
-            &format!("SELECT count(*) {filter} AND ?2>=0 AND ?3>=0"),
+        let parameters = || {
             params![
-                needle,
+                needle.as_str(),
                 (limit + 1) as i64,
                 offset,
                 i64::from(query.collapse_self_echoes),
-                gram
-            ],
+                gram.as_str()
+            ]
+        };
+        let rows = self.rows(
+            &format!("SELECT {COLUMNS} {filter} ORDER BY e.favorite DESC,e.recency DESC,e.id LIMIT ?2 OFFSET ?3"),
+            parameters(),
+        )?;
+        let total = self.scalar(
+            &format!("SELECT count(*) {filter} AND ?2>=0 AND ?3>=0"),
+            parameters(),
         )? as usize;
         let has_more = rows.len() > limit;
         let mut entries = rows
@@ -576,22 +572,21 @@ impl Database {
             .collect::<Vec<_>>()
             .join(",");
         let cte = format!("WITH targets(id,revision) AS (VALUES {values})");
-        let bindings = targets
-            .iter()
-            .flat_map(|target| {
+        let bindings = || {
+            turso::params_from_iter(targets.iter().flat_map(|target| {
                 [
                     turso::Value::Text(target.opaque_id.clone()),
                     turso::Value::Integer(target.expected_revision as i64),
                 ]
-            })
-            .collect::<Vec<_>>();
+            }))
+        };
         self.transaction(|db| {
-            let valid=db.scalar(&format!("{cte} SELECT count(*) FROM targets t JOIN entries e ON e.id=t.id AND e.revision=t.revision"),bindings.clone())?;
+            let valid=db.scalar(&format!("{cte} SELECT count(*) FROM targets t JOIN entries e ON e.id=t.id AND e.revision=t.revision"),bindings())?;
             if valid!=targets.len() as i64 {
-                let present=db.scalar(&format!("{cte} SELECT count(*) FROM targets t JOIN entries e ON e.id=t.id"),bindings.clone())?;
+                let present=db.scalar(&format!("{cte} SELECT count(*) FROM targets t JOIN entries e ON e.id=t.id"),bindings())?;
                 return Err(if present!=targets.len() as i64 {BackendError::not_found("Clipboard entry does not exist")} else {BackendError::stale("Clipboard entry revision changed")});
             }
-            db.exec(&format!("{cte} DELETE FROM entries WHERE id IN (SELECT id FROM targets)"),bindings)?;
+            db.exec(&format!("{cte} DELETE FROM entries WHERE id IN (SELECT id FROM targets)"),bindings())?;
             db.bump()?;
             Ok(())
         })
@@ -714,14 +709,15 @@ fn search_gram(needle: &str) -> Option<String> {
     // bounded set, rather than picking a common prefix that selects the entire
     // catalog. Only generated, quoted alphanumeric terms reach the FTS parser.
     let mut terms = std::collections::BTreeSet::new();
-    for word in needle.split(|c: char| !c.is_alphanumeric()) {
-        let chars: Vec<_> = word.chars().collect();
-        for gram in chars.windows(3) {
-            terms.insert(gram.iter().collect::<String>());
-            if terms.len() == 32 {
-                break;
-            }
-        }
+    let grams = needle
+        .split(|c: char| !c.is_alphanumeric())
+        .flat_map(|word| {
+            word.char_indices()
+                .zip(word.char_indices().skip(2))
+                .map(move |((start, _), (end, last))| &word[start..end + last.len_utf8()])
+        });
+    for gram in grams {
+        terms.insert(gram);
         if terms.len() == 32 {
             break;
         }
@@ -796,6 +792,29 @@ fn decode_summary(row: &Row) -> BackendResult<EntrySummary> {
 #[cfg(test)]
 mod failure_tests {
     use super::*;
+    #[test]
+    fn search_grams_are_unicode_literal_deduplicated_and_bounded() {
+        for (needle, expected) in [
+            ("", None),
+            ("a ab !?", None),
+            ("abc abcd abc", Some("\"abc\" AND \"bcd\"")),
+            ("é界日", Some("\"é界日\"")),
+            ("abc!def", Some("\"abc\" AND \"def\"")),
+        ] {
+            assert_eq!(search_gram(needle).as_deref(), expected);
+        }
+        let words: Vec<_> = (0..64).rev().map(|n| format!("{n:03}")).collect();
+        let expected = (32..64)
+            .map(|n| format!("\"{n:03}\""))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        assert_eq!(
+            search_gram(&words.join(" ")).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(search_gram(&"a".repeat(4096)).as_deref(), Some("\"aaa\""));
+    }
+
     #[test]
     fn dangling_sidecar_after_commit_fences_storage() {
         let directory = tempfile::tempdir().unwrap();
